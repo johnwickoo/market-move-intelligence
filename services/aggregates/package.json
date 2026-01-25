@@ -1,0 +1,16 @@
+{
+  "name": "@market-move-intelligence/aggregate",
+  "version": "0.1.0",
+  "private": true,
+  "main": "src/index.ts",
+  "devDependencies": {
+    "ts-node": "^10.9.2",
+    "typescript": "^5.5.0"
+  },
+  "dependencies": {
+    "@polymarket/clob-client": "^5.2.1",
+    "dotenv": "^17.2.3",
+    "ethers": "^5.8.0",
+    "ws": "^8.19.0"
+  }
+}

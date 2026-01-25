@@ -1,0 +1,10 @@
+{
+  "name": "@market-move-intelligence/news",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "src/newsapi.client.ts",
+  "devDependencies": {
+    "typescript": "^5.5.0"
+  }
+}

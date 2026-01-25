@@ -1,0 +1,10 @@
+{
+  "name": "@market-move-intelligence/scoring",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "src/classifier.ts",
+  "devDependencies": {
+    "typescript": "^5.5.0"
+  }
+}

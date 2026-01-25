@@ -1,0 +1,10 @@
+{
+  "name": "@market-move-intelligence/scheduler",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "src/cron.ts",
+  "devDependencies": {
+    "typescript": "^5.5.0"
+  }
+}

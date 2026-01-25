@@ -1,0 +1,25 @@
+{
+  "name": "market-move-intelligence",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "apps/*",
+    "services/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "echo \"TODO: add build\"",
+    "dev": "echo \"TODO: add dev\"",
+    "lint": "echo \"TODO: add lint\"",
+    "test": "echo \"TODO: add test\""
+  },
+  "devDependencies": {
+    "@types/react": "^19.2.9",
+    "@types/react-dom": "^19.2.3",
+    "typescript": "^5.5.0"
+  },
+  "dependencies": {
+    "react": "^19.2.3"
+  }
+}
