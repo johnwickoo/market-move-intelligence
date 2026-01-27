@@ -12,18 +12,25 @@ export function connectPolymarketWS(opts: {
     if (ws.readyState === WebSocket.OPEN) ws.send("ping");
   }, 5000);
 
-  ws.on("open", () => {
-    console.log("[ws] connected");
+ws.on("open", () => {
+  console.log("[ws] connected");
 
-    ws.send(
-      JSON.stringify({
-        action: "subscribe",
-        subscriptions: opts.subscriptions,
-      })
-    );
+  for (const s of opts.subscriptions) {
+    ws.send(JSON.stringify({
+      action: "subscribe",
+      subscriptions: [
+        {
+          topic: s.topic,
+          type: s.type,
+          ...(s.filters ? { filters: s.filters } : {}),
+        }
+      ]
+    }));
+  }
 
-    console.log("[ws] subscribed");
-  });
+  console.log("[ws] subscribed");
+});
+
 
   ws.on("message", async (data: WebSocket.RawData) => {
     const text = data.toString();

@@ -28,6 +28,8 @@ CREATE TABLE price_snapshots (
 CREATE TABLE movement_events (
   id BIGSERIAL PRIMARY KEY,
   market_id TEXT NOT NULL,
+  asset_id TEXT NOT NULL,
+  outcome TEXT NULL,
   start_time TIMESTAMPTZ NOT NULL,
   end_time TIMESTAMPTZ,
   price_start NUMERIC NOT NULL,
@@ -35,6 +37,11 @@ CREATE TABLE movement_events (
   volume NUMERIC NOT NULL,
   reason TEXT NOT NULL,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE movement_explanations (
+  movement_id TEXT PRIMARY KEY,
+  text TEXT NOT NULL
 );
 
 CREATE TABLE signal_scores (

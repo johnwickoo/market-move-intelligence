@@ -8,6 +8,8 @@ type MovementInsert = {
   outcome: string | null;
   window_start: string;
   window_end: string;
+
+  //these represent MID-price, not trade price
   start_price: number | null;
   end_price: number | null;
   pct_change: number | null;
@@ -18,15 +20,19 @@ type MovementInsert = {
 
   reason: "PRICE" | "VOLUME" | "BOTH";
 
+  // hese represent MID min/max/range
   min_price_24h: number | null;
   max_price_24h: number | null;
   range_pct: number | null;
 
   max_hour_volume: number | null;
   hourly_volume_ratio: number | null;
+
   trades_count_24h: number;
   unique_price_levels_24h: number;
   avg_trade_size_24h: number | null;
+
+  // liquidity guard
   thin_liquidity: boolean;
 };
 
@@ -36,7 +42,6 @@ function toNum(x: any): number {
   return n;
 }
 
-// 24h window ending "now"
 function windowBounds(nowMs: number) {
   const end = new Date(nowMs);
   const start = new Date(nowMs - 24 * 60 * 60 * 1000);
@@ -52,7 +57,6 @@ function bucketIdHour(tsMs: number) {
 /**
  * Tiny anti-spam guard:
  * only compute movement once per minute per market+outcome in this process.
- * (Prevents constant rereads/recomputes on high trade throughput.)
  */
 const lastCheckedMs = new Map<string, number>();
 function shouldSkipCompute(key: string, nowMs: number, cooldownMs = 60_000) {
@@ -61,7 +65,6 @@ function shouldSkipCompute(key: string, nowMs: number, cooldownMs = 60_000) {
   lastCheckedMs.set(key, nowMs);
   return false;
 }
-
 
 export async function detectMovement(trade: TradeInsert) {
   const marketId = trade.market_id;
@@ -79,8 +82,10 @@ export async function detectMovement(trade: TradeInsert) {
   const bucket = bucketIdHour(nowMs);
   const movementId = `${marketId}:${outcome ?? "NA"}:${bucket}`;
 
-  // 1) pull trades in last 24h for this market (and outcome if present)
-  let q = supabase
+  // =========================================================
+  // 1) TRADES in last 24h → VOLUME + trade-based liquidity hints
+  // =========================================================
+  let tq = supabase
     .from("trades")
     .select("price,size,timestamp,outcome")
     .eq("market_id", marketId)
@@ -88,67 +93,87 @@ export async function detectMovement(trade: TradeInsert) {
     .lte("timestamp", endISO)
     .order("timestamp", { ascending: true });
 
-  if (outcome) q = q.eq("outcome", outcome);
+  if (outcome) tq = tq.eq("outcome", outcome);
 
-  const { data: trades, error: tradesErr } = await q;
+  const { data: trades, error: tradesErr } = await tq;
   if (tradesErr) throw tradesErr;
-
   if (!trades || trades.length < 2) return;
 
-  const startPrice = trades[0].price == null ? null : toNum(trades[0].price);
-  const endPrice =
-    trades[trades.length - 1].price == null ? null : toNum(trades[trades.length - 1].price);
-
-  // 24h min/max (captures spikes/whipsaws inside the window)
-  let min24: number | null = null;
-  let max24: number | null = null;
-
-  for (const t of trades) {
-    if (t.price == null) continue;
-    const px = toNum(t.price);
-    min24 = min24 == null ? px : Math.min(min24, px);
-    max24 = max24 == null ? px : Math.max(max24, px);
-  }
-
-  let rangePct: number | null = null;
-  if (min24 != null && max24 != null && min24 > 0) {
-    rangePct = (max24 - min24) / min24;
-  }
-
-  let pctChange: number | null = null;
-  if (startPrice != null && endPrice != null && startPrice !== 0) {
-    pctChange = (endPrice - startPrice) / startPrice;
-  }
-
-  const volume24h = trades.reduce((sum, t) => sum + toNum(t.size ?? 0), 0);
-
-    // --- Liquidity guard inputs ---
   const tradesCount = trades.length;
 
-  // unique "price levels" in the window
-  // (round to avoid float noise creating fake uniqueness)
+  const volume24h = trades.reduce((sum, t) => sum + toNum(t.size ?? 0), 0);
+  const avgTradeSize24h = tradesCount > 0 ? volume24h / tradesCount : null;
+
+  // unique trade price levels (rounded to avoid float noise)
   const priceLevels = new Set<number>();
   for (const t of trades) {
     if (t.price == null) continue;
-    const px = toNum(t.price);
-    priceLevels.add(Number(px.toFixed(4)));
+    priceLevels.add(Number(toNum(t.price).toFixed(2)));
   }
   const uniquePriceLevels = priceLevels.size;
 
-  const avgTradeSize24h =
-    tradesCount > 0 ? volume24h / tradesCount : null;
+  // =========================================================
+  // 2) MID TICKS in last 24h → PRICE movement + spread liquidity
+  // =========================================================
+  let mq = supabase
+    .from("market_mid_ticks")
+    .select("mid, ts, spread_pct, outcome")
+    .eq("market_id", marketId)
+    .gte("ts", startISO)
+    .lte("ts", endISO)
+    .order("ts", { ascending: true });
 
-  // Thin liquidity rule (simple + effective):
-  // If very few trades OR very few price levels,
-  // price jumps are likely orderbook effects.
-  const THIN_TRADE_COUNT = 15;
-  const THIN_PRICE_LEVELS = 8;
+  // if you store outcome on ticks, filter it too
+  if (outcome) mq = mq.eq("outcome", outcome);
 
-  const thinLiquidity =
-    tradesCount < THIN_TRADE_COUNT || uniquePriceLevels < THIN_PRICE_LEVELS;
+  const { data: ticks, error: ticksErr } = await mq;
+  if (ticksErr) throw ticksErr;
 
+  // If we don’t have mid ticks yet, we can’t do price detection.
+  // (We can still do volume detection below.)
+  const hasTicks = !!ticks && ticks.length >= 2;
 
-  // 2) baseline daily volume from aggregates (scaled by observed days)
+  let startMid: number | null = null;
+  let endMid: number | null = null;
+  let minMid: number | null = null;
+  let maxMid: number | null = null;
+  let midDriftPct: number | null = null;
+  let midRangePct: number | null = null;
+
+  let avgSpreadPct: number | null = null;
+
+  if (hasTicks && ticks) {
+    startMid = ticks[0].mid == null ? null : toNum(ticks[0].mid);
+    endMid = ticks[ticks.length - 1].mid == null ? null : toNum(ticks[ticks.length - 1].mid);
+
+    for (const tk of ticks) {
+      if (tk.mid == null) continue;
+      const m = toNum(tk.mid);
+      minMid = minMid == null ? m : Math.min(minMid, m);
+      maxMid = maxMid == null ? m : Math.max(maxMid, m);
+    }
+
+    if (minMid != null && maxMid != null && minMid > 0) {
+      midRangePct = (maxMid - minMid) / minMid;
+    }
+    if (startMid != null && endMid != null && startMid > 0) {
+      midDriftPct = (endMid - startMid) / startMid;
+    }
+
+    // avg spread % in window (ignore nulls)
+    let spreadSum = 0;
+    let spreadN = 0;
+    for (const tk of ticks) {
+      if (tk.spread_pct == null) continue;
+      spreadSum += toNum(tk.spread_pct);
+      spreadN += 1;
+    }
+    avgSpreadPct = spreadN > 0 ? spreadSum / spreadN : null;
+  }
+
+  // =========================================================
+  // 3) baseline daily volume from aggregates (scaled by observed days)
+  // =========================================================
   const { data: agg, error: aggErr } = await supabase
     .from("market_aggregates")
     .select("total_volume, first_seen_at")
@@ -172,7 +197,9 @@ export async function detectMovement(trade: TradeInsert) {
   const volumeRatio =
     baselineDaily != null && baselineDaily > 0 ? volume24h / baselineDaily : null;
 
-  // hourly spike: max 1-hour volume / baseline hourly
+  // =========================================================
+  // 4) hourly max volume ratio (trade-based)
+  // =========================================================
   const hourMs = 60 * 60 * 1000;
   const startMs = Date.parse(startISO);
   const hourlySums = new Map<number, number>();
@@ -190,40 +217,41 @@ export async function detectMovement(trade: TradeInsert) {
   const hourlyRatio =
     baselineHourly != null && baselineHourly > 0 ? maxHourVol / baselineHourly : null;
 
-  // 3) thresholds
+  // =========================================================
+  // 5) LIQUIDITY GUARD (spread + trade sparsity)
+  // =========================================================
+  const THIN_TRADE_COUNT = 15;
+  const THIN_PRICE_LEVELS = 8;
+  const WIDE_SPREAD = 0.05; // 5%
+
+  const thinBySpread = avgSpreadPct != null && avgSpreadPct >= WIDE_SPREAD;
+  const thinLiquidity =
+    thinBySpread ||
+    tradesCount < THIN_TRADE_COUNT ||
+    uniquePriceLevels < THIN_PRICE_LEVELS;
+
+  // =========================================================
+  // 6) THRESHOLDS
+  // =========================================================
   const PRICE_THRESHOLD = 0.15;
+  const THIN_PRICE_THRESHOLD = 0.25;
   const VOLUME_THRESHOLD = 2.0;
 
-  const driftHit = pctChange != null && Math.abs(pctChange) >= PRICE_THRESHOLD;
-  const rangeHit = rangePct != null && rangePct >= PRICE_THRESHOLD;
-  let priceHit = driftHit || rangeHit;
+  // PRICE uses MID ticks (not trade prints)
+  const driftHit = midDriftPct != null && Math.abs(midDriftPct) >= (thinLiquidity ? THIN_PRICE_THRESHOLD : PRICE_THRESHOLD);
+  const rangeHit = midRangePct != null && midRangePct >= (thinLiquidity ? THIN_PRICE_THRESHOLD : PRICE_THRESHOLD);
+  const priceHit = hasTicks ? (driftHit || rangeHit) : false;
 
-    const hasEnoughHistoryForVolume = observedDays >= 3;
-    const dailyVolHit =
-      hasEnoughHistoryForVolume && volumeRatio != null && volumeRatio >= VOLUME_THRESHOLD;
-    const hourlyVolHit =
-      hasEnoughHistoryForVolume && hourlyRatio != null && hourlyRatio >= VOLUME_THRESHOLD;
+  // VOLUME uses trades vs baseline (daily + hourly spike)
+  const hasEnoughHistoryForVolume = observedDays >= 3;
 
-    const volHit = dailyVolHit || hourlyVolHit;
+  const dailyVolHit =
+    hasEnoughHistoryForVolume && volumeRatio != null && volumeRatio >= VOLUME_THRESHOLD;
 
-    // If market is thin, require a stronger price move to trigger PRICE.
-  // (prevents false “price repricing” from one sweep)
-  const THIN_PRICE_THRESHOLD = 0.25;
+  const hourlyVolHit =
+    hasEnoughHistoryForVolume && hourlyRatio != null && hourlyRatio >= VOLUME_THRESHOLD;
 
-  if (thinLiquidity) {
-    const thinDriftHit = pctChange != null && Math.abs(pctChange) >= THIN_PRICE_THRESHOLD;
-    const thinRangeHit = rangePct != null && rangePct >= THIN_PRICE_THRESHOLD;
-
-    // override priceHit under thin liquidity
-    const guardedPriceHit = thinDriftHit || thinRangeHit;
-
-    // replace priceHit with guarded version
-    // (volume logic stays unchanged)
-    // @ts-ignore
-    priceHit = guardedPriceHit;
-  }
-  
-
+  const volHit = dailyVolHit || hourlyVolHit;
 
   if (!priceHit && !volHit) return;
 
@@ -236,9 +264,11 @@ export async function detectMovement(trade: TradeInsert) {
     outcome,
     window_start: startISO,
     window_end: endISO,
-    start_price: startPrice,
-    end_price: endPrice,
-    pct_change: pctChange,
+
+    // ✅ store MID-based numbers here for now
+    start_price: startMid,
+    end_price: endMid,
+    pct_change: midDriftPct,
 
     volume_24h: volume24h,
     baseline_daily_volume: baselineDaily,
@@ -246,21 +276,20 @@ export async function detectMovement(trade: TradeInsert) {
 
     reason,
 
-    min_price_24h: min24,
-    max_price_24h: max24,
-    range_pct: rangePct,
+    min_price_24h: minMid,
+    max_price_24h: maxMid,
+    range_pct: midRangePct,
 
     max_hour_volume: maxHourVol,
     hourly_volume_ratio: hourlyRatio,
+
     trades_count_24h: tradesCount,
     unique_price_levels_24h: uniquePriceLevels,
     avg_trade_size_24h: avgTradeSize24h,
     thin_liquidity: thinLiquidity,
-
-    
   };
 
-  // ✅ single-step idempotency: try insert, ignore duplicates
+  // ✅ idempotency: insert once per hour bucket
   const { error: insErr } = await supabase.from("market_movements").insert(row);
 
   if (insErr) {
@@ -274,8 +303,8 @@ export async function detectMovement(trade: TradeInsert) {
 
   console.log(
     `[movement] ${reason} market=${marketId} outcome=${outcome ?? "-"} ` +
-      `drift=${pctChange?.toFixed(3) ?? "n/a"} range=${rangePct?.toFixed(3) ?? "n/a"} ` +
+      `mid_drift=${midDriftPct?.toFixed(3) ?? "n/a"} mid_range=${midRangePct?.toFixed(3) ?? "n/a"} ` +
       `vol24h=${volume24h.toFixed(2)} vr=${volumeRatio?.toFixed(2) ?? "n/a"} ` +
-      `hr=${hourlyRatio?.toFixed(2) ?? "n/a"}`
+      `hr=${hourlyRatio?.toFixed(2) ?? "n/a"} thin=${thinLiquidity}`
   );
 }
