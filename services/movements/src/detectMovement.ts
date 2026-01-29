@@ -233,14 +233,24 @@ export async function detectMovement(trade: TradeInsert) {
   // =========================================================
   // 6) THRESHOLDS
   // =========================================================
-  const PRICE_THRESHOLD = 0.15;
-  const THIN_PRICE_THRESHOLD = 0.25;
-  const VOLUME_THRESHOLD = 2.0;
+  const PRICE_THRESHOLD = Number(process.env.MOVEMENT_PRICE_THRESHOLD ?? 0.08);
+  const THIN_PRICE_THRESHOLD = Number(process.env.MOVEMENT_THIN_PRICE_THRESHOLD ?? 0.12);
+  const VOLUME_THRESHOLD = Number(process.env.MOVEMENT_VOLUME_THRESHOLD ?? 1.5);
+  const MIN_PRICE_FOR_ALERT = Number(process.env.MOVEMENT_MIN_PRICE_FOR_ALERT ?? 0.05);
+  const MIN_ABS_MOVE = Number(process.env.MOVEMENT_MIN_ABS_MOVE ?? 0.03);
 
   // PRICE uses MID ticks (not trade prints)
-  const driftHit = midDriftPct != null && Math.abs(midDriftPct) >= (thinLiquidity ? THIN_PRICE_THRESHOLD : PRICE_THRESHOLD);
-  const rangeHit = midRangePct != null && midRangePct >= (thinLiquidity ? THIN_PRICE_THRESHOLD : PRICE_THRESHOLD);
-  const priceHit = hasTicks ? (driftHit || rangeHit) : false;
+  const absMove =
+    minMid != null && maxMid != null ? Math.abs(maxMid - minMid) : null;
+  const priceEligible = minMid != null && minMid >= MIN_PRICE_FOR_ALERT;
+  const driftHit =
+    midDriftPct != null &&
+    Math.abs(midDriftPct) >= (thinLiquidity ? THIN_PRICE_THRESHOLD : PRICE_THRESHOLD);
+  const rangeHit =
+    midRangePct != null &&
+    midRangePct >= (thinLiquidity ? THIN_PRICE_THRESHOLD : PRICE_THRESHOLD);
+  const absHit = absMove != null && absMove >= MIN_ABS_MOVE;
+  const priceHit = hasTicks ? priceEligible && absHit && (driftHit || rangeHit) : false;
 
   // VOLUME uses trades vs baseline (daily + hourly spike)
   const hasEnoughHistoryForVolume = observedDays >= 3;

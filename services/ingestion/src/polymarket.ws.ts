@@ -4,12 +4,18 @@ export function connectPolymarketWS(opts: {
   url: string;
   onMessage: (msg: any) => Promise<void> | void;
   subscriptions: Array<{ topic: string; type: string; filters?: string }>;
+  staleMs?: number;
+  staleCheckMs?: number;
 }) {
   let ws: WebSocket | null = null;
   let pingInterval: NodeJS.Timeout | null = null;
   let reconnectTimer: NodeJS.Timeout | null = null;
+  let staleTimer: NodeJS.Timeout | null = null;
+  let lastMessageAt = Date.now();
   let backoffMs = 5_000;
   const maxBackoffMs = 60_000;
+  const staleMs = opts.staleMs ?? Number(process.env.WS_STALE_MS ?? 60_000);
+  const staleCheckMs = opts.staleCheckMs ?? Number(process.env.WS_STALE_CHECK_MS ?? 10_000);
 
   const scheduleReconnect = (reason: string) => {
     if (reconnectTimer) return;
@@ -24,11 +30,22 @@ export function connectPolymarketWS(opts: {
 
   const connect = () => {
     ws = new WebSocket(opts.url);
+    lastMessageAt = Date.now();
 
     // ping like the official client: send "ping" text
     pingInterval = setInterval(() => {
       if (ws?.readyState === WebSocket.OPEN) ws.send("ping");
     }, 5000);
+    if (staleMs > 0 && staleCheckMs > 0) {
+      staleTimer = setInterval(() => {
+        if (!ws || ws.readyState !== WebSocket.OPEN) return;
+        const idleMs = Date.now() - lastMessageAt;
+        if (idleMs > staleMs) {
+          console.warn(`[ws] stale (${Math.round(idleMs / 1000)}s), reconnecting`);
+          ws.close();
+        }
+      }, staleCheckMs);
+    }
 
     ws.on("open", () => {
       console.log("[ws] connected");
@@ -56,7 +73,11 @@ export function connectPolymarketWS(opts: {
       const text = data.toString();
 
       // server may respond with "pong" or other non-json keepalives
-      if (text === "pong" || text === "ping") return;
+      if (text === "pong" || text === "ping") {
+        lastMessageAt = Date.now();
+        return;
+      }
+      lastMessageAt = Date.now();
 
       try {
         const parsed = JSON.parse(text);
@@ -69,6 +90,8 @@ export function connectPolymarketWS(opts: {
     ws.on("close", () => {
       if (pingInterval) clearInterval(pingInterval);
       pingInterval = null;
+      if (staleTimer) clearInterval(staleTimer);
+      staleTimer = null;
       console.log("[ws] closed");
       backoffMs = Math.min(backoffMs * 2, maxBackoffMs);
       scheduleReconnect("socket closed");

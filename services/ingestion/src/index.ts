@@ -6,7 +6,7 @@ import { updateAggregateBuffered } from "../../aggregates/src/updateAggregate";
 import { detectMovement } from "../../movements/src/detectMovement";
 import { movementRealtime } from "../../movements/src/detectMovementRealtime";
 import { insertMidTick } from "../../storage/src/insertMidTick";
-import { insertTrade } from "../../storage/src/db";
+import { insertTradeBatch, insertTrade } from "../../storage/src/db";
 import type { TradeInsert } from "../../storage/src/types";
 import * as fs from "fs/promises";
 import * as path from "path";
@@ -22,6 +22,7 @@ const MAX_CLOB_ASSETS = Number(process.env.MAX_CLOB_ASSETS ?? 100);
 const MAX_ASSETS_PER_MARKET = Number(process.env.MAX_ASSETS_PER_MARKET ?? 3);
 const MOVER_WINDOW_MS = Number(process.env.MOVER_WINDOW_MS ?? 10 * 60_000);
 const MOVER_REFRESH_MS = Number(process.env.MOVER_REFRESH_MS ?? 60_000);
+const DOMINANT_OUTCOME_TTL_MS = Number(process.env.DOMINANT_OUTCOME_TTL_MS ?? 60_000);
 
 type AssetStats = {
   firstPrice: number;
@@ -35,6 +36,7 @@ type AssetStats = {
 const marketSelections = new Map<string, Set<string>>();
 const lastSelectionUpdate = new Map<string, number>();
 const marketAssetStats = new Map<string, Map<string, AssetStats>>();
+const dominantOutcomeByMarket = new Map<string, { outcome: string; ts: number }>();
 
 const lastTopByAsset = new Map<string, { bid: number; ask: number; bucket: number }>();
 const MID_BUCKET_MS = 2000;
@@ -45,6 +47,8 @@ const MOVEMENT_MIN_STEP = Number(process.env.MOVEMENT_MIN_STEP ?? 0.01);
 const RETRY_MAX_ATTEMPTS = Number(process.env.RETRY_MAX_ATTEMPTS ?? 5);
 const RETRY_BASE_MS = Number(process.env.RETRY_BASE_MS ?? 500);
 const LOG_RETRY = process.env.LOG_RETRY === "1";
+const LOG_TRADE_GROUPED = process.env.LOG_TRADE_GROUPED !== "0";
+const TRADE_LOG_GROUP_MS = Number(process.env.TRADE_LOG_GROUP_MS ?? 1000);
 const INSERT_FAIL_WINDOW_MS = Number(process.env.INSERT_FAIL_WINDOW_MS ?? 60_000);
 const INSERT_FAIL_THRESHOLD = Number(process.env.INSERT_FAIL_THRESHOLD ?? 3);
 let insertFailCount = 0;
@@ -52,6 +56,13 @@ let insertFailWindowStart = 0;
 const SPOOL_PATH = process.env.SPOOL_PATH ?? path.join("/tmp", "mmi-trade-spool.ndjson");
 const SPOOL_REPLAY_MS = Number(process.env.SPOOL_REPLAY_MS ?? 30_000);
 let spoolReplayRunning = false;
+const TRADE_BUFFER_MAX = Number(process.env.TRADE_BUFFER_MAX ?? 200);
+const TRADE_BUFFER_FLUSH_MS = Number(process.env.TRADE_BUFFER_FLUSH_MS ?? 1000);
+const tradeBuffer: TradeInsert[] = [];
+let tradeFlushTimer: NodeJS.Timeout | null = null;
+const TRADE_DEDUPE_TTL_MS = Number(process.env.TRADE_DEDUPE_TTL_MS ?? 10 * 60_000);
+const recentTrades = new Map<string, number>();
+const pendingTradeLogs = new Map<string, { parts: string[]; timer: NodeJS.Timeout }>();
 
 async function withRetry<T>(
   fn: () => Promise<T>,
@@ -88,6 +99,12 @@ async function withRetry<T>(
 async function appendToSpool(trade: TradeInsert) {
   const line = JSON.stringify(trade) + "\n";
   await fs.appendFile(SPOOL_PATH, line, "utf8");
+}
+
+async function appendManyToSpool(trades: TradeInsert[]) {
+  if (trades.length === 0) return;
+  const lines = trades.map((t) => JSON.stringify(t)).join("\n") + "\n";
+  await fs.appendFile(SPOOL_PATH, lines, "utf8");
 }
 
 async function replaySpoolOnce() {
@@ -127,6 +144,26 @@ async function replaySpoolOnce() {
     }
   } finally {
     spoolReplayRunning = false;
+  }
+}
+
+async function flushTradeBuffer() {
+  if (tradeBuffer.length === 0) return;
+  const batch = tradeBuffer.splice(0, tradeBuffer.length);
+  console.log(`[trade-batch] flush size=${batch.length}`);
+  try {
+    if (insertFailCount >= INSERT_FAIL_THRESHOLD) {
+      await appendManyToSpool(batch);
+      console.log(`[trade-batch] spooled size=${batch.length} reason=circuit`);
+      return;
+    }
+    await withRetry(() => insertTradeBatch(batch), "insertTradeBatch", 2);
+    insertFailCount = 0;
+    console.log(`[trade-batch] success size=${batch.length}`);
+  } catch {
+    insertFailCount += 1;
+    await appendManyToSpool(batch);
+    console.log(`[trade-batch] failed size=${batch.length} -> spooled`);
   }
 }
 
@@ -317,6 +354,34 @@ function updateSelectionForMarket(marketId: string, nowMs: number) {
   }
 }
 
+function getDominantOutcome(marketId: string, nowMs: number): string | null {
+  const cached = dominantOutcomeByMarket.get(marketId);
+  if (cached && nowMs - cached.ts < DOMINANT_OUTCOME_TTL_MS) return cached.outcome;
+
+  const byAsset = marketAssetStats.get(marketId);
+  if (!byAsset) return null;
+
+  let bestAsset: string | null = null;
+  let bestVolume = -1;
+  let bestTrades = -1;
+
+  for (const [assetId, s] of byAsset.entries()) {
+    if (nowMs - s.lastTs > MOVER_WINDOW_MS) continue;
+    if (s.volume > bestVolume || (s.volume === bestVolume && s.trades > bestTrades)) {
+      bestVolume = s.volume;
+      bestTrades = s.trades;
+      bestAsset = assetId;
+    }
+  }
+
+  if (!bestAsset) return null;
+  const meta = assetMeta.get(bestAsset);
+  const outcome = meta?.outcome ?? null;
+  if (!outcome) return null;
+  dominantOutcomeByMarket.set(marketId, { outcome, ts: nowMs });
+  return outcome;
+}
+
 function toTradeInsert(msg: any): TradeInsert | null {
   if (msg?.topic !== "activity" || msg?.type !== "trades") return null;
   const p = msg.payload;
@@ -327,14 +392,18 @@ function toTradeInsert(msg: any): TradeInsert | null {
   const marketId = p.conditionId;
   if (!marketId) return null;
 
-  const id = p.transactionHash || `${marketId}:${p.asset}:${msg.timestamp}`;
+  const tx = p.transactionHash ? String(p.transactionHash) : "";
+  const assetId = p.asset ? String(p.asset) : "";
+  const id = tx ? `${tx}:${assetId}` : `${marketId}:${assetId}:${msg.timestamp}`;
 
   // prefer msg.timestamp (ms), fallback to payload.timestamp (sec)
   const ms =
     typeof msg.timestamp === "number"
       ? msg.timestamp
       : typeof p.timestamp === "number"
-        ? p.timestamp * 1000
+        ? p.timestamp < 10_000_000_000
+          ? p.timestamp * 1000
+          : p.timestamp
         : Date.parse(String(p.timestamp));
 
   if (!Number.isFinite(ms)) return null;
@@ -358,10 +427,14 @@ function toTradeInsertFromObj(obj: any): TradeInsert | null {
   const marketId = obj.conditionId ?? obj.market_id ?? obj.marketId;
   if (!marketId) return null;
 
-  const id = obj.transactionHash || `${marketId}:${obj.asset}:${obj.timestamp}`;
+  const tx = obj.transactionHash ? String(obj.transactionHash) : "";
+  const assetId = obj.asset ? String(obj.asset) : "";
+  const id = tx ? `${tx}:${assetId}` : `${marketId}:${assetId}:${obj.timestamp}`;
   const ms =
     typeof obj.timestamp === "number"
-      ? obj.timestamp * 1000
+      ? obj.timestamp < 10_000_000_000
+        ? obj.timestamp * 1000
+        : obj.timestamp
       : Date.parse(String(obj.timestamp));
   if (!Number.isFinite(ms)) return null;
 
@@ -376,6 +449,40 @@ function toTradeInsertFromObj(obj: any): TradeInsert | null {
     outcome: String(obj.outcome ?? ""),
     outcome_index: typeof obj.outcomeIndex === "number" ? obj.outcomeIndex : null,
   };
+}
+
+function isDuplicateTrade(id: string, nowMs: number): boolean {
+  const last = recentTrades.get(id);
+  if (last != null && nowMs - last < TRADE_DEDUPE_TTL_MS) return true;
+  recentTrades.set(id, nowMs);
+  if (recentTrades.size > 50_000) {
+    for (const [k, v] of recentTrades.entries()) {
+      if (nowMs - v > TRADE_DEDUPE_TTL_MS) recentTrades.delete(k);
+    }
+  }
+  return false;
+}
+
+function logGroupedTrade(
+  tx: string,
+  part: string
+) {
+  if (!LOG_TRADE_GROUPED || !tx) {
+    console.log(part);
+    return;
+  }
+  const existing = pendingTradeLogs.get(tx);
+  if (existing) {
+    existing.parts.push(part);
+    return;
+  }
+  const timer = setTimeout(() => {
+    const item = pendingTradeLogs.get(tx);
+    if (!item) return;
+    pendingTradeLogs.delete(tx);
+    console.log(`[trade] tx=${tx} ${item.parts.join(" | ")}`);
+  }, TRADE_LOG_GROUP_MS);
+  pendingTradeLogs.set(tx, { parts: [part], timer });
 }
 
 function bestBidFromBids(bids: any[] | undefined): number | null {
@@ -460,6 +567,7 @@ if (eventSlugs.length === 0) {
 }
 const eventSlugSet = new Set(eventSlugs);
 const LOG_EVENT_SLUGS = process.env.LOG_EVENT_SLUGS === "1";
+const LOG_TRADE_DEBUG = process.env.LOG_TRADE_DEBUG === "1";
 const BACKFILL_URL = String(process.env.POLYMARKET_TRADES_BACKFILL_URL ?? "").trim();
 const BACKFILL_INTERVAL_MS = Number(process.env.BACKFILL_INTERVAL_MS ?? 60_000);
 const BACKFILL_LOOKBACK_MS = Number(process.env.BACKFILL_LOOKBACK_MS ?? 5 * 60_000);
@@ -477,6 +585,8 @@ connectPolymarketWS({
       type: "trades",
     },
   ],
+  staleMs: Number(process.env.WS_STALE_MS ?? 60_000),
+  staleCheckMs: Number(process.env.WS_STALE_CHECK_MS ?? 10_000),
   onMessage: async (msg) => {
     const rawEventSlug = String((msg as any)?.payload?.eventSlug ?? "");
     if (LOG_EVENT_SLUGS && rawEventSlug) {
@@ -487,6 +597,8 @@ connectPolymarketWS({
 
     const trade = toTradeInsert(msg);
     if (!trade) return;
+    const tradeTsMs = Date.parse(trade.timestamp);
+    if (Number.isFinite(tradeTsMs) && isDuplicateTrade(trade.id, tradeTsMs)) return;
 
     const rawAssetId = String((trade as any)?.raw?.payload?.asset ?? "");
     if (rawAssetId) {
@@ -508,29 +620,33 @@ connectPolymarketWS({
     void hydrateMarket(trade.market_id, rawEventSlug || null);
 
     try {
-      try {
-        const now = Date.now();
-        if (now - insertFailWindowStart > INSERT_FAIL_WINDOW_MS) {
-          insertFailWindowStart = now;
-          insertFailCount = 0;
-        }
-        if (insertFailCount >= INSERT_FAIL_THRESHOLD) {
-          await appendToSpool(trade);
-          throw new Error("spooled");
-        }
-        await withRetry(() => insertTrade(trade), "insertTrade", 2);
+      const now = Date.now();
+      if (now - insertFailWindowStart > INSERT_FAIL_WINDOW_MS) {
+        insertFailWindowStart = now;
         insertFailCount = 0;
-      } catch {
-        insertFailCount += 1;
-        await appendToSpool(trade);
-        throw new Error("spooled");
+      }
+
+      tradeBuffer.push(trade);
+      if (tradeBuffer.length >= TRADE_BUFFER_MAX) {
+        void flushTradeBuffer();
+      } else if (!tradeFlushTimer) {
+        tradeFlushTimer = setTimeout(() => {
+          tradeFlushTimer = null;
+          void flushTradeBuffer();
+        }, TRADE_BUFFER_FLUSH_MS);
       }
       await withRetry(() => updateAggregateBuffered(trade), "updateAggregate");
 
-      // avoid duplicate movement signals across YES/NO
-      if (trade.outcome === "Yes") {
-        const gateKey = `${trade.market_id}:Yes`;
-        const nowMs = Date.parse(trade.timestamp);
+      // avoid duplicate movement signals across outcomes
+      const nowMs = Date.parse(trade.timestamp);
+      const dominantOutcome = Number.isFinite(nowMs)
+        ? getDominantOutcome(trade.market_id, nowMs)
+        : null;
+      const shouldCheckOutcome = dominantOutcome
+        ? trade.outcome === dominantOutcome
+        : trade.outcome === "Yes";
+      if (shouldCheckOutcome) {
+        const gateKey = `${trade.market_id}:${dominantOutcome ?? "Yes"}`;
         const latest = rawAssetId ? latestSignalByAsset.get(rawAssetId) : undefined;
         const prev = lastMovementGate.get(gateKey);
         const enoughTime =
@@ -547,9 +663,15 @@ connectPolymarketWS({
         }
       }
 
-      console.log(
-        `[trade] ${trade.outcome} ${trade.side} px=${trade.price} sz=${trade.size}`
-      );
+      const tx = String((trade as any)?.raw?.payload?.transactionHash ?? "");
+      const part = LOG_TRADE_DEBUG
+        ? `${trade.outcome} ${trade.side} px=${trade.price} sz=${trade.size} tx=${tx}`
+        : `${trade.outcome} ${trade.side} px=${trade.price} sz=${trade.size}`;
+      if (LOG_TRADE_GROUPED && tx) {
+        logGroupedTrade(tx, part);
+      } else {
+        console.log(`[trade] ${part}`);
+      }
     } catch (e: any) {
       const m = e?.message ?? "";
       if (m.includes("duplicate key value violates unique constraint")) return;
@@ -605,6 +727,8 @@ async function runBackfillOnce() {
         }
         const trade = toTradeInsertFromObj(t);
         if (!trade) continue;
+        const tradeTsMs = Date.parse(trade.timestamp);
+        if (Number.isFinite(tradeTsMs) && isDuplicateTrade(trade.id, tradeTsMs)) continue;
         try {
           await insertTrade(trade);
           await updateAggregateBuffered(trade);
@@ -622,11 +746,17 @@ async function runBackfillOnce() {
 }
 
 if (BACKFILL_URL) {
-  setInterval(() => void runBackfillOnce(), BACKFILL_INTERVAL_MS);
-  void runBackfillOnce();
+  setInterval(() => {
+    runBackfillOnce().catch((e) =>
+      console.error("[backfill] error", e?.message ?? e)
+    );
+  }, BACKFILL_INTERVAL_MS);
+  runBackfillOnce().catch((e) => console.error("[backfill] error", e?.message ?? e));
 }
 
-setInterval(() => void replaySpoolOnce(), SPOOL_REPLAY_MS);
+setInterval(() => {
+  replaySpoolOnce().catch((e) => console.error("[spool] replay error", e?.message ?? e));
+}, SPOOL_REPLAY_MS);
 
 function chunkAssets(all: string[], size: number): string[][] {
   const out: string[][] = [];

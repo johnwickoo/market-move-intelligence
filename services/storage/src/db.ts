@@ -25,3 +25,8 @@ export async function insertTrade(trade:TradeInsert)
         }
     }
 
+export async function insertTradeBatch(trades: TradeInsert[]) {
+  if (trades.length === 0) return;
+  const { error } = await supabase.from("trades").insert(trades);
+  if (error) throw error;
+}
