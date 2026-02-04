@@ -9,8 +9,8 @@
     "packages/*"
   ],
   "scripts": {
-    "build": "echo \"TODO: add build\"",
-    "dev": "echo \"TODO: add dev\"",
+    "build": "npm --workspace @market-move-intelligence/web run build",
+    "dev": "npm --workspace @market-move-intelligence/web run dev",
     "lint": "echo \"TODO: add lint\"",
     "test": "echo \"TODO: add test\""
   },
@@ -19,7 +19,5 @@
     "@types/react-dom": "^19.2.3",
     "typescript": "^5.5.0"
   },
-  "dependencies": {
-    "react": "^19.2.3"
-  }
+  "dependencies": {}
 }

@@ -6,6 +6,8 @@ type PriceUpdate = {
   outcome?: string | null;
   price: number;
   spreadPct?: number | null;
+  bestBidSize?: number | null;
+  bestAskSize?: number | null;
   tsMs: number;
   source: "mid" | "trade";
 };
@@ -31,6 +33,9 @@ type State = {
   emaPendingCount: number;
   emaLastUpTs: number;
   emaLastDownTs: number;
+  pendingPrice: number;
+  pendingStartTs: number;
+  pendingCount: number;
 };
 
 const BUCKET_MS = 60_000;
@@ -47,6 +52,10 @@ const EMA_MIN_PCT = Number(process.env.MOVEMENT_RT_EMA_MIN_PCT ?? 0.003);
 const EMA_GAP_PCT = Number(process.env.MOVEMENT_RT_EMA_GAP_PCT ?? 0.005);
 const EMA_CONFIRM_TICKS = Number(process.env.MOVEMENT_RT_EMA_CONFIRM_TICKS ?? 3);
 const EMA_DIR_COOLDOWN_MS = Number(process.env.MOVEMENT_RT_EMA_DIR_COOLDOWN_MS ?? 90_000);
+const MIN_TOP_SIZE = Number(process.env.MOVEMENT_RT_MIN_TOP_SIZE ?? 5);
+const PERSIST_TICKS = Number(process.env.MOVEMENT_RT_PERSIST_TICKS ?? 3);
+const PERSIST_MS = Number(process.env.MOVEMENT_RT_PERSIST_MS ?? 5000);
+const TRADE_CONFIRM_MS = Number(process.env.MOVEMENT_RT_TRADE_CONFIRM_MS ?? 60_000);
 
 function emaUpdate(prev: number, price: number, dtMs: number, tauMs: number) {
   const alpha = 1 - Math.exp(-dtMs / tauMs);
@@ -63,6 +72,12 @@ function nowIso(ms: number) {
 
 export class MovementRealtime {
   private states = new Map<string, State>();
+  private lastTradeByAsset = new Map<string, number>();
+
+  onTrade = (marketId: string, assetId: string, tsMs: number) => {
+    if (!marketId || !assetId || !Number.isFinite(tsMs)) return;
+    this.lastTradeByAsset.set(`${marketId}:${assetId}`, tsMs);
+  };
 
   onPriceUpdate = async (u: PriceUpdate) => {
     if (!Number.isFinite(u.price) || !Number.isFinite(u.tsMs)) return;
@@ -79,11 +94,14 @@ export class MovementRealtime {
     state.lastPrice = u.price;
     state.lastTs = u.tsMs;
 
-    try {
-      await this.checkBreakout(u, state);
-      await this.checkEmaCross(u, state);
-    } catch (err) {
-      console.error("[movement-rt] insert failed", err);
+    const stable = this.updateStability(state, u);
+    if (stable) {
+      try {
+        await this.checkBreakout(u, state);
+        await this.checkEmaCross(u, state);
+      } catch (err) {
+        console.error("[movement-rt] insert failed", err);
+      }
     }
 
     this.evictIdle();
@@ -103,6 +121,9 @@ export class MovementRealtime {
       emaPendingCount: 0,
       emaLastUpTs: 0,
       emaLastDownTs: 0,
+      pendingPrice: u.price,
+      pendingStartTs: u.tsMs,
+      pendingCount: 1,
     };
     this.updateBuckets(state, u.tsMs, u.price);
     this.states.set(`${u.market_id}:${u.asset_id}`, state);
@@ -117,8 +138,28 @@ export class MovementRealtime {
     ) {
       return true;
     }
+    const bidSizeOk = u.bestBidSize != null && Number.isFinite(u.bestBidSize);
+    const askSizeOk = u.bestAskSize != null && Number.isFinite(u.bestAskSize);
+    if (MIN_TOP_SIZE > 0 && (bidSizeOk || askSizeOk)) {
+      const bidSize = bidSizeOk ? (u.bestBidSize as number) : Infinity;
+      const askSize = askSizeOk ? (u.bestAskSize as number) : Infinity;
+      if (bidSize < MIN_TOP_SIZE && askSize < MIN_TOP_SIZE) return true;
+    }
     if (u.tsMs - state.lastTs < MIN_UPDATE_MS) return true;
     if (Math.abs(u.price - state.lastPrice) < MIN_STEP) return true;
+    return false;
+  }
+
+  private updateStability(state: State, u: PriceUpdate) {
+    if (Math.abs(u.price - state.pendingPrice) < MIN_STEP) {
+      state.pendingCount += 1;
+    } else {
+      state.pendingPrice = u.price;
+      state.pendingStartTs = u.tsMs;
+      state.pendingCount = 1;
+    }
+    if (PERSIST_TICKS > 0 && state.pendingCount >= PERSIST_TICKS) return true;
+    if (PERSIST_MS > 0 && u.tsMs - state.pendingStartTs >= PERSIST_MS) return true;
     return false;
   }
 
@@ -220,6 +261,7 @@ export class MovementRealtime {
   ) {
     const last = this.getLastEventTs(u, reason);
     if (u.tsMs - last < EVENT_COOLDOWN_MS) return;
+    if (!this.hasRecentTrade(u)) return;
 
     this.setLastEventTs(u, reason, u.tsMs);
 
@@ -262,6 +304,13 @@ export class MovementRealtime {
     for (const [key, s] of this.states.entries()) {
       if (now - s.lastTs > EVICT_IDLE_MS) this.states.delete(key);
     }
+  }
+
+  private hasRecentTrade(u: PriceUpdate) {
+    if (u.source === "trade") return true;
+    if (TRADE_CONFIRM_MS <= 0) return true;
+    const lastTrade = this.lastTradeByAsset.get(`${u.market_id}:${u.asset_id}`) ?? 0;
+    return u.tsMs - lastTrade <= TRADE_CONFIRM_MS;
   }
 }
 

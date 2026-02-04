@@ -11,6 +11,41 @@ import type { TradeInsert } from "../../storage/src/types";
 import * as fs from "fs/promises";
 import * as path from "path";
 
+const LOG_FILE = (process.env.LOG_FILE ?? path.join("/tmp", "mmi-ingestion.log")).trim();
+if (LOG_FILE) {
+  const origLog = console.log.bind(console);
+  const origWarn = console.warn.bind(console);
+  const origError = console.error.bind(console);
+  let logWrite = Promise.resolve();
+  const serialize = (v: any) => {
+    if (typeof v === "string") return v;
+    try {
+      return JSON.stringify(v);
+    } catch {
+      return String(v);
+    }
+  };
+  const writeLine = (level: "INFO" | "WARN" | "ERROR", args: any[]) => {
+    const line =
+      `[${new Date().toISOString()}] [${level}] ` +
+      args.map(serialize).join(" ") +
+      "\n";
+    logWrite = logWrite.then(() => fs.appendFile(LOG_FILE, line, "utf8")).catch(() => {});
+  };
+  console.log = (...args: any[]) => {
+    origLog(...args);
+    writeLine("INFO", args);
+  };
+  console.warn = (...args: any[]) => {
+    origWarn(...args);
+    writeLine("WARN", args);
+  };
+  console.error = (...args: any[]) => {
+    origError(...args);
+    writeLine("ERROR", args);
+  };
+}
+
 const assetMeta = new Map<string, { marketId: string; outcome: string | null }>();
 const trackedAssets = new Set<string>();
 const hydratedMarkets = new Set<string>();
@@ -38,7 +73,10 @@ const lastSelectionUpdate = new Map<string, number>();
 const marketAssetStats = new Map<string, Map<string, AssetStats>>();
 const dominantOutcomeByMarket = new Map<string, { outcome: string; ts: number }>();
 
-const lastTopByAsset = new Map<string, { bid: number; ask: number; bucket: number }>();
+const lastTopByAsset = new Map<
+  string,
+  { bid: number | null; ask: number | null; mid: number | null; bucket: number }
+>();
 const MID_BUCKET_MS = 2000;
 const latestSignalByAsset = new Map<string, { price: number; ts: number }>();
 const lastMovementGate = new Map<string, { price: number; ts: number }>();
@@ -255,22 +293,29 @@ function roundPx(n: number, decimals = 3) {
   return Math.round(n * f) / f;
 }
 
-function shouldStoreMid(assetId: string, bestBid: number, bestAsk: number, nowMs: number) {
+function shouldStoreMid(
+  assetId: string,
+  bestBid: number | null,
+  bestAsk: number | null,
+  mid: number | null,
+  nowMs: number
+) {
   const bucket = Math.floor(nowMs / MID_BUCKET_MS);
-  const bid = roundPx(bestBid, 3);
-  const ask = roundPx(bestAsk, 3);
+  const bid = bestBid != null ? roundPx(bestBid, 3) : null;
+  const ask = bestAsk != null ? roundPx(bestAsk, 3) : null;
+  const m = mid != null ? roundPx(mid, 3) : null;
 
   const prev = lastTopByAsset.get(assetId);
   if (!prev) {
-    lastTopByAsset.set(assetId, { bid, ask, bucket });
+    lastTopByAsset.set(assetId, { bid, ask, mid: m, bucket });
     return true;
   }
 
-  const changed = bid !== prev.bid || ask !== prev.ask;
+  const changed = bid !== prev.bid || ask !== prev.ask || m !== prev.mid;
   const bucketChanged = bucket !== prev.bucket;
 
   if (changed || bucketChanged) {
-    lastTopByAsset.set(assetId, { bid, ask, bucket });
+    lastTopByAsset.set(assetId, { bid, ask, mid: m, bucket });
     return true;
   }
   return false;
@@ -486,23 +531,47 @@ function logGroupedTrade(
 }
 
 function bestBidFromBids(bids: any[] | undefined): number | null {
-  if (!Array.isArray(bids) || bids.length === 0) return null;
-  let best = -Infinity;
-  for (const lvl of bids) {
-    const px = Number(lvl?.price ?? lvl?.p ?? lvl?.[0]);
-    if (Number.isFinite(px)) best = Math.max(best, px);
-  }
-  return best === -Infinity ? null : best;
+  return bestBidLevelFromBids(bids)?.price ?? null;
 }
 
 function bestAskFromAsks(asks: any[] | undefined): number | null {
+  return bestAskLevelFromAsks(asks)?.price ?? null;
+}
+
+function bestBidLevelFromBids(
+  bids: any[] | undefined
+): { price: number; size: number } | null {
+  if (!Array.isArray(bids) || bids.length === 0) return null;
+  let bestPrice = -Infinity;
+  let bestSize = 0;
+  for (const lvl of bids) {
+    const px = Number(lvl?.price ?? lvl?.p ?? lvl?.[0]);
+    if (!Number.isFinite(px)) continue;
+    if (px > bestPrice) {
+      bestPrice = px;
+      const sz = Number(lvl?.size ?? lvl?.s ?? lvl?.[1]);
+      bestSize = Number.isFinite(sz) ? sz : 0;
+    }
+  }
+  return bestPrice === -Infinity ? null : { price: bestPrice, size: bestSize };
+}
+
+function bestAskLevelFromAsks(
+  asks: any[] | undefined
+): { price: number; size: number } | null {
   if (!Array.isArray(asks) || asks.length === 0) return null;
-  let best = Infinity;
+  let bestPrice = Infinity;
+  let bestSize = 0;
   for (const lvl of asks) {
     const px = Number(lvl?.price ?? lvl?.p ?? lvl?.[0]);
-    if (Number.isFinite(px)) best = Math.min(best, px);
+    if (!Number.isFinite(px)) continue;
+    if (px < bestPrice) {
+      bestPrice = px;
+      const sz = Number(lvl?.size ?? lvl?.s ?? lvl?.[1]);
+      bestSize = Number.isFinite(sz) ? sz : 0;
+    }
   }
-  return best === Infinity ? null : best;
+  return bestPrice === Infinity ? null : { price: bestPrice, size: bestSize };
 }
 
 export function toSyntheticMid(msg: any) {
@@ -510,10 +579,16 @@ export function toSyntheticMid(msg: any) {
   if (!assetId) return null;
   const marketId = String(msg?.market ?? msg?.market_id ?? "");
 
+  const bidLevel = bestBidLevelFromBids(msg?.bids);
+  const askLevel = bestAskLevelFromAsks(msg?.asks);
   const bestBidRaw =
-    msg?.best_bid != null ? Number(msg.best_bid) : bestBidFromBids(msg?.bids);
+    msg?.best_bid != null ? Number(msg.best_bid) : bidLevel?.price;
   const bestAskRaw =
-    msg?.best_ask != null ? Number(msg.best_ask) : bestAskFromAsks(msg?.asks);
+    msg?.best_ask != null ? Number(msg.best_ask) : askLevel?.price;
+  const bestBidSize =
+    msg?.best_bid_size != null ? Number(msg.best_bid_size) : bidLevel?.size ?? null;
+  const bestAskSize =
+    msg?.best_ask_size != null ? Number(msg.best_ask_size) : askLevel?.size ?? null;
 
   const bidOk = Number.isFinite(bestBidRaw);
   const askOk = Number.isFinite(bestAskRaw);
@@ -545,7 +620,19 @@ export function toSyntheticMid(msg: any) {
     latestSignalByAsset.set(assetId, { price: mid, ts: tsMs });
   }
 
-  return { assetId, marketId, bestBid, bestAsk, mid, spread, spreadPct, tsMs, raw: msg };
+  return {
+    assetId,
+    marketId,
+    bestBid,
+    bestAsk,
+    bestBidSize,
+    bestAskSize,
+    mid,
+    spread,
+    spreadPct,
+    tsMs,
+    raw: msg,
+  };
 }
 
 
@@ -606,6 +693,9 @@ connectPolymarketWS({
         marketId: trade.market_id,
         outcome: trade.outcome ? String(trade.outcome) : null,
       });
+      if (Number.isFinite(tradeTsMs)) {
+        movementRealtime.onTrade(trade.market_id, rawAssetId, tradeTsMs);
+      }
       if (!trackedAssets.has(rawAssetId)) {
         trackedAssets.add(rawAssetId);
         scheduleClobReconnect();
@@ -815,14 +905,16 @@ async function onClobTick(msg: any) {
         outcome,
         price: t.mid,
         spreadPct: t.spreadPct,
+        bestBidSize: t.bestBidSize ?? null,
+        bestAskSize: t.bestAskSize ?? null,
         tsMs: t.tsMs,
         source: "mid",
       });
     }
 
     try {
-      if (t.bestBid == null || t.bestAsk == null) return;
-      if (!shouldStoreMid(t.assetId, t.bestBid, t.bestAsk, t.tsMs)) return;
+      if (t.mid == null || !Number.isFinite(t.mid)) return;
+      if (!shouldStoreMid(t.assetId, t.bestBid, t.bestAsk, t.mid, t.tsMs)) return;
       await withRetry(
         () =>
           insertMidTick({
@@ -841,8 +933,11 @@ async function onClobTick(msg: any) {
       );
 
       if (process.env.LOG_MID === "1") {
+        const tsIso = new Date(t.tsMs).toISOString();
         console.log(
-          `[mid] ${outcome} mid=${(t.mid ?? 0).toFixed(4)} spread%=${t.spreadPct?.toFixed(4) ?? "n/a"}`
+          `[mid] market=${marketId} outcome=${outcome ?? "n/a"} asset=${t.assetId} ts=${tsIso} ` +
+            `bid=${t.bestBid?.toFixed(4) ?? "n/a"} ask=${t.bestAsk?.toFixed(4) ?? "n/a"} ` +
+            `mid=${(t.mid ?? 0).toFixed(4)} spread%=${t.spreadPct?.toFixed(4) ?? "n/a"}`
         );
       }
     } catch (e: any) {

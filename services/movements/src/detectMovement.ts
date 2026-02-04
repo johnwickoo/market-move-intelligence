@@ -6,6 +6,7 @@ type MovementInsert = {
   id: string;
   market_id: string;
   outcome: string | null;
+  window_type: "24h" | "event";
   window_start: string;
   window_end: string;
 
@@ -76,11 +77,28 @@ export async function detectMovement(trade: TradeInsert) {
   const computeKey = `${marketId}:${outcome ?? "NA"}`;
   if (shouldSkipCompute(computeKey, nowMs)) return;
 
-  const { startISO, endISO } = windowBounds(nowMs);
+  let { startISO, endISO } = windowBounds(nowMs);
+
+  // Clamp window start to first_seen_at so we don't report pre-tracking windows.
+  const { data: agg, error: aggErr } = await supabase
+    .from("market_aggregates")
+    .select("total_volume, first_seen_at")
+    .eq("market_id", marketId)
+    .maybeSingle();
+  if (aggErr) throw aggErr;
+  const totalVol = agg?.total_volume == null ? null : toNum(agg.total_volume);
+  const firstSeenISO = (agg as any)?.first_seen_at as string | null;
+  if (firstSeenISO) {
+    const firstMs = Date.parse(firstSeenISO);
+    if (Number.isFinite(firstMs) && firstMs > Date.parse(startISO)) {
+      startISO = new Date(firstMs).toISOString();
+    }
+  }
 
   // deterministic id: market + outcome + hourly bucket
   const bucket = bucketIdHour(nowMs);
-  const movementId = `${marketId}:${outcome ?? "NA"}:${bucket}`;
+  const movementId24h = `${marketId}:${outcome ?? "NA"}:24h:${bucket}`;
+  const movementIdEvent = `${marketId}:${outcome ?? "NA"}:event:${bucket}`;
 
   // =========================================================
   // 1) TRADES in last 24h → VOLUME + trade-based liquidity hints
@@ -171,27 +189,74 @@ export async function detectMovement(trade: TradeInsert) {
     avgSpreadPct = spreadN > 0 ? spreadSum / spreadN : null;
   }
 
+  const baseStartMid = startMid;
+  const baseEndMid = endMid;
+  const baseMinMid = minMid;
+  const baseMaxMid = maxMid;
+  const baseMidDriftPct = midDriftPct;
+  const baseMidRangePct = midRangePct;
+  const baseAvgSpreadPct = avgSpreadPct;
+
+  // =========================================================
+  // 2b) Anchor start_price to last movement end (if recent)
+  // =========================================================
+  let effectiveStartISO = startISO;
+  if (hasTicks && endMid != null) {
+    const { data: lastMove } = await supabase
+      .from("market_movements")
+      .select("end_price, window_end")
+      .eq("market_id", marketId)
+      .eq("outcome", outcome)
+      .order("window_end", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    const lastEndPrice = (lastMove as any)?.end_price;
+    const lastEndISO = (lastMove as any)?.window_end as string | undefined;
+    const lastEndMs = lastEndISO ? Date.parse(lastEndISO) : NaN;
+    if (lastEndPrice != null && Number.isFinite(lastEndMs)) {
+      if (lastEndMs > Date.parse(startISO) && lastEndMs <= nowMs) {
+        startMid = toNum(lastEndPrice);
+        effectiveStartISO = lastEndISO as string;
+        if (startMid > 0) {
+          midDriftPct = (endMid - startMid) / startMid;
+        }
+      }
+    }
+  }
+
+  let eventMinMid = minMid;
+  let eventMaxMid = maxMid;
+  let eventMidRangePct = midRangePct;
+  if (hasTicks && ticks && effectiveStartISO !== startISO) {
+    const eventStartMs = Date.parse(effectiveStartISO);
+    eventMinMid = null;
+    eventMaxMid = null;
+    for (const tk of ticks) {
+      const ts = Date.parse(tk.ts);
+      if (!Number.isFinite(ts) || ts < eventStartMs) continue;
+      if (tk.mid == null) continue;
+      const m = toNum(tk.mid);
+      eventMinMid = eventMinMid == null ? m : Math.min(eventMinMid, m);
+      eventMaxMid = eventMaxMid == null ? m : Math.max(eventMaxMid, m);
+    }
+    if (eventMinMid != null && eventMaxMid != null && eventMinMid > 0) {
+      eventMidRangePct = (eventMaxMid - eventMinMid) / eventMinMid;
+    }
+  }
+
   // =========================================================
   // 3) baseline daily volume from aggregates (scaled by observed days)
   // =========================================================
-  const { data: agg, error: aggErr } = await supabase
-    .from("market_aggregates")
-    .select("total_volume, first_seen_at")
-    .eq("market_id", marketId)
-    .maybeSingle();
-  if (aggErr) throw aggErr;
-
-  const totalVol = agg?.total_volume == null ? null : toNum(agg.total_volume);
-  const firstSeenISO = (agg as any)?.first_seen_at as string | null;
-
   let observedDays = 30;
+  let baselineOk = true;
   if (firstSeenISO) {
     const firstMs = Date.parse(firstSeenISO);
     const ageDays = Math.max(1, Math.ceil((nowMs - firstMs) / (24 * 60 * 60 * 1000)));
     observedDays = Math.min(30, ageDays);
+    if (ageDays < 7) baselineOk = false;
   }
 
-  const baselineDaily = totalVol == null ? null : totalVol / observedDays;
+  const baselineDaily = totalVol == null || !baselineOk ? null : totalVol / observedDays;
   const baselineHourly = baselineDaily == null ? null : baselineDaily / 24;
 
   const volumeRatio =
@@ -217,6 +282,21 @@ export async function detectMovement(trade: TradeInsert) {
   const hourlyRatio =
     baselineHourly != null && baselineHourly > 0 ? maxHourVol / baselineHourly : null;
 
+  const eventStartMs = Date.parse(effectiveStartISO);
+  const eventTrades = Number.isFinite(eventStartMs)
+    ? trades.filter((t) => Date.parse(t.timestamp) >= eventStartMs)
+    : trades;
+  const eventTradesCount = eventTrades.length;
+  const eventVolume = eventTrades.reduce((sum, t) => sum + toNum(t.size ?? 0), 0);
+  const eventAvgTradeSize =
+    eventTradesCount > 0 ? eventVolume / eventTradesCount : null;
+  const eventPriceLevelsSet = new Set<number>();
+  for (const t of eventTrades) {
+    if (t.price == null) continue;
+    eventPriceLevelsSet.add(Number(toNum(t.price).toFixed(2)));
+  }
+  const eventPriceLevels = eventPriceLevelsSet.size;
+
   // =========================================================
   // 5) LIQUIDITY GUARD (spread + trade sparsity)
   // =========================================================
@@ -224,7 +304,7 @@ export async function detectMovement(trade: TradeInsert) {
   const THIN_PRICE_LEVELS = 8;
   const WIDE_SPREAD = 0.05; // 5%
 
-  const thinBySpread = avgSpreadPct != null && avgSpreadPct >= WIDE_SPREAD;
+  const thinBySpread = baseAvgSpreadPct != null && baseAvgSpreadPct >= WIDE_SPREAD;
   const thinLiquidity =
     thinBySpread ||
     tradesCount < THIN_TRADE_COUNT ||
@@ -238,19 +318,34 @@ export async function detectMovement(trade: TradeInsert) {
   const VOLUME_THRESHOLD = Number(process.env.MOVEMENT_VOLUME_THRESHOLD ?? 1.5);
   const MIN_PRICE_FOR_ALERT = Number(process.env.MOVEMENT_MIN_PRICE_FOR_ALERT ?? 0.05);
   const MIN_ABS_MOVE = Number(process.env.MOVEMENT_MIN_ABS_MOVE ?? 0.03);
+  const CONFIRM_MINUTES = Number(process.env.MOVEMENT_CONFIRM_MINUTES ?? 10);
+  const CONFIRM_MIN_TICKS = Number(process.env.MOVEMENT_CONFIRM_MIN_TICKS ?? 3);
 
   // PRICE uses MID ticks (not trade prints)
-  const absMove =
-    minMid != null && maxMid != null ? Math.abs(maxMid - minMid) : null;
-  const priceEligible = minMid != null && minMid >= MIN_PRICE_FOR_ALERT;
-  const driftHit =
+  const absMove24 =
+    baseMinMid != null && baseMaxMid != null ? Math.abs(baseMaxMid - baseMinMid) : null;
+  const priceEligible24 = baseMinMid != null && baseMinMid >= MIN_PRICE_FOR_ALERT;
+  const driftHit24 =
+    baseMidDriftPct != null &&
+    Math.abs(baseMidDriftPct) >= (thinLiquidity ? THIN_PRICE_THRESHOLD : PRICE_THRESHOLD);
+  const rangeHit24 =
+    baseMidRangePct != null &&
+    baseMidRangePct >= (thinLiquidity ? THIN_PRICE_THRESHOLD : PRICE_THRESHOLD);
+  const absHit24 = absMove24 != null && absMove24 >= MIN_ABS_MOVE;
+  const priceHit24 = hasTicks ? priceEligible24 && absHit24 && (driftHit24 || rangeHit24) : false;
+
+  const absMoveEvent =
+    eventMinMid != null && eventMaxMid != null ? Math.abs(eventMaxMid - eventMinMid) : null;
+  const priceEligibleEvent = eventMinMid != null && eventMinMid >= MIN_PRICE_FOR_ALERT;
+  const driftHitEvent =
     midDriftPct != null &&
     Math.abs(midDriftPct) >= (thinLiquidity ? THIN_PRICE_THRESHOLD : PRICE_THRESHOLD);
-  const rangeHit =
-    midRangePct != null &&
-    midRangePct >= (thinLiquidity ? THIN_PRICE_THRESHOLD : PRICE_THRESHOLD);
-  const absHit = absMove != null && absMove >= MIN_ABS_MOVE;
-  const priceHit = hasTicks ? priceEligible && absHit && (driftHit || rangeHit) : false;
+  const rangeHitEvent =
+    eventMidRangePct != null &&
+    eventMidRangePct >= (thinLiquidity ? THIN_PRICE_THRESHOLD : PRICE_THRESHOLD);
+  const absHitEvent = absMoveEvent != null && absMoveEvent >= MIN_ABS_MOVE;
+  const priceHitEvent =
+    hasTicks ? priceEligibleEvent && absHitEvent && (driftHitEvent || rangeHitEvent) : false;
 
   // VOLUME uses trades vs baseline (daily + hourly spike)
   const hasEnoughHistoryForVolume = observedDays >= 3;
@@ -263,58 +358,131 @@ export async function detectMovement(trade: TradeInsert) {
 
   const volHit = dailyVolHit || hourlyVolHit;
 
-  if (!priceHit && !volHit) return;
-
-  const reason: MovementInsert["reason"] =
-    priceHit && volHit ? "BOTH" : priceHit ? "PRICE" : "VOLUME";
-
-  const row: MovementInsert = {
-    id: movementId,
-    market_id: marketId,
-    outcome,
-    window_start: startISO,
-    window_end: endISO,
-
-    // ✅ store MID-based numbers here for now
-    start_price: startMid,
-    end_price: endMid,
-    pct_change: midDriftPct,
-
-    volume_24h: volume24h,
-    baseline_daily_volume: baselineDaily,
-    volume_ratio: volumeRatio,
-
-    reason,
-
-    min_price_24h: minMid,
-    max_price_24h: maxMid,
-    range_pct: midRangePct,
-
-    max_hour_volume: maxHourVol,
-    hourly_volume_ratio: hourlyRatio,
-
-    trades_count_24h: tradesCount,
-    unique_price_levels_24h: uniquePriceLevels,
-    avg_trade_size_24h: avgTradeSize24h,
-    thin_liquidity: thinLiquidity,
-  };
-
-  // ✅ idempotency: insert once per hour bucket
-  const { error: insErr } = await supabase.from("market_movements").insert(row);
-
-  if (insErr) {
-    const msg = insErr.message ?? "";
-    if (msg.includes("duplicate key")) return;
-    console.error("[movement] insert failed", msg, "id", movementId);
-    throw insErr;
+  // PRICE confirmation: require persistence if volume hasn't confirmed
+  let priceConfirmed = priceHitEvent;
+  if (priceHitEvent && !volHit && hasTicks && ticks && startMid != null && endMid != null) {
+    const confirmMs = Math.max(1, CONFIRM_MINUTES) * 60 * 1000;
+    const confirmStartMs = nowMs - confirmMs;
+    let wMin: number | null = null;
+    let wMax: number | null = null;
+    let wCount = 0;
+    let wStartPrice: number | null = null;
+    for (const tk of ticks) {
+      const ts = Date.parse(tk.ts);
+      if (!Number.isFinite(ts) || ts < confirmStartMs) continue;
+      if (tk.mid == null) continue;
+      const m = toNum(tk.mid);
+      wMin = wMin == null ? m : Math.min(wMin, m);
+      wMax = wMax == null ? m : Math.max(wMax, m);
+      if (wStartPrice == null) wStartPrice = m;
+      wCount += 1;
+    }
+    const thresh = thinLiquidity ? THIN_PRICE_THRESHOLD : PRICE_THRESHOLD;
+    const confirmThresh = thresh * 0.5;
+    if (wCount >= CONFIRM_MIN_TICKS && wMin != null && wMax != null) {
+      const upMove = endMid >= startMid;
+      if (upMove) {
+        priceConfirmed =
+          wMin >= startMid * (1 + confirmThresh) || (wMin - startMid) >= MIN_ABS_MOVE;
+      } else {
+        priceConfirmed =
+          wMax <= startMid * (1 - confirmThresh) || (startMid - wMax) >= MIN_ABS_MOVE;
+      }
+    } else {
+      priceConfirmed = false;
+    }
+    if (!priceConfirmed) {
+      console.log("[movement] skip price not confirmed", {
+        market_id: marketId,
+        outcome: outcome ?? "-",
+        confirm_minutes: CONFIRM_MINUTES,
+        confirm_ticks: CONFIRM_MIN_TICKS,
+        ticks_in_window: wCount,
+        start_price: startMid,
+        end_price: endMid,
+        window_start_price: wStartPrice,
+        window_min: wMin,
+        window_max: wMax,
+      });
+    }
   }
 
-  await scoreSignals(row);
+  if (!priceHit24 && !volHit && !priceConfirmed) return;
 
-  console.log(
-    `[movement] ${reason} market=${marketId} outcome=${outcome ?? "-"} ` +
-      `mid_drift=${midDriftPct?.toFixed(3) ?? "n/a"} mid_range=${midRangePct?.toFixed(3) ?? "n/a"} ` +
-      `vol24h=${volume24h.toFixed(2)} vr=${volumeRatio?.toFixed(2) ?? "n/a"} ` +
-      `hr=${hourlyRatio?.toFixed(2) ?? "n/a"} thin=${thinLiquidity}`
-  );
+  const reason24: MovementInsert["reason"] =
+    priceHit24 && volHit ? "BOTH" : priceHit24 ? "PRICE" : "VOLUME";
+
+  async function insertMovement(row: MovementInsert) {
+    const { error: insErr } = await supabase.from("market_movements").insert(row);
+    if (insErr) {
+      const msg = insErr.message ?? "";
+      if (msg.includes("duplicate key")) return false;
+      console.error("[movement] insert failed", msg, "id", row.id);
+      throw insErr;
+    }
+    await scoreSignals(row);
+    console.log(
+      `[movement] ${row.reason} market=${marketId} outcome=${outcome ?? "-"} ` +
+        `mid_drift=${row.pct_change?.toFixed(3) ?? "n/a"} mid_range=${row.range_pct?.toFixed(3) ?? "n/a"} ` +
+        `vol24h=${row.volume_24h.toFixed(2)} vr=${row.volume_ratio?.toFixed(2) ?? "n/a"} ` +
+        `hr=${row.hourly_volume_ratio?.toFixed(2) ?? "n/a"} thin=${thinLiquidity} window=${row.window_start}`
+    );
+    return true;
+  }
+
+  if (priceHit24 || volHit) {
+    const row24: MovementInsert = {
+      id: movementId24h,
+      market_id: marketId,
+      outcome,
+      window_type: "24h",
+      window_start: startISO,
+      window_end: endISO,
+      start_price: baseStartMid,
+      end_price: baseEndMid,
+      pct_change: baseMidDriftPct,
+      volume_24h: volume24h,
+      baseline_daily_volume: baselineDaily,
+      volume_ratio: volumeRatio,
+      reason: reason24,
+      min_price_24h: baseMinMid,
+      max_price_24h: baseMaxMid,
+      range_pct: baseMidRangePct,
+      max_hour_volume: maxHourVol,
+      hourly_volume_ratio: hourlyRatio,
+      trades_count_24h: tradesCount,
+      unique_price_levels_24h: uniquePriceLevels,
+      avg_trade_size_24h: avgTradeSize24h,
+      thin_liquidity: thinLiquidity,
+    };
+    await insertMovement(row24);
+  }
+
+  if (priceConfirmed && effectiveStartISO !== startISO) {
+    const rowEvent: MovementInsert = {
+      id: movementIdEvent,
+      market_id: marketId,
+      outcome,
+      window_type: "event",
+      window_start: effectiveStartISO,
+      window_end: endISO,
+      start_price: startMid,
+      end_price: endMid,
+      pct_change: midDriftPct,
+      volume_24h: eventVolume,
+      baseline_daily_volume: null,
+      volume_ratio: null,
+      reason: "PRICE",
+      min_price_24h: eventMinMid,
+      max_price_24h: eventMaxMid,
+      range_pct: eventMidRangePct,
+      max_hour_volume: null,
+      hourly_volume_ratio: null,
+      trades_count_24h: eventTradesCount,
+      unique_price_levels_24h: eventPriceLevels,
+      avg_trade_size_24h: eventAvgTradeSize,
+      thin_liquidity: thinLiquidity,
+    };
+    await insertMovement(rowEvent);
+  }
 }

@@ -13,11 +13,22 @@ export function buildExplanation(movement: any, signal: any): string {
       : 24;
 
   const priceSentence = `Price moved ${(pctChange * 100).toFixed(0)}% over ${windowHours}h.`;
+  const windowType = String(movement?.window_type ?? "");
+  const windowSentence =
+    windowType === "event"
+      ? "This is a recent move since the last signal."
+      : "This is the rolling 24h window.";
 
-  const volumeRatio = safeNum(movement?.volume_ratio, 0);
+  const volumeRatioRaw = movement?.volume_ratio;
+  const volumeRatio = safeNum(volumeRatioRaw, 0);
   let volumeSentence = "Volume was near typical levels.";
-  if (volumeRatio < 0.8) volumeSentence = "Volume was below recent average.";
-  else if (volumeRatio > 1.5) volumeSentence = "Volume spiked above normal levels.";
+  if (volumeRatioRaw == null || !Number.isFinite(Number(volumeRatioRaw))) {
+    volumeSentence = "Volume baseline is not reliable yet (insufficient history).";
+  } else if (volumeRatio < 0.8) {
+    volumeSentence = "Volume was below recent average.";
+  } else if (volumeRatio > 1.5) {
+    volumeSentence = "Volume spiked above normal levels.";
+  }
 
   const thin = Boolean(movement?.thin_liquidity);
   const liquiditySentence = thin
@@ -31,12 +42,12 @@ export function buildExplanation(movement: any, signal: any): string {
   } else if (classification === "INFO") {
     classificationSentence = "Move appears driven by new information or sentiment.";
   } else if (classification === "LIQUIDITY") {
-    classificationSentence = "Move likely caused by low liquidity rather than conviction.";
+    classificationSentence = "Liquidity risk is high; thin books can exaggerate moves.";
   } else if (classification === "TIME") {
     classificationSentence = "Move may be related to time-to-resolution dynamics.";
   }
 
-  return [priceSentence, volumeSentence, liquiditySentence, classificationSentence]
+  return [priceSentence, windowSentence, volumeSentence, liquiditySentence, classificationSentence]
     .filter(Boolean)
     .join(" ");
 }

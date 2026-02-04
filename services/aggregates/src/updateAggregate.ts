@@ -47,8 +47,7 @@ type AggregateDelta = {
 };
 
 async function applyAggregateDelta(marketId: string, delta: AggregateDelta) {
-  // 30d rolling window definition (simple for now; no subtraction yet)
-  const windowStart = isoDaysAgo(30);
+  // Window start should not predate first_seen_at; keep it aligned to observed data.
   const windowEnd = delta.lastTimestamp;
 
   // 1) load existing row
@@ -64,7 +63,7 @@ async function applyAggregateDelta(marketId: string, delta: AggregateDelta) {
   if (!existing) {
     const row = {
       market_id: marketId,
-      window_start: windowStart,
+      window_start: delta.firstSeenAt,
       window_end: windowEnd,
 
       trade_count: delta.count,
@@ -112,9 +111,13 @@ async function applyAggregateDelta(marketId: string, delta: AggregateDelta) {
   const newMin = oldMin == null ? delta.minPrice : Math.min(oldMin, delta.minPrice);
   const newMax = oldMax == null ? delta.maxPrice : Math.max(oldMax, delta.maxPrice);
   const existingFirstSeen = (existing as any).first_seen_at as string | null;
+  const nextFirstSeen =
+    existingFirstSeen && Date.parse(existingFirstSeen) <= Date.parse(delta.firstSeenAt)
+      ? existingFirstSeen
+      : delta.firstSeenAt;
 
   const patch = {
-    window_start: windowStart,
+    window_start: nextFirstSeen,
     window_end: windowEnd,
 
     trade_count: newCount,
@@ -129,7 +132,7 @@ async function applyAggregateDelta(marketId: string, delta: AggregateDelta) {
 
     updated_at: windowEnd,
 
-    ...(existingFirstSeen ? {} : { first_seen_at: delta.firstSeenAt }),
+    first_seen_at: nextFirstSeen,
   };
 
   const { error: updateErr } = await supabase

@@ -4,7 +4,20 @@
   "private": true,
   "type": "module",
   "main": "src/app/page.tsx",
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start"
+  },
+  "dependencies": {
+    "lightweight-charts": "^4.2.0",
+    "next": "^15.1.3",
+    "react": "^19.2.3",
+    "react-dom": "^19.2.3"
+  },
   "devDependencies": {
-    "typescript": "^5.5.0"
+    "typescript": "^5.5.0",
+    "@types/react": "^19.2.9",
+    "@types/react-dom": "^19.2.3"
   }
 }

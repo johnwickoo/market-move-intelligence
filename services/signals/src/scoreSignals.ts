@@ -19,8 +19,10 @@ export async function scoreSignals(movement: any) {
   const range = Math.abs(safeNum(movement.range_pct, 0));   // e.g. 0.35
 
   // VOLUME signals
-  const volumeRatio = safeNum(movement.volume_ratio, 0);          // 24h / baselineDaily
-  const hourlyRatio = safeNum(movement.hourly_volume_ratio, 0);   // maxHour / baselineHourly
+  const volumeRatioRaw = movement.volume_ratio;
+  const hourlyRatioRaw = movement.hourly_volume_ratio;
+  const volumeRatio = safeNum(volumeRatioRaw, 0);          // 24h / baselineDaily
+  const hourlyRatio = safeNum(hourlyRatioRaw, 0);   // maxHour / baselineHourly
 
   // Liquidity stats (optional; you already store these)
   const tradesCount = safeNum(movement.trades_count_24h, 0);
@@ -187,8 +189,8 @@ export async function scoreSignals(movement: any) {
     reason,
     drift,
     range,
-    volumeRatio,
-    hourlyRatio,
+    volumeRatio: volumeRatioRaw ?? "n/a",
+    hourlyRatio: hourlyRatioRaw ?? "n/a",
     tradesCount,
     priceLevels,
     avgTradeSize,
