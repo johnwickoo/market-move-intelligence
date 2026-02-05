@@ -5,6 +5,7 @@ type RawTrade = {
   outcome: string | null;
   timestamp: string;
   size?: number;
+  side?: string;
   raw?: any;
 };
 
@@ -23,6 +24,11 @@ type RawMovement = {
   window_end: string;
   window_type: "24h" | "event";
   reason: string;
+};
+
+type DominantOutcomeRow = {
+  market_id: string;
+  outcome: string | null;
 };
 
 function getEnv(key: string) {
@@ -145,6 +151,21 @@ export async function GET(req: Request) {
     return new Response("no markets", { status: 400 });
   }
 
+  const dominantByMarket = new Map<string, string>();
+  if (marketIds.length > 0) {
+    try {
+      const dominantRows = (await pgFetch(
+        `market_dominant_outcomes?select=market_id,outcome` +
+          `&market_id=in.(${marketIds.join(",")})`
+      )) as DominantOutcomeRow[];
+      for (const row of dominantRows) {
+        if (row.outcome) dominantByMarket.set(row.market_id, String(row.outcome));
+      }
+    } catch {
+      // ignore dominant lookup failures
+    }
+  }
+
   const encoder = new TextEncoder();
   let heartbeat: ReturnType<typeof setInterval> | null = null;
   let poll: ReturnType<typeof setInterval> | null = null;
@@ -201,6 +222,8 @@ export async function GET(req: Request) {
           const seen = new Set<string>();
           for (const tk of latestTicks) {
             if (tk.mid == null) continue;
+            const dominant = dominantByMarket.get(tk.market_id);
+            if (dominant && tk.outcome !== dominant) continue;
             const key = `${tk.market_id}:${tk.outcome ?? ""}`;
             if (seen.has(key)) continue;
             seen.add(key);
@@ -229,6 +252,8 @@ export async function GET(req: Request) {
 
           for (const tk of midTicks) {
             if (tk.mid == null) continue;
+            const dominant = dominantByMarket.get(tk.market_id);
+            if (dominant && tk.outcome !== dominant) continue;
             lastTickIso = tk.ts > lastTickIso ? tk.ts : lastTickIso;
             send("tick", {
               market_id: tk.market_id,
@@ -240,13 +265,15 @@ export async function GET(req: Request) {
           }
 
           const trades = (await pgFetch(
-            `trades?select=market_id,outcome,timestamp,size` +
+            `trades?select=market_id,outcome,timestamp,size,side` +
               `&market_id=in.(${marketIds.join(",")})` +
               `&timestamp=gt.${encodeURIComponent(lastTradeIso)}` +
               `&order=timestamp.asc&limit=2000`
           )) as RawTrade[];
 
           for (const tr of trades) {
+            const dominant = dominantByMarket.get(tr.market_id);
+            if (dominant && tr.outcome !== dominant) continue;
             lastTradeIso =
               tr.timestamp > lastTradeIso ? tr.timestamp : lastTradeIso;
             send("trade", {
@@ -254,6 +281,7 @@ export async function GET(req: Request) {
               outcome: tr.outcome,
               ts: tr.timestamp,
               size: toNum(tr.size ?? 0),
+              side: tr.side ?? null,
               bucketMinutes,
             });
           }
@@ -285,6 +313,8 @@ export async function GET(req: Request) {
           }
 
           for (const mv of moves) {
+            const dominant = dominantByMarket.get(mv.market_id);
+            if (dominant && mv.outcome !== dominant) continue;
             send("movement", {
               ...mv,
               explanation:

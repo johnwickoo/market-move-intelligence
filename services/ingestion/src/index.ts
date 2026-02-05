@@ -6,7 +6,7 @@ import { updateAggregateBuffered } from "../../aggregates/src/updateAggregate";
 import { detectMovement } from "../../movements/src/detectMovement";
 import { movementRealtime } from "../../movements/src/detectMovementRealtime";
 import { insertMidTick } from "../../storage/src/insertMidTick";
-import { insertTradeBatch, insertTrade } from "../../storage/src/db";
+import { insertTradeBatch, insertTrade, upsertDominantOutcome } from "../../storage/src/db";
 import type { TradeInsert } from "../../storage/src/types";
 import * as fs from "fs/promises";
 import * as path from "path";
@@ -424,6 +424,9 @@ function getDominantOutcome(marketId: string, nowMs: number): string | null {
   const outcome = meta?.outcome ?? null;
   if (!outcome) return null;
   dominantOutcomeByMarket.set(marketId, { outcome, ts: nowMs });
+  void upsertDominantOutcome(marketId, outcome, new Date(nowMs).toISOString()).catch((err) => {
+    console.warn("[dominant] upsert failed", err?.message ?? err);
+  });
   return outcome;
 }
 

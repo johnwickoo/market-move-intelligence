@@ -5,6 +5,7 @@ type RawTrade = {
   outcome: string | null;
   timestamp: string;
   size?: number;
+  side?: string;
   raw?: any;
 };
 
@@ -23,6 +24,11 @@ type RawMovement = {
   window_end: string;
   window_type: "24h" | "event";
   reason: string;
+};
+
+type DominantOutcomeRow = {
+  market_id: string;
+  outcome: string | null;
 };
 
 const DEFAULT_BUCKET_MINUTES = 1;
@@ -46,7 +52,6 @@ function buildBucketSeries(
   bucketMinutes: number
 ) {
   const bucketMs = clampBucketMinutes(bucketMinutes) * 60 * 1000;
-  const tickShiftMs = bucketMs;
   if (!Number.isFinite(windowStartMs) || !Number.isFinite(windowEndMs)) {
     return [] as Array<{ t: string; price: number; volume: number }>;
   }
@@ -62,8 +67,7 @@ function buildBucketSeries(
 
   for (const tk of ticks) {
     if (tk.mid == null) continue;
-    const rawMs = Date.parse(tk.ts);
-    const tsMs = Number.isFinite(rawMs) ? rawMs - tickShiftMs : rawMs;
+    const tsMs = Date.parse(tk.ts);
     if (!Number.isFinite(tsMs) || tsMs < windowStartMs) continue;
     const idx = Math.floor((tsMs - windowStartMs) / bucketMs);
     if (idx < 0 || idx >= series.length) continue;
@@ -98,6 +102,43 @@ function buildBucketSeries(
   }
 
   return series;
+}
+
+function buildVolumeBuckets(
+  trades: RawTrade[],
+  windowStartMs: number,
+  windowEndMs: number,
+  bucketMinutes: number
+) {
+  const bucketMs = clampBucketMinutes(bucketMinutes) * 60 * 1000;
+  if (!Number.isFinite(windowStartMs) || !Number.isFinite(windowEndMs)) {
+    return [] as Array<{ t: string; buy: number; sell: number }>;
+  }
+
+  const bucketCount =
+    Math.max(1, Math.floor((windowEndMs - windowStartMs) / bucketMs) + 1);
+  const buckets: Array<{ t: string; buy: number; sell: number }> =
+    Array.from({ length: bucketCount }, (_, i) => ({
+      t: new Date(windowStartMs + i * bucketMs).toISOString(),
+      buy: 0,
+      sell: 0,
+    }));
+
+  for (const tr of trades) {
+    const tsMs = Date.parse(tr.timestamp);
+    if (!Number.isFinite(tsMs) || tsMs < windowStartMs) continue;
+    const idx = Math.floor((tsMs - windowStartMs) / bucketMs);
+    if (idx < 0 || idx >= buckets.length) continue;
+    const side = String(tr.side ?? "").toUpperCase();
+    const size = toNum(tr.size ?? 0);
+    if (side === "BUY") {
+      buckets[idx].buy += size;
+    } else if (side === "SELL") {
+      buckets[idx].sell += size;
+    }
+  }
+
+  return buckets;
 }
 
 function getEnv(key: string) {
@@ -243,11 +284,31 @@ export async function GET(req: Request) {
     }
   }
 
+  const marketIds = Array.from(markets.keys());
+  const dominantByMarket = new Map<string, string>();
+  if (marketIds.length > 0) {
+    try {
+      const dominantRows = (await pgFetch(
+        `market_dominant_outcomes?select=market_id,outcome` +
+          `&market_id=in.(${marketIds.join(",")})`
+      )) as DominantOutcomeRow[];
+      for (const row of dominantRows) {
+        if (row.outcome) dominantByMarket.set(row.market_id, String(row.outcome));
+      }
+    } catch {
+      // ignore dominant lookup failures
+    }
+  }
+
   const payloadMarkets = [];
 
   for (const [marketId, meta] of markets.entries()) {
-    const outcomes =
-      meta.outcomes.size > 0 ? Array.from(meta.outcomes) : ["Yes", "No"];
+    const dominant = dominantByMarket.get(marketId);
+    const outcomes = dominant
+      ? [dominant]
+      : meta.outcomes.size > 0
+        ? Array.from(meta.outcomes)
+        : ["Yes", "No"];
 
     const outcomeSeries = [];
 
@@ -267,15 +328,13 @@ export async function GET(req: Request) {
           `&order=ts.asc&limit=5000`
       )) as RawTick[];
 
-      const trades = raw
-        ? []
-        : ((await pgFetch(
-            `trades?select=market_id,outcome,timestamp,size` +
-              `&market_id=eq.${marketId}` +
-              `&outcome=eq.${encodeURIComponent(outcome)}` +
-              `&timestamp=gte.${encodeURIComponent(windowStartISO)}` +
-              `&order=timestamp.asc&limit=5000`
-          )) as RawTrade[]);
+      const trades = (await pgFetch(
+        `trades?select=market_id,outcome,timestamp,size,side` +
+          `&market_id=eq.${marketId}` +
+          `&outcome=eq.${encodeURIComponent(outcome)}` +
+          `&timestamp=gte.${encodeURIComponent(windowStartISO)}` +
+          `&order=timestamp.asc&limit=5000`
+      )) as RawTrade[];
 
       const series = raw
         ? ticks
@@ -292,6 +351,13 @@ export async function GET(req: Request) {
             windowEndMs,
             bucketMinutes
           );
+
+      const volumes = buildVolumeBuckets(
+        trades,
+        windowStartMs,
+        windowEndMs,
+        bucketMinutes
+      );
 
       const movements = (await pgFetch(
         `market_movements?select=id,market_id,outcome,window_start,window_end,window_type,reason` +
@@ -357,6 +423,7 @@ export async function GET(req: Request) {
         outcome,
         color,
         series,
+        volumes,
         annotations,
       });
     }

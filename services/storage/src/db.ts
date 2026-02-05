@@ -30,3 +30,17 @@ export async function insertTradeBatch(trades: TradeInsert[]) {
   const { error } = await supabase.from("trades").insert(trades);
   if (error) throw error;
 }
+
+export async function upsertDominantOutcome(marketId: string, outcome: string, tsIso: string) {
+  const { error } = await supabase
+    .from("market_dominant_outcomes")
+    .upsert(
+      {
+        market_id: marketId,
+        outcome,
+        updated_at: tsIso,
+      },
+      { onConflict: "market_id" }
+    );
+  if (error) throw error;
+}

@@ -27,6 +27,12 @@ CREATE TABLE market_mid_latest (
   PRIMARY KEY (market_id, asset_id)
 );
 
+CREATE TABLE market_dominant_outcomes (
+  market_id TEXT PRIMARY KEY,
+  outcome TEXT NOT NULL,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
 CREATE TABLE market_mid_ticks (
   id BIGSERIAL PRIMARY KEY,
   market_id TEXT NOT NULL,

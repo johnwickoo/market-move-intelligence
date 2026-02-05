@@ -9,6 +9,12 @@ type SeriesPoint = {
   volume: number;
 };
 
+type VolumePoint = {
+  t: string;
+  buy: number;
+  sell: number;
+};
+
 type Annotation = {
   kind: "signal" | "movement";
   startIndex: number;
@@ -22,6 +28,7 @@ type OutcomeSeries = {
   outcome: string;
   color: string;
   series: SeriesPoint[];
+  volumes: VolumePoint[];
   annotations: Annotation[];
 };
 
@@ -59,6 +66,7 @@ const demoMarkets: MarketSnapshot[] = [
           { t: "15:30", price: 0.41, volume: 450 },
           { t: "16:00", price: 0.43, volume: 500 },
         ],
+        volumes: [],
         annotations: [
           {
             kind: "signal",
@@ -102,6 +110,7 @@ const demoMarkets: MarketSnapshot[] = [
           { t: "15:30", price: 0.59, volume: 420 },
           { t: "16:00", price: 0.57, volume: 460 },
         ],
+        volumes: [],
         annotations: [
           {
             kind: "signal",
@@ -167,6 +176,8 @@ export default function Page() {
     () => inferSinceHours(slugs, inferredBucketMinutes),
     [slugs, inferredBucketMinutes]
   );
+  const [chartMode, setChartMode] = useState<"raw" | "1m">("raw");
+  const useRawTicks = chartMode === "raw";
   const [bucketMinutes, setBucketMinutes] = useState(inferredBucketMinutes);
   const [windowStart, setWindowStart] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
@@ -177,6 +188,7 @@ export default function Page() {
   const chartContainerRef = useRef<HTMLDivElement | null>(null);
   const chartRef = useRef<ReturnType<typeof createChart> | null>(null);
   const lineSeriesRef = useRef<any>(null);
+  const volumeSeriesRef = useRef<any>(null);
   const pointsRef = useRef<Array<{ time: number; value: number }>>([]);
 
   useEffect(() => {
@@ -186,16 +198,26 @@ export default function Page() {
       setError(null);
       try {
         const res = await fetch(
-          `/api/markets?slugs=${encodeURIComponent(slugs)}&sinceHours=${inferredSinceHours}&bucketMinutes=${inferredBucketMinutes}&raw=1`,
+          `/api/markets?slugs=${encodeURIComponent(slugs)}` +
+            `&sinceHours=${inferredSinceHours}` +
+            `&bucketMinutes=${inferredBucketMinutes}` +
+            `&raw=${useRawTicks ? "1" : "0"}`,
           { cache: "no-store" }
         );
         if (!res.ok) throw new Error(`API ${res.status}`);
         const json = await res.json();
         if (!active) return;
         if (Array.isArray(json.markets) && json.markets.length > 0) {
-          setMarkets(json.markets);
+          const normalized = json.markets.map((m: MarketSnapshot) => ({
+            ...m,
+            outcomes: (m.outcomes ?? []).map((o: OutcomeSeries) => ({
+              ...o,
+              volumes: o.volumes ?? [],
+            })),
+          }));
+          setMarkets(normalized);
         }
-        if (json.bucketMinutes) {
+        if (json.bucketMinutes && Number(json.bucketMinutes) > 0) {
           setBucketMinutes(Number(json.bucketMinutes));
         } else {
           setBucketMinutes(inferredBucketMinutes);
@@ -213,7 +235,7 @@ export default function Page() {
     return () => {
       active = false;
     };
-  }, [slugs, inferredSinceHours, inferredBucketMinutes]);
+  }, [slugs, inferredSinceHours, inferredBucketMinutes, useRawTicks]);
 
   useEffect(() => {
     const container = chartContainerRef.current;
@@ -243,8 +265,18 @@ export default function Page() {
       lineWidth: 2,
     });
 
+    const volumeSeries = chart.addHistogramSeries({
+      priceScaleId: "volume",
+      priceFormat: { type: "volume" },
+      color: "#2ecc71",
+    });
+    chart.priceScale("volume").applyOptions({
+      scaleMargins: { top: 0.8, bottom: 0 },
+    });
+
     chartRef.current = chart;
     lineSeriesRef.current = lineSeries;
+    volumeSeriesRef.current = volumeSeries;
 
     const resize = () => {
       chart.applyOptions({
@@ -262,6 +294,7 @@ export default function Page() {
       chart.remove();
       chartRef.current = null;
       lineSeriesRef.current = null;
+      volumeSeriesRef.current = null;
     };
   }, []);
 
@@ -276,6 +309,23 @@ export default function Page() {
     () => markets.find((m) => m.slug === slug) ?? markets[0],
     [slug, markets]
   );
+
+  const dominantOutcome = useMemo(() => {
+    if (!selectedMarket?.outcomes?.length) return null;
+    let best = selectedMarket.outcomes[0];
+    let bestVolume = -1;
+    for (const o of selectedMarket.outcomes) {
+      const total = (o.volumes ?? []).reduce(
+        (sum, v) => sum + Number(v.buy ?? 0) + Number(v.sell ?? 0),
+        0
+      );
+      if (total > bestVolume) {
+        best = o;
+        bestVolume = total;
+      }
+    }
+    return best.outcome;
+  }, [selectedMarket]);
 
   const marketIdKey = useMemo(() => {
     return markets
@@ -304,6 +354,7 @@ export default function Page() {
       outcome: string | null;
       ts: string;
       size: number;
+      side: string | null;
       bucketMinutes: number;
     }> = [];
     const pendingMoves: Array<any> = [];
@@ -317,6 +368,7 @@ export default function Page() {
             ...o,
             series: [...o.series],
             annotations: [...o.annotations],
+            volumes: [...o.volumes],
           })),
         }));
         const marketById = (id: string) =>
@@ -329,6 +381,7 @@ export default function Page() {
             outcome: name,
             color: colorForOutcome(name),
             series: [],
+            volumes: [],
             annotations: [],
           };
           market.outcomes.push(created);
@@ -370,21 +423,79 @@ export default function Page() {
           return series.length - 1;
         };
 
+        const bucketMs = Math.max(1, bucketMinutes) * 60 * 1000;
+        const toBucketIso = (tsMs: number) => {
+          const bucketStart = baseMs + Math.floor((tsMs - baseMs) / bucketMs) * bucketMs;
+          return new Date(bucketStart).toISOString();
+        };
+
+        const upsertBucketPoint = (
+          series: SeriesPoint[],
+          tsMs: number,
+          price: number
+        ) => {
+          if (!Number.isFinite(tsMs)) return;
+          const bucketIso = toBucketIso(tsMs);
+          const last = series[series.length - 1];
+          if (last && last.t === bucketIso) {
+            last.price = price;
+            return;
+          }
+          const existingIndex = series.findIndex((p) => p.t === bucketIso);
+          if (existingIndex >= 0) {
+            series[existingIndex].price = price;
+            return;
+          }
+          if (last) {
+            const lastMs = Date.parse(last.t);
+            if (Number.isFinite(lastMs) && tsMs < lastMs) return;
+          }
+          series.push({ t: bucketIso, price, volume: 0 });
+        };
+
+        const upsertVolumeBucket = (
+          volumes: VolumePoint[],
+          tsMs: number,
+          side: string | null,
+          size: number
+        ) => {
+          if (!Number.isFinite(tsMs)) return;
+          const bucketIso = toBucketIso(tsMs);
+          let bucket = volumes[volumes.length - 1];
+          if (!bucket || bucket.t !== bucketIso) {
+            bucket = volumes.find((v) => v.t === bucketIso);
+            if (!bucket) {
+              bucket = { t: bucketIso, buy: 0, sell: 0 };
+              volumes.push(bucket);
+            }
+          }
+          const normalized = String(side ?? "").toUpperCase();
+          if (normalized === "BUY") {
+            bucket.buy += size;
+          } else if (normalized === "SELL") {
+            bucket.sell += size;
+          }
+        };
+
         for (const tick of pendingTicks.splice(0)) {
           const market = marketById(tick.market_id);
           const outcome = ensureOutcome(market, tick.outcome);
           if (!outcome) continue;
           const tsMs = Date.parse(tick.ts);
           if (!Number.isFinite(tsMs) || tsMs < baseMs) continue;
-          const last = outcome.series[outcome.series.length - 1];
-          if (last && last.t === tick.ts) {
-            last.price = tick.mid;
+          if (useRawTicks) {
+            const last = outcome.series[outcome.series.length - 1];
+            if (last && last.t === tick.ts) {
+              last.price = tick.mid;
+            } else {
+              outcome.series.push({
+                t: tick.ts,
+                price: tick.mid,
+                volume: 0,
+              });
+            }
           } else {
-            outcome.series.push({
-              t: tick.ts,
-              price: tick.mid,
-              volume: 0,
-            });
+            upsertBucketPoint(outcome.series, tsMs, tick.mid);
           }
           if (outcome.series.length > MAX_POINTS) {
             outcome.series.splice(0, outcome.series.length - MAX_POINTS);
@@ -396,6 +507,13 @@ export default function Page() {
           const outcome = ensureOutcome(market, tr.outcome);
           if (!outcome) continue;
           addVolumeToSeries(outcome.series, tr.ts, tr.size);
+          const tradeMs = Date.parse(tr.ts);
+          if (Number.isFinite(tradeMs)) {
+            upsertVolumeBucket(outcome.volumes, tradeMs, tr.side, tr.size);
+            if (outcome.volumes.length > MAX_POINTS) {
+              outcome.volumes.splice(0, outcome.volumes.length - MAX_POINTS);
+            }
+          }
         }
 
         for (const mv of pendingMoves.splice(0)) {
@@ -439,7 +557,10 @@ export default function Page() {
       try {
         const payload = JSON.parse(event.data);
         console.log("[sse] trade", payload);
-        pendingTrades.push(payload);
+        pendingTrades.push({
+          ...payload,
+          side: payload?.side ?? null,
+        });
       } catch {
         // ignore
       }
@@ -458,9 +579,14 @@ export default function Page() {
       clearInterval(interval);
       source.close();
     };
-  }, [slugs, marketIdKey, bucketMinutes, windowStart]);
+  }, [slugs, marketIdKey, bucketMinutes, windowStart, useRawTicks]);
 
   const [outcome, setOutcome] = useState(selectedMarket.outcomes[0].outcome);
+
+  useEffect(() => {
+    if (!dominantOutcome) return;
+    setOutcome(dominantOutcome);
+  }, [dominantOutcome]);
 
   const selectedOutcome = useMemo(() => {
     return (
@@ -496,6 +622,45 @@ export default function Page() {
     seriesApi.setData(trimmed);
     seriesApi.applyOptions({ color: selectedOutcome.color });
 
+    const volumeApi = volumeSeriesRef.current;
+    if (volumeApi) {
+      const volumePoints = selectedOutcome.volumes
+        .map((v) => {
+          const ts = Date.parse(v.t);
+          if (!Number.isFinite(ts)) return null;
+          const buy = Number(v.buy ?? 0);
+          const sell = Number(v.sell ?? 0);
+          const total = buy + sell;
+          const delta = buy - sell;
+          const color =
+            delta > 0
+              ? "#2ecc71"
+              : delta < 0
+                ? "#e74c3c"
+                : "rgba(200,200,200,0.6)";
+          return {
+            time: Math.floor(ts / 1000),
+            value: total,
+            color,
+          };
+        })
+        .filter((p): p is { time: number; value: number; color: string } => !!p)
+        .sort((a, b) => a.time - b.time);
+
+      const dedupedVolumes: Array<{ time: number; value: number; color: string }> = [];
+      for (const point of volumePoints) {
+        const last = dedupedVolumes[dedupedVolumes.length - 1];
+        if (last && last.time === point.time) {
+          last.value = point.value;
+          last.color = point.color;
+        } else {
+          dedupedVolumes.push(point);
+        }
+      }
+
+      volumeApi.setData(dedupedVolumes.slice(-MAX_POINTS));
+    }
+
     if (trimmed.length > 0) {
       const values = trimmed.map((p) => p.value);
       const min = Math.min(...values);
@@ -508,7 +673,7 @@ export default function Page() {
     }
   }, [selectedOutcome]);
 
-  const chartWindowLabel = `${DEFAULT_SINCE_HOURS}h window`;
+  const chartWindowLabel = `${useRawTicks ? "Raw ticks" : "1m buckets"} · ${inferredSinceHours}h`;
 
   return (
     <main className="mmi-shell">
@@ -542,21 +707,26 @@ export default function Page() {
               <strong>{rangePct.toFixed(1)}%</strong>
             </div>
             {selectedMarket.outcomes.length > 1 && (
-              <div className="outcome-tabs">
-                {selectedMarket.outcomes.map((o) => (
-                  <button
-                    key={o.outcome}
-                    type="button"
-                    className={
-                      o.outcome === selectedOutcome.outcome ? "active" : ""
-                    }
-                    onClick={() => setOutcome(o.outcome)}
-                  >
-                    {o.outcome}
-                  </button>
-                ))}
+              <div className="dominant-pill">
+                Dominant: {selectedOutcome.outcome}
               </div>
             )}
+            <div className="mode-tabs">
+              <button
+                type="button"
+                className={useRawTicks ? "active" : ""}
+                onClick={() => setChartMode("raw")}
+              >
+                Raw ticks
+              </button>
+              <button
+                type="button"
+                className={!useRawTicks ? "active" : ""}
+                onClick={() => setChartMode("1m")}
+              >
+                1m buckets
+              </button>
+            </div>
           </div>
         </div>
 
@@ -695,7 +865,15 @@ export default function Page() {
           font-size: 16px;
           font-weight: 600;
         }
-        .outcome-tabs {
+        .dominant-pill {
+          padding: 6px 12px;
+          border-radius: 999px;
+          border: 1px solid rgba(255, 255, 255, 0.08);
+          background: rgba(10, 14, 25, 0.7);
+          color: var(--ink);
+          font-size: 12px;
+        }
+        .mode-tabs {
           display: flex;
           gap: 6px;
           padding: 4px;
@@ -703,7 +881,7 @@ export default function Page() {
           border: 1px solid rgba(255, 255, 255, 0.08);
           background: rgba(10, 14, 25, 0.7);
         }
-        .outcome-tabs button {
+        .mode-tabs button {
           border: none;
           background: transparent;
           color: var(--muted);
@@ -713,7 +891,7 @@ export default function Page() {
           cursor: pointer;
           transition: all 0.2s ease;
         }
-        .outcome-tabs button.active {
+        .mode-tabs button.active {
           background: rgba(255, 255, 255, 0.08);
           color: var(--ink);
         }
