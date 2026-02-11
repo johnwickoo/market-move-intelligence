@@ -1,3 +1,1 @@
-export type ApiClient = {
-  // TODO: define API client surface
-};
+export { pgFetch, fetchDominantOutcomes, fetchExplanations } from "./supabase";

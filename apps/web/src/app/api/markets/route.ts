@@ -1,43 +1,20 @@
 export const runtime = "nodejs";
 
-type RawTrade = {
-  market_id: string;
-  outcome: string | null;
-  timestamp: string;
-  size?: number;
-  side?: string;
-  raw?: any;
-};
-
-type RawTick = {
-  market_id: string;
-  outcome: string | null;
-  ts: string;
-  mid: number | null;
-};
-
-type RawMovement = {
-  id: string;
-  market_id: string;
-  outcome: string | null;
-  window_start: string;
-  window_end: string;
-  window_type: "24h" | "event";
-  reason: string;
-};
-
-type DominantOutcomeRow = {
-  market_id: string;
-  outcome: string | null;
-};
+import {
+  type RawTick,
+  type RawTrade,
+  type RawMovement,
+  pgFetch,
+  toNum,
+  slugFromRaw,
+  titleFromRaw,
+  colorForOutcome,
+  fetchDominantOutcomes,
+  fetchExplanations,
+} from "../../../lib/supabase";
 
 const DEFAULT_BUCKET_MINUTES = 1;
 const DEFAULT_SINCE_HOURS = 24;
-
-function toNum(x: any): number {
-  const n = typeof x === "number" ? x : Number(x);
-  return Number.isFinite(n) ? n : 0;
-}
 
 function clampBucketMinutes(value: number) {
   if (!Number.isFinite(value) || value <= 0) return DEFAULT_BUCKET_MINUTES;
@@ -84,9 +61,7 @@ function buildBucketSeries(
   }
 
   const firstIndex = series.findIndex((p) => Number.isFinite(p.price));
-  if (firstIndex === -1) {
-    return [];
-  }
+  if (firstIndex === -1) return [];
 
   const firstPrice = series[firstIndex].price;
   for (let i = 0; i < firstIndex; i += 1) {
@@ -141,44 +116,6 @@ function buildVolumeBuckets(
   return buckets;
 }
 
-function getEnv(key: string) {
-  const v = process.env[key];
-  if (!v) throw new Error(`Missing env: ${key}`);
-  return v;
-}
-
-async function pgFetch(path: string) {
-  const url = `${getEnv("SUPABASE_URL")}/rest/v1/${path}`;
-  const res = await fetch(url, {
-    headers: {
-      apikey: getEnv("SUPABASE_SERVICE_ROLE_KEY"),
-      Authorization: `Bearer ${getEnv("SUPABASE_SERVICE_ROLE_KEY")}`,
-    },
-    cache: "no-store",
-  });
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`Supabase error ${res.status}: ${text}`);
-  }
-  return res.json();
-}
-
-function slugFromRaw(raw: any): string | null {
-  const payload = raw?.payload ?? raw;
-  return (
-    payload?.eventSlug ??
-    payload?.slug ??
-    payload?.marketSlug ??
-    payload?.market_slug ??
-    null
-  );
-}
-
-function titleFromRaw(raw: any): string | null {
-  const payload = raw?.payload ?? raw;
-  return payload?.title ?? payload?.market_title ?? null;
-}
-
 export async function GET(req: Request) {
   const { searchParams } = new URL(req.url);
   const slugsParam = searchParams.get("slugs") ?? "";
@@ -188,7 +125,10 @@ export async function GET(req: Request) {
     .filter(Boolean);
 
   const marketIdParam = searchParams.get("market_id");
-  const sinceHours = Number(searchParams.get("sinceHours") ?? DEFAULT_SINCE_HOURS);
+  const assetIdParam = (searchParams.get("asset_id") ?? "").trim();
+  const sinceHours = Number(
+    searchParams.get("sinceHours") ?? DEFAULT_SINCE_HOURS
+  );
   const raw = searchParams.get("raw") === "1";
   const bucketMinutes = clampBucketMinutes(
     Number(searchParams.get("bucketMinutes") ?? DEFAULT_BUCKET_MINUTES)
@@ -213,11 +153,11 @@ export async function GET(req: Request) {
       outcomes: new Set<string>(),
     });
   } else if (slugList.length > 0) {
-    const trades = (await pgFetch(
+    const trades = await pgFetch<RawTrade[]>(
       `trades?select=market_id,outcome,timestamp,raw` +
         `&timestamp=gte.${encodeURIComponent(windowStartISO)}` +
         `&order=timestamp.desc&limit=2000`
-    )) as RawTrade[];
+    );
 
     for (const t of trades) {
       const slug = slugFromRaw(t.raw);
@@ -232,16 +172,16 @@ export async function GET(req: Request) {
     }
   }
 
+  // When multiple markets share the same slug, keep only the most recent
   if (!marketIdParam && slugList.length > 0 && markets.size > 1) {
     const marketIds = Array.from(markets.keys());
     const lastTickByMarket = new Map<string, number>();
     if (marketIds.length > 0) {
-      const ticks = (await pgFetch(
+      const ticks = await pgFetch<Pick<RawTick, "market_id" | "ts">[]>(
         `market_mid_ticks?select=market_id,ts` +
           `&market_id=in.(${marketIds.join(",")})` +
           `&order=ts.desc&limit=2000`
-      )) as Pick<RawTick, "market_id" | "ts">[];
-
+      );
       for (const tk of ticks) {
         if (lastTickByMarket.has(tk.market_id)) continue;
         const ms = Date.parse(tk.ts);
@@ -267,17 +207,24 @@ export async function GET(req: Request) {
     }
   }
 
+  // Discover outcomes from ticks
   if (markets.size > 0) {
     const marketIds = Array.from(markets.keys());
-    const tickOutcomes = (await pgFetch(
-      `market_mid_ticks?select=market_id,outcome` +
+    const tickOutcomes = await pgFetch<
+      Pick<RawTick, "market_id" | "outcome" | "asset_id">[]
+    >(
+      `market_mid_ticks?select=market_id,outcome,asset_id` +
         `&market_id=in.(${marketIds.join(",")})` +
+        (assetIdParam
+          ? `&asset_id=eq.${encodeURIComponent(assetIdParam)}`
+          : "") +
         `&ts=gte.${encodeURIComponent(windowStartISO)}` +
         `&order=ts.desc&limit=2000`
-    )) as Pick<RawTick, "market_id" | "outcome">[];
+    );
 
     for (const tk of tickOutcomes) {
       if (!tk.outcome) continue;
+      if (assetIdParam && tk.asset_id && tk.asset_id !== assetIdParam) continue;
       const entry = markets.get(tk.market_id);
       if (!entry) continue;
       entry.outcomes.add(String(tk.outcome));
@@ -285,20 +232,7 @@ export async function GET(req: Request) {
   }
 
   const marketIds = Array.from(markets.keys());
-  const dominantByMarket = new Map<string, string>();
-  if (marketIds.length > 0) {
-    try {
-      const dominantRows = (await pgFetch(
-        `market_dominant_outcomes?select=market_id,outcome` +
-          `&market_id=in.(${marketIds.join(",")})`
-      )) as DominantOutcomeRow[];
-      for (const row of dominantRows) {
-        if (row.outcome) dominantByMarket.set(row.market_id, String(row.outcome));
-      }
-    } catch {
-      // ignore dominant lookup failures
-    }
-  }
+  const dominantByMarket = await fetchDominantOutcomes(marketIds);
 
   const payloadMarkets = [];
 
@@ -313,28 +247,26 @@ export async function GET(req: Request) {
     const outcomeSeries = [];
 
     for (const outcome of outcomes) {
-      const normalizedOutcome = outcome.toLowerCase();
-      const color =
-        normalizedOutcome === "yes" || normalizedOutcome === "up"
-          ? "#ff6a3d"
-          : normalizedOutcome === "no" || normalizedOutcome === "down"
-            ? "#3a6bff"
-            : "#9aa3b8";
-      const ticks = (await pgFetch(
-        `market_mid_ticks?select=market_id,outcome,ts,mid` +
+      const color = colorForOutcome(outcome);
+
+      const ticks = await pgFetch<RawTick[]>(
+        `market_mid_ticks?select=market_id,outcome,asset_id,ts,mid` +
           `&market_id=eq.${marketId}` +
           `&outcome=eq.${encodeURIComponent(outcome)}` +
+          (assetIdParam
+            ? `&asset_id=eq.${encodeURIComponent(assetIdParam)}`
+            : "") +
           `&ts=gte.${encodeURIComponent(windowStartISO)}` +
           `&order=ts.asc&limit=5000`
-      )) as RawTick[];
+      );
 
-      const trades = (await pgFetch(
+      const trades = await pgFetch<RawTrade[]>(
         `trades?select=market_id,outcome,timestamp,size,side` +
           `&market_id=eq.${marketId}` +
           `&outcome=eq.${encodeURIComponent(outcome)}` +
           `&timestamp=gte.${encodeURIComponent(windowStartISO)}` +
           `&order=timestamp.asc&limit=5000`
-      )) as RawTrade[];
+      );
 
       const series = raw
         ? ticks
@@ -359,55 +291,24 @@ export async function GET(req: Request) {
         bucketMinutes
       );
 
-      const movements = (await pgFetch(
+      const movements = await pgFetch<RawMovement[]>(
         `market_movements?select=id,market_id,outcome,window_start,window_end,window_type,reason` +
           `&market_id=eq.${marketId}` +
           `&outcome=eq.${encodeURIComponent(outcome)}` +
           `&window_end=gte.${encodeURIComponent(windowStartISO)}` +
           `&order=window_end.desc&limit=50`
-      )) as RawMovement[];
+      );
 
-      const movementIds = movements.map((m) => m.id);
-      let explanations: Record<string, string> = {};
-      if (movementIds.length > 0) {
-        try {
-          const expRows = (await pgFetch(
-            `movement_explanations?select=movement_id,text` +
-              `&movement_id=in.(${movementIds.map(encodeURIComponent).join(",")})`
-          )) as { movement_id: string; text: string }[];
-          explanations = Object.fromEntries(
-            expRows.map((r) => [r.movement_id, r.text])
-          );
-        } catch {
-          explanations = {};
-        }
-      }
-
-      const seriesMs = series.map((p) => Date.parse(p.t));
-      const indexForTs = (tsMs: number) => {
-        if (!Number.isFinite(tsMs) || seriesMs.length === 0) return 0;
-        const firstMs = seriesMs[0];
-        const lastMs = seriesMs[seriesMs.length - 1];
-        if (Number.isFinite(firstMs) && tsMs <= firstMs) return 0;
-        if (Number.isFinite(lastMs) && tsMs >= lastMs) return seriesMs.length - 1;
-        for (let i = 0; i < seriesMs.length; i += 1) {
-          const pointMs = seriesMs[i];
-          if (!Number.isFinite(pointMs)) continue;
-          if (pointMs >= tsMs) return i;
-        }
-        return seriesMs.length - 1;
-      };
+      const explanations = await fetchExplanations(
+        movements.map((m) => m.id)
+      );
 
       const annotations = movements.map((m) => {
-        const startMs = Date.parse(m.window_start);
-        const endMs = Date.parse(m.window_end);
-        const startIndex = indexForTs(startMs);
-        const endIndex = indexForTs(endMs);
         const label = m.window_type === "event" ? "Movement" : "Signal";
         return {
           kind: m.window_type === "event" ? "movement" : "signal",
-          startIndex,
-          endIndex,
+          start_ts: m.window_start,
+          end_ts: m.window_end,
           label,
           explanation:
             explanations[m.id] ??
@@ -419,13 +320,7 @@ export async function GET(req: Request) {
         };
       });
 
-      outcomeSeries.push({
-        outcome,
-        color,
-        series,
-        volumes,
-        annotations,
-      });
+      outcomeSeries.push({ outcome, color, series, volumes, annotations });
     }
 
     payloadMarkets.push({

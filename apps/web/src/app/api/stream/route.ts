@@ -1,78 +1,21 @@
 export const runtime = "nodejs";
 
-type RawTrade = {
-  market_id: string;
-  outcome: string | null;
-  timestamp: string;
-  size?: number;
-  side?: string;
-  raw?: any;
-};
-
-type RawTick = {
-  market_id: string;
-  outcome: string | null;
-  ts: string;
-  mid: number | null;
-};
-
-type RawMovement = {
-  id: string;
-  market_id: string;
-  outcome: string | null;
-  window_start: string;
-  window_end: string;
-  window_type: "24h" | "event";
-  reason: string;
-};
-
-type DominantOutcomeRow = {
-  market_id: string;
-  outcome: string | null;
-};
-
-function getEnv(key: string) {
-  const v = process.env[key];
-  if (!v) throw new Error(`Missing env: ${key}`);
-  return v;
-}
-
-async function pgFetch(path: string) {
-  const url = `${getEnv("SUPABASE_URL")}/rest/v1/${path}`;
-  const res = await fetch(url, {
-    headers: {
-      apikey: getEnv("SUPABASE_SERVICE_ROLE_KEY"),
-      Authorization: `Bearer ${getEnv("SUPABASE_SERVICE_ROLE_KEY")}`,
-    },
-    cache: "no-store",
-  });
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`Supabase error ${res.status}: ${text}`);
-  }
-  return res.json();
-}
-
-function slugFromRaw(raw: any): string | null {
-  const payload = raw?.payload ?? raw;
-  return (
-    payload?.eventSlug ??
-    payload?.slug ??
-    payload?.marketSlug ??
-    payload?.market_slug ??
-    null
-  );
-}
-
-function toNum(x: any): number {
-  const n = typeof x === "number" ? x : Number(x);
-  return Number.isFinite(n) ? n : 0;
-}
+import {
+  type RawTick,
+  type RawTrade,
+  type RawMovement,
+  pgFetch,
+  toNum,
+  slugFromRaw,
+  fetchDominantOutcomes,
+  fetchExplanations,
+} from "../../../lib/supabase";
 
 export async function GET(req: Request) {
   const { searchParams } = new URL(req.url);
   const slugsParam = searchParams.get("slugs") ?? "";
   const marketIdsParam = searchParams.get("market_id") ?? "";
+  const assetIdsParam = (searchParams.get("asset_id") ?? "").trim();
   const slugList = slugsParam
     .split(",")
     .map((s) => s.trim())
@@ -82,10 +25,7 @@ export async function GET(req: Request) {
     Number(searchParams.get("bucketMinutes") ?? 1)
   );
 
-  const markets = new Map<
-    string,
-    { slug: string; outcomes: Set<string> }
-  >();
+  const markets = new Map<string, { slug: string; outcomes: Set<string> }>();
 
   if (marketIdsParam) {
     for (const id of marketIdsParam.split(",").map((s) => s.trim())) {
@@ -93,34 +33,32 @@ export async function GET(req: Request) {
       markets.set(id, { slug: id, outcomes: new Set<string>() });
     }
   } else if (slugList.length > 0) {
-    const trades = (await pgFetch(
+    const trades = await pgFetch<RawTrade[]>(
       `trades?select=market_id,outcome,timestamp,raw` +
         `&order=timestamp.desc&limit=2000`
-    )) as RawTrade[];
+    );
     for (const t of trades) {
       const slug = slugFromRaw(t.raw);
       if (!slug || !slugList.includes(slug)) continue;
-      const entry =
-        markets.get(t.market_id) ??
-        ({ slug, outcomes: new Set<string>() } as {
-          slug: string;
-          outcomes: Set<string>;
-        });
+      const entry = markets.get(t.market_id) ?? {
+        slug,
+        outcomes: new Set<string>(),
+      };
       if (t.outcome) entry.outcomes.add(String(t.outcome));
       markets.set(t.market_id, entry);
     }
   }
 
+  // Dedup: keep most-recent market per slug
   if (!marketIdsParam && slugList.length > 0 && markets.size > 1) {
     const marketIds = Array.from(markets.keys());
     const lastTickByMarket = new Map<string, number>();
     if (marketIds.length > 0) {
-      const ticks = (await pgFetch(
+      const ticks = await pgFetch<Pick<RawTick, "market_id" | "ts">[]>(
         `market_mid_ticks?select=market_id,ts` +
           `&market_id=in.(${marketIds.join(",")})` +
           `&order=ts.desc&limit=2000`
-      )) as Pick<RawTick, "market_id" | "ts">[];
-
+      );
       for (const tk of ticks) {
         if (lastTickByMarket.has(tk.market_id)) continue;
         const ms = Date.parse(tk.ts);
@@ -148,23 +86,26 @@ export async function GET(req: Request) {
 
   const marketIds = Array.from(markets.keys());
   if (marketIds.length === 0) {
-    return new Response("no markets", { status: 400 });
+    const encoder = new TextEncoder();
+    const body = encoder.encode(
+      `event: error\ndata: ${JSON.stringify({ message: "no markets found" })}\n\n`
+    );
+    return new Response(body, {
+      headers: {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        Connection: "keep-alive",
+      },
+    });
   }
 
-  const dominantByMarket = new Map<string, string>();
-  if (marketIds.length > 0) {
-    try {
-      const dominantRows = (await pgFetch(
-        `market_dominant_outcomes?select=market_id,outcome` +
-          `&market_id=in.(${marketIds.join(",")})`
-      )) as DominantOutcomeRow[];
-      for (const row of dominantRows) {
-        if (row.outcome) dominantByMarket.set(row.market_id, String(row.outcome));
-      }
-    } catch {
-      // ignore dominant lookup failures
-    }
-  }
+  const assetIds = assetIdsParam
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  const assetIdSet = assetIds.length > 0 ? new Set(assetIds) : null;
+
+  const dominantByMarket = await fetchDominantOutcomes(marketIds);
 
   const encoder = new TextEncoder();
   let heartbeat: ReturnType<typeof setInterval> | null = null;
@@ -201,7 +142,7 @@ export async function GET(req: Request) {
         }
       };
 
-      const send = (event: string, data: any) => {
+      const send = (event: string, data: unknown) => {
         if (closed) return;
         safeEnqueue(encoder.encode(`event: ${event}\n`));
         safeEnqueue(encoder.encode(`data: ${JSON.stringify(data)}\n\n`));
@@ -211,19 +152,26 @@ export async function GET(req: Request) {
         safeEnqueue(encoder.encode(`: keep-alive\n\n`));
       }, 15000);
 
+      // Initial burst: send latest tick per market+outcome (deduped)
       void (async () => {
         try {
-          const latestTicks = (await pgFetch(
-            `market_mid_ticks?select=market_id,outcome,ts,mid` +
+          const latestTicks = await pgFetch<RawTick[]>(
+            `market_mid_ticks?select=market_id,outcome,asset_id,ts,mid` +
               `&market_id=in.(${marketIds.join(",")})` +
-              `&order=ts.desc&limit=2000`
-          )) as RawTick[];
+              (assetIds.length > 0
+                ? `&asset_id=in.(${assetIds.map(encodeURIComponent).join(",")})`
+                : "") +
+              `&ts=gt.${encodeURIComponent(lastTickIso)}` +
+              `&order=ts.desc&limit=500`
+          );
 
           const seen = new Set<string>();
           for (const tk of latestTicks) {
             if (tk.mid == null) continue;
             const dominant = dominantByMarket.get(tk.market_id);
             if (dominant && tk.outcome !== dominant) continue;
+            if (assetIdSet && tk.asset_id && !assetIdSet.has(tk.asset_id))
+              continue;
             const key = `${tk.market_id}:${tk.outcome ?? ""}`;
             if (seen.has(key)) continue;
             seen.add(key);
@@ -232,6 +180,7 @@ export async function GET(req: Request) {
               market_id: tk.market_id,
               outcome: tk.outcome,
               ts: tk.ts,
+              asset_id: tk.asset_id ?? null,
               mid: tk.mid,
               bucketMinutes,
             });
@@ -243,33 +192,39 @@ export async function GET(req: Request) {
 
       poll = setInterval(async () => {
         try {
-          const midTicks = (await pgFetch(
-            `market_mid_ticks?select=market_id,outcome,ts,mid` +
+          const midTicks = await pgFetch<RawTick[]>(
+            `market_mid_ticks?select=market_id,outcome,asset_id,ts,mid` +
               `&market_id=in.(${marketIds.join(",")})` +
+              (assetIds.length > 0
+                ? `&asset_id=in.(${assetIds.map(encodeURIComponent).join(",")})`
+                : "") +
               `&ts=gt.${encodeURIComponent(lastTickIso)}` +
               `&order=ts.asc&limit=2000`
-          )) as RawTick[];
+          );
 
           for (const tk of midTicks) {
             if (tk.mid == null) continue;
             const dominant = dominantByMarket.get(tk.market_id);
             if (dominant && tk.outcome !== dominant) continue;
+            if (assetIdSet && tk.asset_id && !assetIdSet.has(tk.asset_id))
+              continue;
             lastTickIso = tk.ts > lastTickIso ? tk.ts : lastTickIso;
             send("tick", {
               market_id: tk.market_id,
               outcome: tk.outcome,
               ts: tk.ts,
+              asset_id: tk.asset_id ?? null,
               mid: tk.mid,
               bucketMinutes,
             });
           }
 
-          const trades = (await pgFetch(
+          const trades = await pgFetch<RawTrade[]>(
             `trades?select=market_id,outcome,timestamp,size,side` +
               `&market_id=in.(${marketIds.join(",")})` +
               `&timestamp=gt.${encodeURIComponent(lastTradeIso)}` +
               `&order=timestamp.asc&limit=2000`
-          )) as RawTrade[];
+          );
 
           for (const tr of trades) {
             const dominant = dominantByMarket.get(tr.market_id);
@@ -286,31 +241,20 @@ export async function GET(req: Request) {
             });
           }
 
-          const moves = (await pgFetch(
+          const moves = await pgFetch<RawMovement[]>(
             `market_movements?select=id,market_id,outcome,window_start,window_end,window_type,reason` +
               `&market_id=in.(${marketIds.join(",")})` +
               `&window_end=gt.${encodeURIComponent(lastMoveIso)}` +
               `&order=window_end.asc&limit=200`
-          )) as RawMovement[];
+          );
 
           if (moves.length > 0) {
             lastMoveIso = moves[moves.length - 1].window_end;
           }
 
-          let explanations: Record<string, string> = {};
-          if (moves.length > 0) {
-            try {
-              const ids = moves.map((m) => m.id).join(",");
-              const expRows = (await pgFetch(
-                `movement_explanations?select=movement_id,text&movement_id=in.(${ids})`
-              )) as { movement_id: string; text: string }[];
-              explanations = Object.fromEntries(
-                expRows.map((r) => [r.movement_id, r.text])
-              );
-            } catch {
-              explanations = {};
-            }
-          }
+          const explanations = await fetchExplanations(
+            moves.map((m) => m.id)
+          );
 
           for (const mv of moves) {
             const dominant = dominantByMarket.get(mv.market_id);
@@ -319,9 +263,7 @@ export async function GET(req: Request) {
               ...mv,
               explanation:
                 explanations[mv.id] ??
-                `${mv.window_type === "event" ? "Movement" : "Signal"}: ${
-                  mv.reason
-                }`,
+                `${mv.window_type === "event" ? "Movement" : "Signal"}: ${mv.reason}`,
             });
           }
         } catch (err: any) {
