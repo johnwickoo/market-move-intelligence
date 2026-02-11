@@ -648,13 +648,10 @@ console.log("[ingestion] starting...");
 const url = process.env.POLYMARKET_WS_URL;
 if (!url) throw new Error("Missing POLYMARKET_WS_URL in services/ingestion/.env");
 
-const eventSlugs = String(process.env.POLYMARKET_EVENT_SLUGS ?? "")
+let eventSlugs = String(process.env.POLYMARKET_EVENT_SLUGS ?? "")
   .split(",")
   .map((s) => s.trim())
   .filter(Boolean);
-if (eventSlugs.length === 0) {
-  throw new Error("Missing POLYMARKET_EVENT_SLUGS (comma-separated slugs)");
-}
 const eventSlugSet = new Set(eventSlugs);
 const LOG_EVENT_SLUGS = process.env.LOG_EVENT_SLUGS === "1";
 const LOG_TRADE_DEBUG = process.env.LOG_TRADE_DEBUG === "1";
@@ -850,6 +847,50 @@ if (BACKFILL_URL) {
 setInterval(() => {
   replaySpoolOnce().catch((e) => console.error("[spool] replay error", e?.message ?? e));
 }, SPOOL_REPLAY_MS);
+
+// ── Dynamic slug sync from tracked_slugs table ──────────────────────
+const SLUG_SYNC_MS = Number(process.env.SLUG_SYNC_MS ?? 30_000);
+
+async function syncTrackedSlugs() {
+  try {
+    const sbUrl = process.env.SUPABASE_URL;
+    const sbKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+    if (!sbUrl || !sbKey) return;
+    const res = await fetch(
+      `${sbUrl}/rest/v1/tracked_slugs?select=slug&active=eq.true`,
+      {
+        headers: {
+          apikey: sbKey,
+          Authorization: `Bearer ${sbKey}`,
+        },
+      }
+    );
+    if (!res.ok) return;
+    const rows = (await res.json()) as { slug: string }[];
+    let added = 0;
+    for (const row of rows) {
+      const s = row.slug.trim();
+      if (s && !eventSlugSet.has(s)) {
+        eventSlugSet.add(s);
+        eventSlugs.push(s);
+        added++;
+        console.log("[slug-sync] new slug:", s);
+      }
+    }
+    if (added > 0) {
+      console.log(
+        `[slug-sync] added ${added} slug(s), total: ${eventSlugSet.size}`
+      );
+    }
+  } catch (err: any) {
+    console.error("[slug-sync] error:", err?.message ?? err);
+  }
+}
+
+syncTrackedSlugs().catch(() => {});
+setInterval(() => {
+  syncTrackedSlugs().catch(() => {});
+}, SLUG_SYNC_MS);
 
 function chunkAssets(all: string[], size: number): string[][] {
   const out: string[][] = [];

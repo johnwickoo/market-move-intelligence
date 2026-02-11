@@ -306,12 +306,30 @@ export default function Page() {
         timeVisible: true,
         secondsVisible: false,
         borderColor: "rgba(255,255,255,0.08)",
+        tickMarkFormatter: (ts: number) => {
+          const d = new Date(ts * 1000);
+          return d.toLocaleTimeString([], {
+            hour: "2-digit",
+            minute: "2-digit",
+          });
+        },
+      },
+      localization: {
+        timeFormatter: (ts: number) => {
+          const d = new Date(ts * 1000);
+          return d.toLocaleTimeString([], {
+            hour: "2-digit",
+            minute: "2-digit",
+            second: "2-digit",
+          });
+        },
       },
     });
 
     const lineSeries = chart.addLineSeries({
       color: "#4f7cff",
       lineWidth: 2,
+      priceFormat: { type: "price", precision: 3, minMove: 0.001 },
     });
 
     const volumeSeries = chart.addHistogramSeries({
@@ -361,8 +379,14 @@ export default function Page() {
     [slug, markets]
   );
 
+  // Prefer "Yes" if it exists; otherwise pick the outcome with most volume.
+  // This is computed once per market selection — subsequent updates won't flip it.
   const dominantOutcome = useMemo(() => {
     if (!selectedMarket?.outcomes?.length) return null;
+    const yes = selectedMarket.outcomes.find(
+      (o) => o.outcome.toLowerCase() === "yes"
+    );
+    if (yes) return yes.outcome;
     let best = selectedMarket.outcomes[0];
     let bestVolume = -1;
     for (const o of selectedMarket.outcomes) {
@@ -399,11 +423,20 @@ export default function Page() {
   });
 
   const [outcome, setOutcome] = useState(selectedMarket.outcomes[0].outcome);
+  const outcomeLocked = useRef(false);
 
+  // Set outcome once on initial load or market change, then lock it
   useEffect(() => {
     if (!dominantOutcome) return;
+    if (outcomeLocked.current) return;
     setOutcome(dominantOutcome);
+    outcomeLocked.current = true;
   }, [dominantOutcome]);
+
+  // Unlock when slug changes (new market loaded)
+  useEffect(() => {
+    outcomeLocked.current = false;
+  }, [slugs]);
 
   const selectedOutcome = useMemo(() => {
     return (
@@ -439,6 +472,13 @@ export default function Page() {
       } else {
         deduped.push(point);
       }
+    }
+
+    // Forward-fill: extend line to "now" using last known price
+    const nowSec = Math.floor(Date.now() / 1000);
+    const lastPoint = deduped[deduped.length - 1];
+    if (lastPoint && nowSec - lastPoint.time > 10) {
+      deduped.push({ time: nowSec, value: lastPoint.value });
     }
 
     const trimmed = deduped.slice(-MAX_POINTS);
