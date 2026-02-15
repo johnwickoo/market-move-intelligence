@@ -22,6 +22,15 @@ function clampBucketMinutes(value: number) {
   return Math.max(1, Math.floor(value));
 }
 
+/** Inserts " for market [name]" into the first price sentence (e.g. "Price moved 5% over 24h." → "Price moved 5% for market X over 24h."). */
+function withMarketInExplanation(explanation: string, marketName: string): string {
+  if (!marketName || !explanation) return explanation;
+  return explanation.replace(
+    /^(Price moved \d+%)( over )/,
+    `$1 for market ${marketName}$2`
+  );
+}
+
 function buildBucketSeries(
   ticks: RawTick[],
   trades: RawTrade[],
@@ -117,7 +126,11 @@ function buildVolumeBuckets(
   return buckets;
 }
 
-async function fetchEventAnnotations(eventSlug: string, windowStartISO: string) {
+async function fetchEventAnnotations(
+  eventSlug: string,
+  windowStartISO: string,
+  eventName?: string
+) {
   const eventMarketId = `event:${eventSlug}`;
   const moves = await pgFetch<RawMovement[]>(
     `market_movements?select=id,market_id,outcome,window_start,window_end,window_type,reason` +
@@ -128,17 +141,21 @@ async function fetchEventAnnotations(eventSlug: string, windowStartISO: string) 
 
   if (!Array.isArray(moves) || moves.length === 0) return [];
   const explanations = await fetchExplanations(moves.map((m) => m.id));
+  const name =
+    eventName ?? eventSlug.replace(/-/g, " ");
 
   return moves.map((m) => {
     const label = m.window_type === "event" ? "Event Movement" : "Event Window";
+    const raw =
+      explanations[m.id] ??
+      `${label}: ${m.reason.toLowerCase()} move detected.`;
+    const explanation = withMarketInExplanation(raw, name);
     return {
       kind: m.window_type === "event" ? "movement" : "signal",
       start_ts: m.window_start,
       end_ts: m.window_end,
       label,
-      explanation:
-        explanations[m.id] ??
-        `${label}: ${m.reason.toLowerCase()} move detected.`,
+      explanation,
       color:
         m.window_type === "event"
           ? "rgba(96, 169, 255, 0.22)"
@@ -275,7 +292,8 @@ export async function GET(req: Request) {
   // ── Helper: fetch outcome data for a single market_id + outcome ────
   async function fetchOutcomeData(
     marketId: string,
-    outcome: string
+    outcome: string,
+    marketTitle?: string
   ) {
     const ticks = await pgFetch<RawTick[]>(
       `market_mid_ticks?select=market_id,outcome,asset_id,ts,mid` +
@@ -320,14 +338,18 @@ export async function GET(req: Request) {
 
     const annotations = movements.map((m) => {
       const label = m.window_type === "event" ? "Movement" : "Signal";
+      const raw =
+        explanations[m.id] ??
+        `${label}: ${m.reason.toLowerCase()} move detected.`;
+      const explanation = marketTitle
+        ? withMarketInExplanation(raw, marketTitle)
+        : raw;
       return {
         kind: m.window_type === "event" ? "movement" : "signal",
         start_ts: m.window_start,
         end_ts: m.window_end,
         label,
-        explanation:
-          explanations[m.id] ??
-          `${label}: ${m.reason.toLowerCase()} move detected.`,
+        explanation,
         color:
           m.window_type === "event"
             ? "rgba(80, 220, 140, 0.22)"
@@ -364,14 +386,16 @@ export async function GET(req: Request) {
         children: sortedChildren.map((c) => c.title),
       });
 
+      const eventName = meta.slug.replace(/-/g, " ");
       const eventAnnotations = await fetchEventAnnotations(
         meta.slug,
-        windowStartISO
+        windowStartISO,
+        eventName
       );
 
       for (let i = 0; i < sortedChildren.length; i++) {
         const child = sortedChildren[i];
-        const data = await fetchOutcomeData(child.id, "Yes");
+        const data = await fetchOutcomeData(child.id, "Yes", child.title);
 
         // Skip children with no data
         if (data.series.length === 0 && data.tickCount === 0) continue;
@@ -426,7 +450,7 @@ export async function GET(req: Request) {
     const outcomeSeries = [];
 
     for (const outcome of outcomes) {
-      const data = await fetchOutcomeData(marketId, outcome);
+      const data = await fetchOutcomeData(marketId, outcome, meta.title);
 
       console.log("[/api/markets] ticks", {
         marketId: marketId.slice(0, 12),

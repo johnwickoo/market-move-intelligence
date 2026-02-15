@@ -34,8 +34,8 @@ export function SignalBand({
       let startCoord = timeScale.timeToCoordinate(startTime);
       let endCoord = timeScale.timeToCoordinate(endTime);
 
+      const range = timeScale.getVisibleRange();
       if (startCoord == null || endCoord == null) {
-        const range = timeScale.getVisibleRange();
         if (!range) {
           setStyle(null);
           return;
@@ -49,13 +49,37 @@ export function SignalBand({
         );
         endCoord = timeScale.timeToCoordinate(clampedEnd as UTCTimestamp);
       }
-      if (startCoord == null || endCoord == null) {
-        setStyle(null);
+
+      if (startCoord != null && endCoord != null) {
+        const left = Math.min(startCoord, endCoord);
+        const width = Math.max(2, Math.abs(endCoord - startCoord));
+        setStyle({ left, width });
         return;
       }
-      const left = Math.min(startCoord, endCoord);
-      const width = Math.max(2, Math.abs(endCoord - startCoord));
-      setStyle({ left, width });
+
+      if (range && Number.isFinite(range.from) && Number.isFinite(range.to)) {
+        const chartWidth =
+          (chart as any).options()?.width ??
+          (chart as any).element()?.clientWidth ??
+          0;
+        if (chartWidth > 0) {
+          const rangeSpan = (range.to as number) - (range.from as number);
+          if (rangeSpan > 0) {
+            const left =
+              ((startTime as number) - (range.from as number)) / rangeSpan *
+              chartWidth;
+            const width =
+              Math.max(
+                2,
+                ((endTime as number) - (startTime as number)) / rangeSpan *
+                  chartWidth
+              );
+            setStyle({ left, width });
+            return;
+          }
+        }
+      }
+      setStyle(null);
     };
 
     update();

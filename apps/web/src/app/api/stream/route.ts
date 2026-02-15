@@ -7,9 +7,18 @@ import {
   pgFetch,
   toNum,
   slugFromRaw,
+  titleFromRaw,
   fetchDominantOutcomes,
   fetchExplanations,
 } from "../../../lib/supabase";
+
+function withMarketInExplanation(explanation: string, marketName: string): string {
+  if (!marketName || !explanation) return explanation;
+  return explanation.replace(
+    /^(Price moved \d+%)( over )/,
+    `$1 for market ${marketName}$2`
+  );
+}
 
 export async function GET(req: Request) {
   const { searchParams } = new URL(req.url);
@@ -32,13 +41,19 @@ export async function GET(req: Request) {
     Number(searchParams.get("bucketMinutes") ?? 1)
   );
 
-  const markets = new Map<string, { slug: string; outcomes: Set<string> }>();
+  const markets = new Map<
+    string,
+    { slug: string; title: string; outcomes: Set<string> }
+  >();
 
   if (marketIdsParam) {
-    // When market_ids provided explicitly (multi-market), use them directly
     for (const id of marketIdsParam.split(",").map((s) => s.trim())) {
       if (!id) continue;
-      markets.set(id, { slug: id, outcomes: new Set<string>() });
+      markets.set(id, {
+        slug: id,
+        title: id,
+        outcomes: new Set<string>(),
+      });
     }
   } else if (slugList.length > 0) {
     const trades = await pgFetch<RawTrade[]>(
@@ -48,8 +63,10 @@ export async function GET(req: Request) {
     for (const t of trades) {
       const slug = slugFromRaw(t.raw);
       if (!slug || !slugList.includes(slug)) continue;
+      const title = titleFromRaw(t.raw) ?? slug;
       const entry = markets.get(t.market_id) ?? {
         slug,
+        title,
         outcomes: new Set<string>(),
       };
       if (t.outcome) entry.outcomes.add(String(t.outcome));
@@ -281,11 +298,16 @@ export async function GET(req: Request) {
 
           for (const mv of moves) {
             if (!shouldIncludeOutcome(mv.market_id, mv.outcome)) continue;
+            const rawExplanation =
+              explanations[mv.id] ??
+              `${mv.window_type === "event" ? "Movement" : "Signal"}: ${mv.reason}`;
+            const marketName = mv.market_id.startsWith("event:")
+              ? mv.market_id.slice("event:".length).replace(/-/g, " ")
+              : markets.get(mv.market_id)?.title ?? mv.market_id;
+            const explanation = withMarketInExplanation(rawExplanation, marketName);
             send("movement", {
               ...mv,
-              explanation:
-                explanations[mv.id] ??
-                `${mv.window_type === "event" ? "Movement" : "Signal"}: ${mv.reason}`,
+              explanation,
             });
           }
         } catch (err: any) {

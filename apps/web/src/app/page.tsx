@@ -1,7 +1,7 @@
 "use client";
 
 import { createChart, ColorType } from "lightweight-charts";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { use, useEffect, useMemo, useRef, useState } from "react";
 import type {
   Annotation,
   MarketSnapshot,
@@ -197,13 +197,53 @@ function buildLineData(series: SeriesPoint[]) {
   return deduped.slice(-MAX_POINTS);
 }
 
+/** Extend line data with padding at annotation boundaries so chart visible range includes signals. */
+function buildLineDataWithAnnotationPadding(
+  series: SeriesPoint[],
+  annotations: Annotation[]
+): Array<{ time: number; value: number }> {
+  const base = buildLineData(series);
+  if (base.length === 0 || annotations.length === 0) return base;
+
+  let minAnnSec = Infinity;
+  let maxAnnSec = -Infinity;
+  for (const ann of annotations) {
+    const startSec = Math.floor(Date.parse(ann.start_ts) / 1000);
+    const endSec = Math.floor(Date.parse(ann.end_ts) / 1000);
+    if (Number.isFinite(startSec)) minAnnSec = Math.min(minAnnSec, startSec);
+    if (Number.isFinite(endSec)) maxAnnSec = Math.max(maxAnnSec, endSec);
+  }
+  if (!Number.isFinite(minAnnSec) || !Number.isFinite(maxAnnSec)) return base;
+
+  const first = base[0];
+  const last = base[base.length - 1];
+  const result = [...base];
+  if (first && minAnnSec < first.time) {
+    result.unshift({ time: minAnnSec, value: first.value });
+    result.sort((a, b) => a.time - b.time);
+  }
+  if (last && maxAnnSec > last.time) {
+    result.push({ time: maxAnnSec, value: last.value });
+    result.sort((a, b) => a.time - b.time);
+  }
+  return result.slice(-MAX_POINTS);
+}
+
 function outcomeKey(outcome: OutcomeSeries): string {
   return outcome.market_id ?? outcome.outcome;
 }
 
 // ── page component ──────────────────────────────────────────────────
 
-export default function Page() {
+type PageProps = {
+  searchParams?: Promise<Record<string, string | string[] | undefined>>;
+  params?: Promise<Record<string, string | undefined>>;
+};
+
+export default function Page(props: PageProps) {
+  const searchParams = use(props.searchParams ?? Promise.resolve({}));
+  const _params = use(props.params ?? Promise.resolve({}));
+
   const [markets, setMarkets] = useState<MarketSnapshot[]>(demoMarkets);
   const [slugs, setSlugs] = useState(ENV_DEFAULT_SLUG);
   const [slugInput, setSlugInput] = useState(ENV_DEFAULT_SLUG);
@@ -220,15 +260,22 @@ export default function Page() {
     [slugs, inferredBucketMinutes]
   );
 
-  // Resolve slug from URL → localStorage → env default (once on mount)
+  // Resolve slug from URL (searchParams) → localStorage → env default (once on mount)
   useEffect(() => {
-    const params = new URLSearchParams(window.location.search);
-    const urlSlug = (params.get("slug") ?? params.get("slugs") ?? "").trim();
+    const getStr = (v: string | string[] | undefined) =>
+      Array.isArray(v) ? v[0] : v;
+    const urlSlug = (
+      getStr(searchParams.slug) ??
+      getStr(searchParams.slugs) ??
+      ""
+    ).trim();
     const urlMarket = (
-      params.get("market_id") ?? params.get("marketId") ?? ""
+      getStr(searchParams.market_id) ??
+      getStr(searchParams.marketId) ??
+      ""
     ).trim();
     const urlAsset = (
-      params.get("asset_id") ?? params.get("assetId") ?? ""
+      getStr(searchParams.asset_id) ?? getStr(searchParams.assetId) ?? ""
     ).trim();
 
     if (urlMarket) {
@@ -245,7 +292,7 @@ export default function Page() {
       setSlugInput(resolved);
       localStorage.setItem(SLUG_STORAGE_KEY, resolved);
     }
-  }, []);
+  }, [searchParams]);
 
   const [bucketMinutes, setBucketMinutes] = useState(inferredBucketMinutes);
   const [windowStart, setWindowStart] = useState<string | null>(null);
@@ -594,26 +641,21 @@ export default function Page() {
 
   useEffect(() => {
     const merged: Annotation[] = [];
-    const seen = new Set<string>();
+    const seenWindows = new Set<string>();
     for (const outcome of visibleOutcomes) {
       for (const ann of outcome.annotations ?? []) {
-        const key = `${ann.kind}:${ann.start_ts}:${ann.end_ts}:${ann.label}`;
-        if (seen.has(key)) continue;
-        seen.add(key);
-
-        if (visibleRange) {
-          const startMs = Date.parse(ann.start_ts);
-          const endMs = Date.parse(ann.end_ts);
-          if (!Number.isFinite(startMs) || !Number.isFinite(endMs)) continue;
-          if (endMs < visibleRange.minMs || startMs > visibleRange.maxMs) continue;
-        }
-
+        const startMs = Date.parse(ann.start_ts);
+        const endMs = Date.parse(ann.end_ts);
+        if (!Number.isFinite(startMs) || !Number.isFinite(endMs)) continue;
+        const windowKey = `${ann.start_ts}:${ann.end_ts}`;
+        if (seenWindows.has(windowKey)) continue;
+        seenWindows.add(windowKey);
         merged.push(ann);
       }
     }
     setSignalWindows(merged);
     setHoveredSignal(null);
-  }, [visibleOutcomes, visibleRange]);
+  }, [visibleOutcomes]);
 
   // ── sync chart data ───────────────────────────────────────────────
 
@@ -649,7 +691,12 @@ export default function Page() {
         series.applyOptions({ color: outcome.color });
       }
 
-      series.setData(buildLineData(outcome.series));
+      series.setData(
+        buildLineDataWithAnnotationPadding(
+          outcome.series,
+          outcome.annotations ?? []
+        )
+      );
     }
 
     for (const [key, series] of seriesMap.entries()) {
