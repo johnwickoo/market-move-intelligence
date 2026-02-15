@@ -56,40 +56,55 @@ async function fetchTimeScore(marketId: string) {
   return out;
 }
 
+// ── Recency multiplier ───────────────────────────────────────────────
+// Shorter detection windows produce more actionable signals on a live
+// dashboard. A 5m signal is ~4x more actionable than a 4h signal.
+const RECENCY_WEIGHTS: Record<string, number> = {
+  "5m": 1.0,
+  "15m": 0.85,
+  "1h": 0.65,
+  "4h": 0.45,
+  "event": 0.80,
+  // Legacy compatibility
+  "24h": 0.25,
+};
+
+function recencyMultiplier(windowType: string): number {
+  return RECENCY_WEIGHTS[windowType] ?? 0.5;
+}
+
 export async function scoreSignals(movement: any) {
   const reason = String(movement.reason ?? "");
   const thin = Boolean(movement.thin_liquidity);
+  const windowType = String(movement.window_type ?? "");
 
   // PRICE signals
-  const drift = Math.abs(safeNum(movement.pct_change, 0));  // e.g. 0.18
-  const range = Math.abs(safeNum(movement.range_pct, 0));   // e.g. 0.35
+  const drift = Math.abs(safeNum(movement.pct_change, 0));
+  const range = Math.abs(safeNum(movement.range_pct, 0));
 
   // VOLUME signals
   const volumeRatioRaw = movement.volume_ratio;
   const hourlyRatioRaw = movement.hourly_volume_ratio;
-  const volumeRatio = safeNum(volumeRatioRaw, 0);          // 24h / baselineDaily
-  const hourlyRatio = safeNum(hourlyRatioRaw, 0);   // maxHour / baselineHourly
+  const volumeRatio = safeNum(volumeRatioRaw, 0);
+  const hourlyRatio = safeNum(hourlyRatioRaw, 0);
 
-  // Liquidity stats (optional; you already store these)
+  // Liquidity stats
   const tradesCount = safeNum(movement.trades_count_24h, 0);
   const priceLevels = safeNum(movement.unique_price_levels_24h, 0);
   const avgTradeSize = safeNum(movement.avg_trade_size_24h, 0);
 
-    // --- NEW: simple depth gates (tune later)
+  // Velocity from the detection engine
+  const velocity = safeNum(movement.velocity, 0);
+
   const MIN_INFO_TRADES = Number(process.env.MIN_INFO_TRADES ?? 50);
   const MIN_INFO_LEVELS = Number(process.env.MIN_INFO_LEVELS ?? 8);
-
   const hasInfoDepth = tradesCount >= MIN_INFO_TRADES || priceLevels >= MIN_INFO_LEVELS;
 
-  // --- NEW: thin liquidity override should be easier to trigger
-  const LIQUIDITY_OVERRIDE = Number(process.env.LIQUIDITY_OVERRIDE ?? 0.6); // was 0.7
+  const LIQUIDITY_OVERRIDE = Number(process.env.LIQUIDITY_OVERRIDE ?? 0.6);
 
   /**
    * 1) CAPITAL SCORE (0..1)
    * "Did money show up?"
-   * - daily ratio: 2x baseline => strong
-   * - hourly ratio: 2x baseline hourly => strong
-   * Use a soft scale so 2.0 maps to ~1.0.
    */
   const capitalScore =
     0.6 * clamp01(volumeRatio / 2) +
@@ -98,47 +113,41 @@ export async function scoreSignals(movement: any) {
   /**
    * 2) PRICE SCORE (0..1)
    * "Did price meaningfully move?"
-   * Drift catches sustained move.
-   * Range catches intraday spike/whipsaw.
-   * 15% is your base movement threshold.
+   * Scaled to window-appropriate thresholds (15% is the 4h reference).
    */
   const priceScore =
     0.5 * clamp01(drift / 0.15) +
     0.5 * clamp01(range / 0.15);
 
   /**
-   * 3) LIQUIDITY RISK (0..1)
-   * "Is this movement likely unreliable due to thin orderbook?"
-   * - thin flag is strongest signal
-   * - low trades count or low price levels => higher risk
+   * 3) VELOCITY SCORE (0..1) — NEW
+   * "How fast did price move relative to time?"
+   * Velocity = |drift| / sqrt(minutes). Scaled so 0.02 = strong signal.
    */
-  const tradeRisk = tradesCount <= 0 ? 1 : clamp01((15 - tradesCount) / 15); // <15 trades => risk
-  const levelRisk = priceLevels <= 0 ? 1 : clamp01((8 - priceLevels) / 8);   // <8 levels => risk
+  const velocityScore = clamp01(velocity / 0.02);
+
+  /**
+   * 4) LIQUIDITY RISK (0..1)
+   */
+  const tradeRisk = tradesCount <= 0 ? 1 : clamp01((15 - tradesCount) / 15);
+  const levelRisk = priceLevels <= 0 ? 1 : clamp01((8 - priceLevels) / 8);
   const thinRisk = thin ? 1 : 0;
 
-  // Weight thinRisk heavily
   const liquidityRisk =
     0.6 * thinRisk +
     0.25 * tradeRisk +
     0.15 * levelRisk;
 
   /**
-   * 4) INFO SCORE (0..1)
+   * 5) INFO SCORE (0..1)
    * "Price moved without capital behind it"
-   *
-   * Idea:
-   * - high priceScore
-   * - low capitalScore
-   * - low volumeRatio specifically (money didn’t show up)
    */
   const infoScoreRaw =
     priceScore * (1 - capitalScore) * (1 - clamp01(volumeRatio / 2));
-
   const infoScore = clamp01(infoScoreRaw);
 
   /**
-   * 5) TIME SCORE
-   * Based on proximity to resolution/end time (market_resolution table).
+   * 6) TIME SCORE
    */
   let timeScore = 0;
   try {
@@ -149,9 +158,7 @@ export async function scoreSignals(movement: any) {
   }
 
   /**
-   * 5b) NEWS SCORE (0..1)
-   * "Is there recent news coverage related to this market?"
-   * Fetched from NewsAPI.org, cached by slug+hour.
+   * 7) NEWS SCORE (0..1)
    */
   let newsScore = 0;
   let newsHeadlines: string[] = [];
@@ -164,19 +171,20 @@ export async function scoreSignals(movement: any) {
   }
 
   /**
-   * 6) Classification logic (simple + explainable)
+   * 8) Classification logic
    *
    * Priority order:
    * 1. LIQUIDITY — don't trust the move
    * 2. NEWS — strong news coverage + meaningful info signal
-   * 3. CAPITAL — large money flows
-   * 4. INFO — price moved without capital
-   * 5. TIME — fallback
+   * 3. VELOCITY — fast impulse move (new)
+   * 4. CAPITAL — large money flows
+   * 5. INFO — price moved without capital
+   * 6. TIME — fallback
    */
   let classification = "CAPITAL";
   let confidence = capitalScore;
 
-  // 1) Liquidity override: if thin OR risk is high, we don't trust the move
+  // 1) Liquidity override
   if (thin && liquidityRisk >= LIQUIDITY_OVERRIDE) {
     classification = "LIQUIDITY";
     confidence = liquidityRisk;
@@ -184,24 +192,27 @@ export async function scoreSignals(movement: any) {
     classification = "LIQUIDITY";
     confidence = liquidityRisk;
   }
-  // 2) NEWS: strong news coverage + meaningful info signal
+  // 2) NEWS
   else if (newsScore >= 0.5 && infoScore >= 0.3) {
     classification = "NEWS";
     confidence = newsScore * 0.6 + infoScore * 0.4;
   }
-  // 3) Capital
+  // 3) VELOCITY — fast impulse move
+  else if (velocityScore >= 0.6 && priceScore >= 0.3) {
+    classification = "VELOCITY";
+    confidence = velocityScore * 0.7 + priceScore * 0.3;
+  }
+  // 4) Capital
   else if (capitalScore >= 0.6) {
     classification = "CAPITAL";
     confidence = capitalScore;
   }
-  // 4) Info only if we have depth (prevents thin-book mislabels)
+  // 5) Info
   else if (infoScore >= 0.5 && hasInfoDepth) {
     classification = "INFO";
     confidence = infoScore;
   }
-  // 5) Price moved but ambiguous:
-  //    - if thin, call it LIQUIDITY
-  //    - else call it INFO (like before)
+  // 6) Price moved but ambiguous
   else if (priceScore >= 0.6) {
     if (thin) {
       classification = "LIQUIDITY";
@@ -211,7 +222,7 @@ export async function scoreSignals(movement: any) {
       confidence = priceScore;
     }
   }
-  // 6) Time fallback
+  // 7) Time fallback
   else if (timeScore > confidence) {
     classification = "TIME";
     confidence = timeScore;
@@ -220,9 +231,11 @@ export async function scoreSignals(movement: any) {
   // Attach headlines to movement for buildExplanation
   (movement as any).__newsHeadlines = newsHeadlines;
 
-  // Final confidence penalty if market is thin (even if not LIQUIDITY)
-  // Keeps signals conservative.
-  const adjustedConfidence = clamp01(confidence * (1 - 0.35 * liquidityRisk));
+  // Final confidence: apply liquidity penalty + recency multiplier
+  const recency = recencyMultiplier(windowType);
+  const adjustedConfidence = clamp01(
+    confidence * (1 - 0.35 * liquidityRisk) * (0.5 + 0.5 * recency)
+  );
 
   const row = {
     movement_id: movement.id,
@@ -255,13 +268,17 @@ export async function scoreSignals(movement: any) {
     "[signals] inserted",
     row.movement_id,
     row.classification,
-    row.confidence.toFixed(3)
+    row.confidence.toFixed(3),
+    `window=${windowType}`,
+    `recency=${recency.toFixed(2)}`
   );
 
   console.log("[signals] inputs", {
     reason,
+    windowType,
     drift,
     range,
+    velocity: velocity.toFixed(4),
     volumeRatio: volumeRatioRaw ?? "n/a",
     hourlyRatio: hourlyRatioRaw ?? "n/a",
     tradesCount,
@@ -272,15 +289,16 @@ export async function scoreSignals(movement: any) {
 
   console.log("[signals] scores", {
     priceScore: priceScore.toFixed(3),
+    velocityScore: velocityScore.toFixed(3),
     capitalScore: capitalScore.toFixed(3),
     infoScore: infoScore.toFixed(3),
     newsScore: newsScore.toFixed(3),
     timeScore: timeScore.toFixed(3),
     liquidityRisk: liquidityRisk.toFixed(3),
+    recency: recency.toFixed(2),
   });
 
   console.log("[signals] gates", { hasInfoDepth, MIN_INFO_TRADES, MIN_INFO_LEVELS });
 
   console.log("[explain]", explanationText);
-
 }

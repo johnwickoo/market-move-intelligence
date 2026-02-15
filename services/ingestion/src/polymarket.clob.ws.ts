@@ -8,7 +8,11 @@ type ClobMarketOpts = {
   maxBackoffMs?: number;
 };
 
-export function connectClobMarketWS(opts: ClobMarketOpts) {
+export type ClobHandle = {
+  close: () => void;
+};
+
+export function connectClobMarketWS(opts: ClobMarketOpts): ClobHandle {
   const base = opts.baseUrl ?? "wss://ws-subscriptions-clob.polymarket.com";
   const wsUrl = `${base}/ws/market`;
   const reconnectBaseMs = opts.reconnectMs ?? 15_000;
@@ -18,10 +22,12 @@ export function connectClobMarketWS(opts: ClobMarketOpts) {
   let pingInterval: NodeJS.Timeout | null = null;
   let reconnectTimer: NodeJS.Timeout | null = null;
   let closedByRateLimit = false;
+  let destroyed = false;
   let backoffMs = reconnectBaseMs;
   let lastConnectAt = 0;
 
   const scheduleReconnect = (reason: string) => {
+    if (destroyed) return;
     if (reconnectTimer) return;
     const jitter = Math.floor(Math.random() * 5_000);
     const delay = Math.min(backoffMs + jitter, maxBackoffMs + jitter);
@@ -34,6 +40,7 @@ export function connectClobMarketWS(opts: ClobMarketOpts) {
   };
 
   const connect = () => {
+    if (destroyed) return;
     const now = Date.now();
     if (now - lastConnectAt < 1000) {
       scheduleReconnect("connect throttled");
@@ -48,7 +55,7 @@ export function connectClobMarketWS(opts: ClobMarketOpts) {
 
     ws.on("open", () => {
       // Market channel subscription format
-  
+
       ws?.send(JSON.stringify({ assets_ids: opts.assetIds, type: "market" }));
       console.log("[clob] connected + subscribed", opts.assetIds.length);
       backoffMs = reconnectBaseMs;
@@ -90,7 +97,7 @@ export function connectClobMarketWS(opts: ClobMarketOpts) {
       if (pingInterval) clearInterval(pingInterval);
       pingInterval = null;
       console.log("[clob] closed");
-      if (!closedByRateLimit) scheduleReconnect("socket closed");
+      if (!destroyed && !closedByRateLimit) scheduleReconnect("socket closed");
     });
 
     ws.on("error", (err: any) => {
@@ -107,5 +114,13 @@ export function connectClobMarketWS(opts: ClobMarketOpts) {
   };
 
   connect();
-  return ws;
+
+  return {
+    close() {
+      destroyed = true;
+      if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+      if (pingInterval) { clearInterval(pingInterval); pingInterval = null; }
+      try { ws?.close(); } catch { /* ignore */ }
+    },
+  };
 }

@@ -2,40 +2,126 @@ import { supabase } from "../../storage/src/db";
 import type { TradeInsert } from "../../storage/src/types";
 import { scoreSignals } from "../../signals/src/scoreSignals";
 
+// ── Window types ──────────────────────────────────────────────────────
+// "5m" | "15m" | "1h" | "4h" are the active detection windows.
+// "event" is still emitted for since-last-signal anchoring.
+export type WindowType = "5m" | "15m" | "1h" | "4h" | "event";
+
 type MovementInsert = {
   id: string;
   market_id: string;
   outcome: string | null;
-  window_type: "24h" | "event";
+  window_type: WindowType;
   window_start: string;
   window_end: string;
 
-  //these represent MID-price, not trade price
   start_price: number | null;
   end_price: number | null;
   pct_change: number | null;
 
-  volume_24h: number;
+  volume_24h: number; // volume in THIS window (column name kept for schema compat)
   baseline_daily_volume: number | null;
   volume_ratio: number | null;
 
-  reason: "PRICE" | "VOLUME" | "BOTH";
+  reason: "PRICE" | "VOLUME" | "BOTH" | "VELOCITY";
 
-  // hese represent MID min/max/range
-  min_price_24h: number | null;
-  max_price_24h: number | null;
+  min_price_24h: number | null; // min price in THIS window
+  max_price_24h: number | null; // max price in THIS window
   range_pct: number | null;
 
   max_hour_volume: number | null;
   hourly_volume_ratio: number | null;
 
-  trades_count_24h: number;
+  trades_count_24h: number; // trade count in THIS window
   unique_price_levels_24h: number;
   avg_trade_size_24h: number | null;
 
-  // liquidity guard
   thin_liquidity: boolean;
+
+  // New fields stored in the existing JSON-friendly columns via "reason" metadata
+  velocity?: number | null;
 };
+
+// ── Window definitions ────────────────────────────────────────────────
+// Each window has its own duration, price threshold, and idempotency bucket.
+// Shorter windows use tighter thresholds — a 3% move in 5m is significant,
+// while 4h needs 8%+ to filter daily noise.
+type WindowDef = {
+  type: WindowType;
+  ms: number;
+  priceThreshold: number;
+  thinPriceThreshold: number;
+  minAbsMove: number;
+  volumeThreshold: number;
+  minTicks: number;        // minimum mid ticks to evaluate
+  minTrades: number;       // minimum trades to evaluate
+  bucketDivisorMs: number; // idempotency bucket size
+  cooldownMs: number;      // per-key anti-spam cooldown
+};
+
+const WINDOWS: WindowDef[] = [
+  {
+    type: "5m",
+    ms: 5 * 60_000,
+    priceThreshold: Number(process.env.MOVEMENT_5M_PRICE_THRESHOLD ?? 0.03),
+    thinPriceThreshold: Number(process.env.MOVEMENT_5M_THIN_THRESHOLD ?? 0.05),
+    minAbsMove: Number(process.env.MOVEMENT_5M_MIN_ABS ?? 0.02),
+    volumeThreshold: Number(process.env.MOVEMENT_5M_VOLUME_THRESHOLD ?? 1.5),
+    minTicks: 2,
+    minTrades: 2,
+    bucketDivisorMs: 5 * 60_000,   // 1 signal per 5min bucket
+    cooldownMs: Number(process.env.MOVEMENT_5M_COOLDOWN_MS ?? 30_000),
+  },
+  {
+    type: "15m",
+    ms: 15 * 60_000,
+    priceThreshold: Number(process.env.MOVEMENT_15M_PRICE_THRESHOLD ?? 0.04),
+    thinPriceThreshold: Number(process.env.MOVEMENT_15M_THIN_THRESHOLD ?? 0.07),
+    minAbsMove: Number(process.env.MOVEMENT_15M_MIN_ABS ?? 0.02),
+    volumeThreshold: Number(process.env.MOVEMENT_15M_VOLUME_THRESHOLD ?? 1.5),
+    minTicks: 3,
+    minTrades: 3,
+    bucketDivisorMs: 15 * 60_000,
+    cooldownMs: Number(process.env.MOVEMENT_15M_COOLDOWN_MS ?? 60_000),
+  },
+  {
+    type: "1h",
+    ms: 60 * 60_000,
+    priceThreshold: Number(process.env.MOVEMENT_1H_PRICE_THRESHOLD ?? 0.06),
+    thinPriceThreshold: Number(process.env.MOVEMENT_1H_THIN_THRESHOLD ?? 0.10),
+    minAbsMove: Number(process.env.MOVEMENT_1H_MIN_ABS ?? 0.03),
+    volumeThreshold: Number(process.env.MOVEMENT_1H_VOLUME_THRESHOLD ?? 1.5),
+    minTicks: 4,
+    minTrades: 5,
+    bucketDivisorMs: 30 * 60_000,
+    cooldownMs: Number(process.env.MOVEMENT_1H_COOLDOWN_MS ?? 60_000),
+  },
+  {
+    type: "4h",
+    ms: 4 * 60 * 60_000,
+    priceThreshold: Number(process.env.MOVEMENT_4H_PRICE_THRESHOLD ?? 0.08),
+    thinPriceThreshold: Number(process.env.MOVEMENT_4H_THIN_THRESHOLD ?? 0.12),
+    minAbsMove: Number(process.env.MOVEMENT_4H_MIN_ABS ?? 0.03),
+    volumeThreshold: Number(process.env.MOVEMENT_4H_VOLUME_THRESHOLD ?? 1.5),
+    minTicks: 5,
+    minTrades: 8,
+    bucketDivisorMs: 60 * 60_000,
+    cooldownMs: Number(process.env.MOVEMENT_4H_COOLDOWN_MS ?? 60_000),
+  },
+];
+
+// ── Shared config ────────────────────────────────────────────────────
+const MIN_PRICE_FOR_ALERT = Number(process.env.MOVEMENT_MIN_PRICE_FOR_ALERT ?? 0.05);
+const CONFIRM_MINUTES = Number(process.env.MOVEMENT_CONFIRM_MINUTES ?? 5);
+const CONFIRM_MIN_TICKS = Number(process.env.MOVEMENT_CONFIRM_MIN_TICKS ?? 3);
+const THIN_TRADE_COUNT = 15;
+const THIN_PRICE_LEVELS = 8;
+const WIDE_SPREAD = 0.05;
+
+// Velocity significance: |price_delta| / sqrt(minutes)
+// A 5% move in 5min = 0.05/sqrt(5) = 0.022
+// An 8% move in 4h  = 0.08/sqrt(240) = 0.005
+const VELOCITY_THRESHOLD = Number(process.env.MOVEMENT_VELOCITY_THRESHOLD ?? 0.008);
 
 function toNum(x: any): number {
   const n = typeof x === "number" ? x : Number(x);
@@ -43,165 +129,99 @@ function toNum(x: any): number {
   return n;
 }
 
-function windowBounds(nowMs: number) {
-  const end = new Date(nowMs);
-  const start = new Date(nowMs - 24 * 60 * 60 * 1000);
-  return { startISO: start.toISOString(), endISO: end.toISOString() };
+function safeNum(x: any, fallback = 0): number {
+  const n = typeof x === "number" ? x : Number(x);
+  return Number.isFinite(n) ? n : fallback;
 }
 
-// idempotency bucket: 1 event per market+outcome per hour
-function bucketIdHour(tsMs: number) {
-  const hourMs = 60 * 60 * 1000;
-  return Math.floor(tsMs / hourMs);
-}
-
-/**
- * Tiny anti-spam guard:
- * only compute movement once per minute per market+outcome in this process.
- */
+// ── Anti-spam guards (per window type) ───────────────────────────────
 const lastCheckedMs = new Map<string, number>();
-function shouldSkipCompute(key: string, nowMs: number, cooldownMs = 60_000) {
+function shouldSkipCompute(key: string, nowMs: number, cooldownMs: number): boolean {
   const prev = lastCheckedMs.get(key) ?? 0;
   if (nowMs - prev < cooldownMs) return true;
   lastCheckedMs.set(key, nowMs);
   return false;
 }
 
+// ── Velocity calculation ─────────────────────────────────────────────
+// Normalizes price change by sqrt(time) — standard diffusion scaling.
+// This makes a 3% move in 5 minutes score higher than an 8% move in 4 hours.
+function computeVelocity(absDrift: number, windowMinutes: number): number {
+  if (windowMinutes <= 0) return 0;
+  return absDrift / Math.sqrt(windowMinutes);
+}
+
+// ── Main entry point ─────────────────────────────────────────────────
 export async function detectMovement(trade: TradeInsert) {
   const marketId = trade.market_id;
   const outcome = (trade as any).outcome ? String((trade as any).outcome) : null;
-
   const nowMs = Date.parse(trade.timestamp);
   if (!Number.isFinite(nowMs)) return;
 
-  const computeKey = `${marketId}:${outcome ?? "NA"}`;
-  if (shouldSkipCompute(computeKey, nowMs)) return;
-
-  let { startISO, endISO } = windowBounds(nowMs);
-
-  // Clamp window start to first_seen_at so we don't report pre-tracking windows.
+  // Fetch aggregate stats once (shared across windows)
   const { data: agg, error: aggErr } = await supabase
     .from("market_aggregates")
     .select("total_volume, first_seen_at")
     .eq("market_id", marketId)
     .maybeSingle();
   if (aggErr) throw aggErr;
+
   const totalVol = agg?.total_volume == null ? null : toNum(agg.total_volume);
   const firstSeenISO = (agg as any)?.first_seen_at as string | null;
+  let firstSeenMs: number | null = null;
   if (firstSeenISO) {
-    const firstMs = Date.parse(firstSeenISO);
-    if (Number.isFinite(firstMs) && firstMs > Date.parse(startISO)) {
-      startISO = new Date(firstMs).toISOString();
-    }
+    const ms = Date.parse(firstSeenISO);
+    if (Number.isFinite(ms)) firstSeenMs = ms;
   }
 
-  // deterministic id: market + outcome + hourly bucket
-  const bucket = bucketIdHour(nowMs);
-  const movementId24h = `${marketId}:${outcome ?? "NA"}:24h:${bucket}`;
-  const movementIdEvent = `${marketId}:${outcome ?? "NA"}:event:${bucket}`;
+  // Baseline volume (7-day minimum for reliability)
+  let observedDays = 30;
+  let baselineOk = true;
+  if (firstSeenMs != null) {
+    const ageDays = Math.max(1, Math.ceil((nowMs - firstSeenMs) / (24 * 60 * 60_000)));
+    observedDays = Math.min(30, ageDays);
+    if (ageDays < 7) baselineOk = false;
+  }
+  const baselineDaily = totalVol == null || !baselineOk ? null : totalVol / observedDays;
+  const baselineHourly = baselineDaily == null ? null : baselineDaily / 24;
 
-  // =========================================================
-  // 1) TRADES in last 24h → VOLUME + trade-based liquidity hints
-  // =========================================================
+  // Find the longest window we need data for (4h)
+  const maxWindowMs = Math.max(...WINDOWS.map((w) => w.ms));
+  const outerStartMs = nowMs - maxWindowMs;
+  let outerStartISO = new Date(outerStartMs).toISOString();
+  if (firstSeenMs != null && firstSeenMs > outerStartMs) {
+    outerStartISO = new Date(firstSeenMs).toISOString();
+  }
+  const endISO = new Date(nowMs).toISOString();
+
+  // ── Fetch ticks + trades once for the full 4h window ────────────
   let tq = supabase
     .from("trades")
     .select("price,size,timestamp,outcome")
     .eq("market_id", marketId)
-    .gte("timestamp", startISO)
+    .gte("timestamp", outerStartISO)
     .lte("timestamp", endISO)
     .order("timestamp", { ascending: true });
-
   if (outcome) tq = tq.eq("outcome", outcome);
-
-  const { data: trades, error: tradesErr } = await tq;
+  const { data: allTrades, error: tradesErr } = await tq;
   if (tradesErr) throw tradesErr;
-  if (!trades || trades.length < 2) return;
+  if (!allTrades || allTrades.length < 2) return;
 
-  const tradesCount = trades.length;
-
-  const volume24h = trades.reduce((sum, t) => sum + toNum(t.size ?? 0), 0);
-  const avgTradeSize24h = tradesCount > 0 ? volume24h / tradesCount : null;
-
-  // unique trade price levels (rounded to avoid float noise)
-  const priceLevels = new Set<number>();
-  for (const t of trades) {
-    if (t.price == null) continue;
-    priceLevels.add(Number(toNum(t.price).toFixed(2)));
-  }
-  const uniquePriceLevels = priceLevels.size;
-
-  // =========================================================
-  // 2) MID TICKS in last 24h → PRICE movement + spread liquidity
-  // =========================================================
   let mq = supabase
     .from("market_mid_ticks")
     .select("mid, ts, spread_pct, outcome")
     .eq("market_id", marketId)
-    .gte("ts", startISO)
+    .gte("ts", outerStartISO)
     .lte("ts", endISO)
     .order("ts", { ascending: true });
-
-  // if you store outcome on ticks, filter it too
   if (outcome) mq = mq.eq("outcome", outcome);
-
-  const { data: ticks, error: ticksErr } = await mq;
+  const { data: allTicks, error: ticksErr } = await mq;
   if (ticksErr) throw ticksErr;
 
-  // If we don’t have mid ticks yet, we can’t do price detection.
-  // (We can still do volume detection below.)
-  const hasTicks = !!ticks && ticks.length >= 2;
-
-  let startMid: number | null = null;
-  let endMid: number | null = null;
-  let minMid: number | null = null;
-  let maxMid: number | null = null;
-  let midDriftPct: number | null = null;
-  let midRangePct: number | null = null;
-
-  let avgSpreadPct: number | null = null;
-
-  if (hasTicks && ticks) {
-    startMid = ticks[0].mid == null ? null : toNum(ticks[0].mid);
-    endMid = ticks[ticks.length - 1].mid == null ? null : toNum(ticks[ticks.length - 1].mid);
-
-    for (const tk of ticks) {
-      if (tk.mid == null) continue;
-      const m = toNum(tk.mid);
-      minMid = minMid == null ? m : Math.min(minMid, m);
-      maxMid = maxMid == null ? m : Math.max(maxMid, m);
-    }
-
-    if (minMid != null && maxMid != null && minMid > 0) {
-      midRangePct = (maxMid - minMid) / minMid;
-    }
-    if (startMid != null && endMid != null && startMid > 0) {
-      midDriftPct = (endMid - startMid) / startMid;
-    }
-
-    // avg spread % in window (ignore nulls)
-    let spreadSum = 0;
-    let spreadN = 0;
-    for (const tk of ticks) {
-      if (tk.spread_pct == null) continue;
-      spreadSum += toNum(tk.spread_pct);
-      spreadN += 1;
-    }
-    avgSpreadPct = spreadN > 0 ? spreadSum / spreadN : null;
-  }
-
-  const baseStartMid = startMid;
-  const baseEndMid = endMid;
-  const baseMinMid = minMid;
-  const baseMaxMid = maxMid;
-  const baseMidDriftPct = midDriftPct;
-  const baseMidRangePct = midRangePct;
-  const baseAvgSpreadPct = avgSpreadPct;
-
-  // =========================================================
-  // 2b) Anchor start_price to last movement end (if recent)
-  // =========================================================
-  let effectiveStartISO = startISO;
-  if (hasTicks && endMid != null) {
+  // ── Last movement anchor for "event" window ────────────────────
+  let lastMoveEndPrice: number | null = null;
+  let lastMoveEndISO: string | null = null;
+  {
     const { data: lastMove } = await supabase
       .from("market_movements")
       .select("end_price, window_end")
@@ -210,279 +230,328 @@ export async function detectMovement(trade: TradeInsert) {
       .order("window_end", { ascending: false })
       .limit(1)
       .maybeSingle();
-    const lastEndPrice = (lastMove as any)?.end_price;
-    const lastEndISO = (lastMove as any)?.window_end as string | undefined;
-    const lastEndMs = lastEndISO ? Date.parse(lastEndISO) : NaN;
-    if (lastEndPrice != null && Number.isFinite(lastEndMs)) {
-      if (lastEndMs > Date.parse(startISO) && lastEndMs <= nowMs) {
-        startMid = toNum(lastEndPrice);
-        effectiveStartISO = lastEndISO as string;
-        if (startMid > 0) {
-          midDriftPct = (endMid - startMid) / startMid;
+    const ep = (lastMove as any)?.end_price;
+    const we = (lastMove as any)?.window_end as string | undefined;
+    const weMs = we ? Date.parse(we) : NaN;
+    if (ep != null && Number.isFinite(weMs) && weMs > outerStartMs && weMs <= nowMs) {
+      lastMoveEndPrice = toNum(ep);
+      lastMoveEndISO = we as string;
+    }
+  }
+
+  // ── Evaluate each window ───────────────────────────────────────
+  for (const w of WINDOWS) {
+    const computeKey = `${marketId}:${outcome ?? "NA"}:${w.type}`;
+    if (shouldSkipCompute(computeKey, nowMs, w.cooldownMs)) continue;
+
+    const wStartMs = nowMs - w.ms;
+    const wStartISO = new Date(Math.max(wStartMs, firstSeenMs ?? 0)).toISOString();
+
+    // Filter ticks/trades to this window
+    const ticks = allTicks
+      ? allTicks.filter((t) => {
+          const ts = Date.parse(t.ts);
+          return Number.isFinite(ts) && ts >= wStartMs && ts <= nowMs;
+        })
+      : [];
+    const trades = allTrades.filter((t) => {
+      const ts = Date.parse(t.timestamp);
+      return Number.isFinite(ts) && ts >= wStartMs && ts <= nowMs;
+    });
+
+    if (ticks.length < w.minTicks && trades.length < w.minTrades) continue;
+    const hasTicks = ticks.length >= 2;
+
+    // ── Price analysis from mid ticks ──
+    let startMid: number | null = null;
+    let endMid: number | null = null;
+    let minMid: number | null = null;
+    let maxMid: number | null = null;
+    let avgSpreadPct: number | null = null;
+
+    if (hasTicks) {
+      startMid = ticks[0].mid == null ? null : safeNum(ticks[0].mid);
+      endMid = ticks[ticks.length - 1].mid == null ? null : safeNum(ticks[ticks.length - 1].mid);
+      let spreadSum = 0;
+      let spreadN = 0;
+      for (const tk of ticks) {
+        if (tk.mid == null) continue;
+        const m = safeNum(tk.mid);
+        minMid = minMid == null ? m : Math.min(minMid, m);
+        maxMid = maxMid == null ? m : Math.max(maxMid, m);
+        if (tk.spread_pct != null) {
+          spreadSum += safeNum(tk.spread_pct);
+          spreadN += 1;
         }
       }
+      avgSpreadPct = spreadN > 0 ? spreadSum / spreadN : null;
     }
-  }
 
-  let eventMinMid = minMid;
-  let eventMaxMid = maxMid;
-  let eventMidRangePct = midRangePct;
-  if (hasTicks && ticks && effectiveStartISO !== startISO) {
-    const eventStartMs = Date.parse(effectiveStartISO);
-    eventMinMid = null;
-    eventMaxMid = null;
-    for (const tk of ticks) {
-      const ts = Date.parse(tk.ts);
-      if (!Number.isFinite(ts) || ts < eventStartMs) continue;
-      if (tk.mid == null) continue;
-      const m = toNum(tk.mid);
-      eventMinMid = eventMinMid == null ? m : Math.min(eventMinMid, m);
-      eventMaxMid = eventMaxMid == null ? m : Math.max(eventMaxMid, m);
+    // ── Trade stats ──
+    const tradesCount = trades.length;
+    const volume = trades.reduce((sum, t) => sum + safeNum(t.size ?? 0), 0);
+    const avgTradeSize = tradesCount > 0 ? volume / tradesCount : null;
+    const priceLevelsSet = new Set<number>();
+    for (const t of trades) {
+      if (t.price == null) continue;
+      priceLevelsSet.add(Number(safeNum(t.price).toFixed(2)));
     }
-    if (eventMinMid != null && eventMaxMid != null && eventMinMid > 0) {
-      eventMidRangePct = (eventMaxMid - eventMinMid) / eventMinMid;
+    const uniquePriceLevels = priceLevelsSet.size;
+
+    // ── Liquidity guard ──
+    const thinBySpread = avgSpreadPct != null && avgSpreadPct >= WIDE_SPREAD;
+    const thinLiquidity =
+      thinBySpread ||
+      tradesCount < THIN_TRADE_COUNT ||
+      uniquePriceLevels < THIN_PRICE_LEVELS;
+
+    // ── Price metrics ──
+    const driftPct =
+      startMid != null && endMid != null && startMid > 0
+        ? (endMid - startMid) / startMid
+        : null;
+    const rangePct =
+      minMid != null && maxMid != null && minMid > 0
+        ? (maxMid - minMid) / minMid
+        : null;
+    const absMove =
+      minMid != null && maxMid != null ? Math.abs(maxMid - minMid) : null;
+
+    const priceEligible = minMid != null && minMid >= MIN_PRICE_FOR_ALERT;
+    const threshold = thinLiquidity ? w.thinPriceThreshold : w.priceThreshold;
+    const driftHit = driftPct != null && Math.abs(driftPct) >= threshold;
+    const rangeHit = rangePct != null && rangePct >= threshold;
+    const absHit = absMove != null && absMove >= w.minAbsMove;
+    const priceHit = hasTicks && priceEligible && absHit && (driftHit || rangeHit);
+
+    // ── Volume metrics ──
+    // Scale hourly volume against baseline for this window's duration
+    const windowHours = w.ms / (60 * 60_000);
+    const scaledBaseline = baselineHourly != null ? baselineHourly * windowHours : null;
+    const volumeRatio =
+      scaledBaseline != null && scaledBaseline > 0 ? volume / scaledBaseline : null;
+
+    // Hourly max within this window
+    const hourMs = 60 * 60_000;
+    const hourlySums = new Map<number, number>();
+    for (const t of trades) {
+      const ts = Date.parse(t.timestamp);
+      if (!Number.isFinite(ts)) continue;
+      const b = Math.floor((ts - wStartMs) / hourMs);
+      hourlySums.set(b, (hourlySums.get(b) ?? 0) + safeNum(t.size ?? 0));
     }
-  }
+    let maxHourVol = 0;
+    for (const v of hourlySums.values()) maxHourVol = Math.max(maxHourVol, v);
+    const hourlyRatio =
+      baselineHourly != null && baselineHourly > 0 ? maxHourVol / baselineHourly : null;
 
-  // =========================================================
-  // 3) baseline daily volume from aggregates (scaled by observed days)
-  // =========================================================
-  let observedDays = 30;
-  let baselineOk = true;
-  if (firstSeenISO) {
-    const firstMs = Date.parse(firstSeenISO);
-    const ageDays = Math.max(1, Math.ceil((nowMs - firstMs) / (24 * 60 * 60 * 1000)));
-    observedDays = Math.min(30, ageDays);
-    if (ageDays < 7) baselineOk = false;
-  }
+    const volHit =
+      (volumeRatio != null && volumeRatio >= w.volumeThreshold) ||
+      (hourlyRatio != null && hourlyRatio >= w.volumeThreshold);
 
-  const baselineDaily = totalVol == null || !baselineOk ? null : totalVol / observedDays;
-  const baselineHourly = baselineDaily == null ? null : baselineDaily / 24;
+    // ── Velocity metric ──
+    const windowMinutes = w.ms / 60_000;
+    const velocity =
+      driftPct != null ? computeVelocity(Math.abs(driftPct), windowMinutes) : null;
+    const velocityHit = velocity != null && velocity >= VELOCITY_THRESHOLD;
 
-  const volumeRatio =
-    baselineDaily != null && baselineDaily > 0 ? volume24h / baselineDaily : null;
-
-  // =========================================================
-  // 4) hourly max volume ratio (trade-based)
-  // =========================================================
-  const hourMs = 60 * 60 * 1000;
-  const startMs = Date.parse(startISO);
-  const hourlySums = new Map<number, number>();
-
-  for (const t of trades) {
-    const ts = Date.parse(t.timestamp);
-    if (!Number.isFinite(ts)) continue;
-    const b = Math.floor((ts - startMs) / hourMs); // 0..23
-    hourlySums.set(b, (hourlySums.get(b) ?? 0) + toNum(t.size ?? 0));
-  }
-
-  let maxHourVol = 0;
-  for (const v of hourlySums.values()) maxHourVol = Math.max(maxHourVol, v);
-
-  const hourlyRatio =
-    baselineHourly != null && baselineHourly > 0 ? maxHourVol / baselineHourly : null;
-
-  const eventStartMs = Date.parse(effectiveStartISO);
-  const eventTrades = Number.isFinite(eventStartMs)
-    ? trades.filter((t) => Date.parse(t.timestamp) >= eventStartMs)
-    : trades;
-  const eventTradesCount = eventTrades.length;
-  const eventVolume = eventTrades.reduce((sum, t) => sum + toNum(t.size ?? 0), 0);
-  const eventAvgTradeSize =
-    eventTradesCount > 0 ? eventVolume / eventTradesCount : null;
-  const eventPriceLevelsSet = new Set<number>();
-  for (const t of eventTrades) {
-    if (t.price == null) continue;
-    eventPriceLevelsSet.add(Number(toNum(t.price).toFixed(2)));
-  }
-  const eventPriceLevels = eventPriceLevelsSet.size;
-
-  // =========================================================
-  // 5) LIQUIDITY GUARD (spread + trade sparsity)
-  // =========================================================
-  const THIN_TRADE_COUNT = 15;
-  const THIN_PRICE_LEVELS = 8;
-  const WIDE_SPREAD = 0.05; // 5%
-
-  const thinBySpread = baseAvgSpreadPct != null && baseAvgSpreadPct >= WIDE_SPREAD;
-  const thinLiquidity =
-    thinBySpread ||
-    tradesCount < THIN_TRADE_COUNT ||
-    uniquePriceLevels < THIN_PRICE_LEVELS;
-
-  // =========================================================
-  // 6) THRESHOLDS
-  // =========================================================
-  const PRICE_THRESHOLD = Number(process.env.MOVEMENT_PRICE_THRESHOLD ?? 0.08);
-  const THIN_PRICE_THRESHOLD = Number(process.env.MOVEMENT_THIN_PRICE_THRESHOLD ?? 0.12);
-  const VOLUME_THRESHOLD = Number(process.env.MOVEMENT_VOLUME_THRESHOLD ?? 1.5);
-  const MIN_PRICE_FOR_ALERT = Number(process.env.MOVEMENT_MIN_PRICE_FOR_ALERT ?? 0.05);
-  const MIN_ABS_MOVE = Number(process.env.MOVEMENT_MIN_ABS_MOVE ?? 0.03);
-  const CONFIRM_MINUTES = Number(process.env.MOVEMENT_CONFIRM_MINUTES ?? 10);
-  const CONFIRM_MIN_TICKS = Number(process.env.MOVEMENT_CONFIRM_MIN_TICKS ?? 3);
-
-  // PRICE uses MID ticks (not trade prints)
-  const absMove24 =
-    baseMinMid != null && baseMaxMid != null ? Math.abs(baseMaxMid - baseMinMid) : null;
-  const priceEligible24 = baseMinMid != null && baseMinMid >= MIN_PRICE_FOR_ALERT;
-  const driftHit24 =
-    baseMidDriftPct != null &&
-    Math.abs(baseMidDriftPct) >= (thinLiquidity ? THIN_PRICE_THRESHOLD : PRICE_THRESHOLD);
-  const rangeHit24 =
-    baseMidRangePct != null &&
-    baseMidRangePct >= (thinLiquidity ? THIN_PRICE_THRESHOLD : PRICE_THRESHOLD);
-  const absHit24 = absMove24 != null && absMove24 >= MIN_ABS_MOVE;
-  const priceHit24 = hasTicks ? priceEligible24 && absHit24 && (driftHit24 || rangeHit24) : false;
-
-  const absMoveEvent =
-    eventMinMid != null && eventMaxMid != null ? Math.abs(eventMaxMid - eventMinMid) : null;
-  const priceEligibleEvent = eventMinMid != null && eventMinMid >= MIN_PRICE_FOR_ALERT;
-  const driftHitEvent =
-    midDriftPct != null &&
-    Math.abs(midDriftPct) >= (thinLiquidity ? THIN_PRICE_THRESHOLD : PRICE_THRESHOLD);
-  const rangeHitEvent =
-    eventMidRangePct != null &&
-    eventMidRangePct >= (thinLiquidity ? THIN_PRICE_THRESHOLD : PRICE_THRESHOLD);
-  const absHitEvent = absMoveEvent != null && absMoveEvent >= MIN_ABS_MOVE;
-  const priceHitEvent =
-    hasTicks ? priceEligibleEvent && absHitEvent && (driftHitEvent || rangeHitEvent) : false;
-
-  // VOLUME uses trades vs baseline (daily + hourly spike)
-  const hasEnoughHistoryForVolume = observedDays >= 3;
-
-  const dailyVolHit =
-    hasEnoughHistoryForVolume && volumeRatio != null && volumeRatio >= VOLUME_THRESHOLD;
-
-  const hourlyVolHit =
-    hasEnoughHistoryForVolume && hourlyRatio != null && hourlyRatio >= VOLUME_THRESHOLD;
-
-  const volHit = dailyVolHit || hourlyVolHit;
-
-  // PRICE confirmation: require persistence if volume hasn't confirmed
-  let priceConfirmed = priceHitEvent;
-  if (priceHitEvent && !volHit && hasTicks && ticks && startMid != null && endMid != null) {
-    const confirmMs = Math.max(1, CONFIRM_MINUTES) * 60 * 1000;
-    const confirmStartMs = nowMs - confirmMs;
-    let wMin: number | null = null;
-    let wMax: number | null = null;
-    let wCount = 0;
-    let wStartPrice: number | null = null;
-    for (const tk of ticks) {
-      const ts = Date.parse(tk.ts);
-      if (!Number.isFinite(ts) || ts < confirmStartMs) continue;
-      if (tk.mid == null) continue;
-      const m = toNum(tk.mid);
-      wMin = wMin == null ? m : Math.min(wMin, m);
-      wMax = wMax == null ? m : Math.max(wMax, m);
-      if (wStartPrice == null) wStartPrice = m;
-      wCount += 1;
-    }
-    const thresh = thinLiquidity ? THIN_PRICE_THRESHOLD : PRICE_THRESHOLD;
-    const confirmThresh = thresh * 0.5;
-    if (wCount >= CONFIRM_MIN_TICKS && wMin != null && wMax != null) {
-      const upMove = endMid >= startMid;
-      if (upMove) {
-        priceConfirmed =
-          wMin >= startMid * (1 + confirmThresh) || (wMin - startMid) >= MIN_ABS_MOVE;
-      } else {
-        priceConfirmed =
-          wMax <= startMid * (1 - confirmThresh) || (startMid - wMax) >= MIN_ABS_MOVE;
+    // ── Confirmation for short windows without volume ──
+    let priceConfirmed = priceHit;
+    if (priceHit && !volHit && !velocityHit && hasTicks && startMid != null && endMid != null) {
+      const confirmMs = Math.max(1, CONFIRM_MINUTES) * 60_000;
+      const confirmStartMs = nowMs - confirmMs;
+      let wCount = 0;
+      let wMin: number | null = null;
+      let wMax: number | null = null;
+      for (const tk of ticks) {
+        const ts = Date.parse(tk.ts);
+        if (!Number.isFinite(ts) || ts < confirmStartMs) continue;
+        if (tk.mid == null) continue;
+        const m = safeNum(tk.mid);
+        wMin = wMin == null ? m : Math.min(wMin, m);
+        wMax = wMax == null ? m : Math.max(wMax, m);
+        wCount += 1;
       }
-    } else {
-      priceConfirmed = false;
+      const confirmThresh = threshold * 0.5;
+      if (wCount >= CONFIRM_MIN_TICKS && wMin != null && wMax != null) {
+        const upMove = endMid >= startMid;
+        priceConfirmed = upMove
+          ? wMin >= startMid * (1 + confirmThresh) || (wMin - startMid) >= w.minAbsMove
+          : wMax <= startMid * (1 - confirmThresh) || (startMid - wMax) >= w.minAbsMove;
+      } else {
+        priceConfirmed = false;
+      }
     }
-    if (!priceConfirmed) {
-      console.log("[movement] skip price not confirmed", {
-        market_id: marketId,
-        outcome: outcome ?? "-",
-        confirm_minutes: CONFIRM_MINUTES,
-        confirm_ticks: CONFIRM_MIN_TICKS,
-        ticks_in_window: wCount,
-        start_price: startMid,
-        end_price: endMid,
-        window_start_price: wStartPrice,
-        window_min: wMin,
-        window_max: wMax,
-      });
-    }
-  }
 
-  if (!priceHit24 && !volHit && !priceConfirmed) return;
+    // ── Decision: emit? ──
+    if (!priceConfirmed && !volHit && !velocityHit) continue;
 
-  const reason24: MovementInsert["reason"] =
-    priceHit24 && volHit ? "BOTH" : priceHit24 ? "PRICE" : "VOLUME";
+    const reason: MovementInsert["reason"] =
+      velocityHit && priceConfirmed
+        ? "VELOCITY"
+        : priceConfirmed && volHit
+          ? "BOTH"
+          : priceConfirmed
+            ? "PRICE"
+            : "VOLUME";
 
-  async function insertMovement(row: MovementInsert) {
-    const { error: insErr } = await supabase.from("market_movements").insert(row);
-    if (insErr) {
-      const msg = insErr.message ?? "";
-      if (msg.includes("duplicate key")) return false;
-      console.error("[movement] insert failed", msg, "id", row.id);
-      throw insErr;
-    }
-    await scoreSignals(row);
-    console.log(
-      `[movement] ${row.reason} market=${marketId} outcome=${outcome ?? "-"} ` +
-        `mid_drift=${row.pct_change?.toFixed(3) ?? "n/a"} mid_range=${row.range_pct?.toFixed(3) ?? "n/a"} ` +
-        `vol24h=${row.volume_24h.toFixed(2)} vr=${row.volume_ratio?.toFixed(2) ?? "n/a"} ` +
-        `hr=${row.hourly_volume_ratio?.toFixed(2) ?? "n/a"} thin=${thinLiquidity} window=${row.window_start}`
-    );
-    return true;
-  }
+    const bucketId = Math.floor(nowMs / w.bucketDivisorMs);
+    const movementId = `${marketId}:${outcome ?? "NA"}:${w.type}:${bucketId}`;
 
-  if (priceHit24 || volHit) {
-    const row24: MovementInsert = {
-      id: movementId24h,
+    const row: MovementInsert = {
+      id: movementId,
       market_id: marketId,
       outcome,
-      window_type: "24h",
-      window_start: startISO,
+      window_type: w.type,
+      window_start: wStartISO,
       window_end: endISO,
-      start_price: baseStartMid,
-      end_price: baseEndMid,
-      pct_change: baseMidDriftPct,
-      volume_24h: volume24h,
+      start_price: startMid,
+      end_price: endMid,
+      pct_change: driftPct,
+      volume_24h: volume,
       baseline_daily_volume: baselineDaily,
       volume_ratio: volumeRatio,
-      reason: reason24,
-      min_price_24h: baseMinMid,
-      max_price_24h: baseMaxMid,
-      range_pct: baseMidRangePct,
+      reason,
+      min_price_24h: minMid,
+      max_price_24h: maxMid,
+      range_pct: rangePct,
       max_hour_volume: maxHourVol,
       hourly_volume_ratio: hourlyRatio,
       trades_count_24h: tradesCount,
       unique_price_levels_24h: uniquePriceLevels,
-      avg_trade_size_24h: avgTradeSize24h,
+      avg_trade_size_24h: avgTradeSize,
       thin_liquidity: thinLiquidity,
+      velocity,
     };
-    await insertMovement(row24);
+
+    await insertMovement(row, marketId, outcome, thinLiquidity);
   }
 
-  if (priceConfirmed && effectiveStartISO !== startISO) {
-    const rowEvent: MovementInsert = {
-      id: movementIdEvent,
-      market_id: marketId,
-      outcome,
-      window_type: "event",
-      window_start: effectiveStartISO,
-      window_end: endISO,
-      start_price: startMid,
-      end_price: endMid,
-      pct_change: midDriftPct,
-      volume_24h: eventVolume,
-      baseline_daily_volume: null,
-      volume_ratio: null,
-      reason: "PRICE",
-      min_price_24h: eventMinMid,
-      max_price_24h: eventMaxMid,
-      range_pct: eventMidRangePct,
-      max_hour_volume: null,
-      hourly_volume_ratio: null,
-      trades_count_24h: eventTradesCount,
-      unique_price_levels_24h: eventPriceLevels,
-      avg_trade_size_24h: eventAvgTradeSize,
-      thin_liquidity: thinLiquidity,
-    };
-    await insertMovement(rowEvent);
+  // ── "event" window: since last signal ──────────────────────────
+  if (lastMoveEndPrice != null && lastMoveEndISO != null) {
+    const eventComputeKey = `${marketId}:${outcome ?? "NA"}:event`;
+    if (!shouldSkipCompute(eventComputeKey, nowMs, 60_000)) {
+      const eventStartMs = Date.parse(lastMoveEndISO);
+      if (Number.isFinite(eventStartMs) && eventStartMs < nowMs) {
+        const eventTicks = allTicks
+          ? allTicks.filter((t) => {
+              const ts = Date.parse(t.ts);
+              return Number.isFinite(ts) && ts >= eventStartMs && ts <= nowMs;
+            })
+          : [];
+        const eventTrades = allTrades.filter((t) => {
+          const ts = Date.parse(t.timestamp);
+          return Number.isFinite(ts) && ts >= eventStartMs && ts <= nowMs;
+        });
+
+        if (eventTicks.length >= 2 && eventTrades.length >= 2) {
+          const eStartMid = lastMoveEndPrice;
+          const eEndMid = safeNum(eventTicks[eventTicks.length - 1].mid);
+          let eMinMid: number | null = null;
+          let eMaxMid: number | null = null;
+          for (const tk of eventTicks) {
+            if (tk.mid == null) continue;
+            const m = safeNum(tk.mid);
+            eMinMid = eMinMid == null ? m : Math.min(eMinMid, m);
+            eMaxMid = eMaxMid == null ? m : Math.max(eMaxMid, m);
+          }
+
+          const eDriftPct = eStartMid > 0 ? (eEndMid - eStartMid) / eStartMid : null;
+          const eRangePct =
+            eMinMid != null && eMaxMid != null && eMinMid > 0
+              ? (eMaxMid - eMinMid) / eMinMid
+              : null;
+          const eAbsMove =
+            eMinMid != null && eMaxMid != null ? Math.abs(eMaxMid - eMinMid) : null;
+
+          // Use 1h thresholds for event window
+          const eventThreshold = 0.06;
+          const eventMinAbs = 0.03;
+          const eDriftHit = eDriftPct != null && Math.abs(eDriftPct) >= eventThreshold;
+          const eRangeHit = eRangePct != null && eRangePct >= eventThreshold;
+          const eAbsHit = eAbsMove != null && eAbsMove >= eventMinAbs;
+          const ePriceEligible = eMinMid != null && eMinMid >= MIN_PRICE_FOR_ALERT;
+
+          if (ePriceEligible && eAbsHit && (eDriftHit || eRangeHit)) {
+            const eVolume = eventTrades.reduce(
+              (sum, t) => sum + safeNum(t.size ?? 0),
+              0
+            );
+            const eLevels = new Set<number>();
+            for (const t of eventTrades) {
+              if (t.price == null) continue;
+              eLevels.add(Number(safeNum(t.price).toFixed(2)));
+            }
+
+            // Compute velocity for the event window
+            const eventMinutes = Math.max(1, (nowMs - eventStartMs) / 60_000);
+            const eVelocity = eDriftPct != null
+              ? computeVelocity(Math.abs(eDriftPct), eventMinutes)
+              : null;
+
+            const bucketId = Math.floor(nowMs / (60 * 60_000));
+            const row: MovementInsert = {
+              id: `${marketId}:${outcome ?? "NA"}:event:${bucketId}`,
+              market_id: marketId,
+              outcome,
+              window_type: "event",
+              window_start: lastMoveEndISO,
+              window_end: endISO,
+              start_price: eStartMid,
+              end_price: eEndMid,
+              pct_change: eDriftPct,
+              volume_24h: eVolume,
+              baseline_daily_volume: null,
+              volume_ratio: null,
+              reason: "PRICE",
+              min_price_24h: eMinMid,
+              max_price_24h: eMaxMid,
+              range_pct: eRangePct,
+              max_hour_volume: null,
+              hourly_volume_ratio: null,
+              trades_count_24h: eventTrades.length,
+              unique_price_levels_24h: eLevels.size,
+              avg_trade_size_24h:
+                eventTrades.length > 0 ? eVolume / eventTrades.length : null,
+              thin_liquidity: false,
+              velocity: eVelocity,
+            };
+
+            await insertMovement(row, marketId, outcome, false);
+          }
+        }
+      }
+    }
   }
+}
+
+async function insertMovement(
+  row: MovementInsert,
+  marketId: string,
+  outcome: string | null,
+  thinLiquidity: boolean
+): Promise<boolean> {
+  // Strip the velocity field before insert — it's not a DB column.
+  // Instead embed it in reason or log it.
+  const velocity = row.velocity;
+  const { velocity: _v, ...dbRow } = row;
+
+  const { error: insErr } = await supabase.from("market_movements").insert(dbRow);
+  if (insErr) {
+    const msg = insErr.message ?? "";
+    if (msg.includes("duplicate key")) return false;
+    console.error("[movement] insert failed", msg, "id", row.id);
+    throw insErr;
+  }
+
+  await scoreSignals({ ...dbRow, velocity });
+
+  console.log(
+    `[movement] ${row.window_type}/${row.reason} market=${marketId} outcome=${outcome ?? "-"} ` +
+      `drift=${row.pct_change?.toFixed(3) ?? "n/a"} range=${row.range_pct?.toFixed(3) ?? "n/a"} ` +
+      `vol=${row.volume_24h.toFixed(2)} vr=${row.volume_ratio?.toFixed(2) ?? "n/a"} ` +
+      `hr=${row.hourly_volume_ratio?.toFixed(2) ?? "n/a"} ` +
+      `vel=${velocity?.toFixed(4) ?? "n/a"} thin=${thinLiquidity}`
+  );
+  return true;
 }

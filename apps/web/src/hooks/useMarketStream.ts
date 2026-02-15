@@ -244,20 +244,21 @@ export function useMarketStream({
             : marketById.get(marketId) ?? null;
           if (!market) continue;
 
+          const wt = String(mv.window_type ?? "");
+          const isShortWindow = wt === "event" || wt === "5m" || wt === "15m";
           const label = isEvent
-            ? mv.window_type === "event"
+            ? isShortWindow
               ? "Event Movement"
-              : "Event Window"
-            : mv.window_type === "event"
+              : `Event Signal (${wt})`
+            : isShortWindow
               ? "Movement"
-              : "Signal";
-          const kind =
-            mv.window_type === "event" || isEvent ? "movement" : "signal";
+              : `Signal (${wt})`;
+          const kind = isShortWindow || isEvent ? "movement" : "signal";
           const color = isEvent
-            ? mv.window_type === "event"
+            ? isShortWindow
               ? "rgba(96, 169, 255, 0.22)"
               : "rgba(96, 169, 255, 0.14)"
-            : mv.window_type === "event"
+            : isShortWindow
               ? "rgba(80, 220, 140, 0.18)"
               : "rgba(255, 170, 40, 0.18)";
 

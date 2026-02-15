@@ -23,7 +23,7 @@ export type RawMovement = {
   outcome: string | null;
   window_start: string;
   window_end: string;
-  window_type: "24h" | "event";
+  window_type: string;
   reason: string;
 };
 

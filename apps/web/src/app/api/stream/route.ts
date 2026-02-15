@@ -298,9 +298,11 @@ export async function GET(req: Request) {
 
           for (const mv of moves) {
             if (!shouldIncludeOutcome(mv.market_id, mv.outcome)) continue;
+            const mvLabel = mv.window_type === "event" || mv.window_type === "5m" || mv.window_type === "15m"
+              ? "Movement" : "Signal";
             const rawExplanation =
               explanations[mv.id] ??
-              `${mv.window_type === "event" ? "Movement" : "Signal"}: ${mv.reason}`;
+              `${mvLabel}: ${mv.reason}`;
             const marketName = mv.market_id.startsWith("event:")
               ? mv.market_id.slice("event:".length).replace(/-/g, " ")
               : markets.get(mv.market_id)?.title ?? mv.market_id;

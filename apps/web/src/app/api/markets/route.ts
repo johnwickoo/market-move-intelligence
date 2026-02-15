@@ -17,6 +17,32 @@ import {
 const DEFAULT_BUCKET_MINUTES = 1;
 const DEFAULT_SINCE_HOURS = 24;
 
+// ── Movement display helpers for multi-window types ──────────────────
+function movementLabel(windowType: string, isEvent = false): string {
+  if (windowType === "event") return isEvent ? "Event Movement" : "Movement";
+  if (windowType === "5m") return isEvent ? "Event Impulse (5m)" : "Impulse (5m)";
+  if (windowType === "15m") return isEvent ? "Event Move (15m)" : "Move (15m)";
+  if (windowType === "1h") return isEvent ? "Event Move (1h)" : "Move (1h)";
+  if (windowType === "4h") return isEvent ? "Event Shift (4h)" : "Shift (4h)";
+  return isEvent ? "Event Signal" : "Signal";
+}
+
+function movementKind(windowType: string): string {
+  // Short windows are movements (actionable), longer are signals (contextual)
+  if (windowType === "event" || windowType === "5m" || windowType === "15m") return "movement";
+  return "signal";
+}
+
+function movementColor(windowType: string, isEvent = false): string {
+  if (isEvent) {
+    if (windowType === "event" || windowType === "5m" || windowType === "15m") return "rgba(96, 169, 255, 0.22)";
+    return "rgba(96, 169, 255, 0.14)";
+  }
+  if (windowType === "event" || windowType === "5m" || windowType === "15m") return "rgba(80, 220, 140, 0.22)";
+  if (windowType === "1h") return "rgba(255, 170, 40, 0.2)";
+  return "rgba(255, 170, 40, 0.14)";
+}
+
 function clampBucketMinutes(value: number) {
   if (!Number.isFinite(value) || value <= 0) return DEFAULT_BUCKET_MINUTES;
   return Math.max(1, Math.floor(value));
@@ -145,21 +171,18 @@ async function fetchEventAnnotations(
     eventName ?? eventSlug.replace(/-/g, " ");
 
   return moves.map((m) => {
-    const label = m.window_type === "event" ? "Event Movement" : "Event Window";
+    const label = movementLabel(m.window_type, true);
     const raw =
       explanations[m.id] ??
       `${label}: ${m.reason.toLowerCase()} move detected.`;
     const explanation = withMarketInExplanation(raw, name);
     return {
-      kind: m.window_type === "event" ? "movement" : "signal",
+      kind: movementKind(m.window_type),
       start_ts: m.window_start,
       end_ts: m.window_end,
       label,
       explanation,
-      color:
-        m.window_type === "event"
-          ? "rgba(96, 169, 255, 0.22)"
-          : "rgba(96, 169, 255, 0.14)",
+      color: movementColor(m.window_type, true),
     };
   });
 }
@@ -337,7 +360,7 @@ export async function GET(req: Request) {
     const explanations = await fetchExplanations(movements.map((m) => m.id));
 
     const annotations = movements.map((m) => {
-      const label = m.window_type === "event" ? "Movement" : "Signal";
+      const label = movementLabel(m.window_type);
       const raw =
         explanations[m.id] ??
         `${label}: ${m.reason.toLowerCase()} move detected.`;
@@ -345,15 +368,12 @@ export async function GET(req: Request) {
         ? withMarketInExplanation(raw, marketTitle)
         : raw;
       return {
-        kind: m.window_type === "event" ? "movement" : "signal",
+        kind: movementKind(m.window_type),
         start_ts: m.window_start,
         end_ts: m.window_end,
         label,
         explanation,
-        color:
-          m.window_type === "event"
-            ? "rgba(80, 220, 140, 0.22)"
-            : "rgba(255, 170, 40, 0.2)",
+        color: movementColor(m.window_type),
       };
     });
 

@@ -6,7 +6,7 @@ process.on("unhandledRejection", (reason: any) => {
 });
 
 import { connectPolymarketWS } from "./polymarket.ws";
-import { connectClobMarketWS } from "./polymarket.clob.ws";
+import { connectClobMarketWS, type ClobHandle } from "./polymarket.clob.ws";
 
 import { updateAggregateBuffered } from "../../aggregates/src/updateAggregate";
 import { detectMovement } from "../../movements/src/detectMovement";
@@ -66,9 +66,9 @@ const marketMetaCache = new Map<string, { ts: number; meta: MarketMeta }>();
 const marketResolutionById = new Map<string, { ms: number; source: string }>();
 const MARKET_META_TTL_MS = Number(process.env.MARKET_META_TTL_MS ?? 10 * 60_000);
 const RESOLUTION_SKEW_MS = Number(process.env.RESOLUTION_SKEW_MS ?? 5 * 60_000);
-const clobWss: Array<{ close: () => void }> = [];
+const clobWss: ClobHandle[] = [];
 let clobReconnectTimer: NodeJS.Timeout | null = null;
-const MAX_CLOB_ASSETS = Number(process.env.MAX_CLOB_ASSETS ?? 100);
+const MAX_CLOB_ASSETS = Number(process.env.MAX_CLOB_ASSETS ?? 20);
 const MAX_ASSETS_PER_MARKET = Number(process.env.MAX_ASSETS_PER_MARKET ?? 3);
 const MOVER_WINDOW_MS = Number(process.env.MOVER_WINDOW_MS ?? 10 * 60_000);
 const MOVER_REFRESH_MS = Number(process.env.MOVER_REFRESH_MS ?? 60_000);
@@ -445,7 +445,7 @@ function persistMarketResolution(meta: MarketMeta, source: string) {
   void withRetry(
     () =>
       upsertMarketResolution({
-        market_id: meta.marketId,
+        market_id: meta.marketId!,
         slug: meta.slug,
         resolved_at,
         end_time,
@@ -1805,6 +1805,14 @@ async function syncTrackedSlugs() {
         }
       }
     }
+
+    // Immediate backfill after adding new slugs to cover the startup gap
+    if (added > 0 && BACKFILL_URL) {
+      console.log(`[slug-sync] triggering immediate backfill for ${added} new slug(s)`);
+      void runBackfillOnce().catch((e) =>
+        console.error("[backfill] post-sync error", e?.message ?? e)
+      );
+    }
   } catch (err: any) {
     console.error("[slug-sync] error:", err?.message ?? err);
   }
@@ -1838,11 +1846,11 @@ function rebuildClobConnections() {
   const size = Number.isFinite(MAX_CLOB_ASSETS) && MAX_CLOB_ASSETS > 0 ? MAX_CLOB_ASSETS : 100;
   const chunks = chunkAssets(Array.from(trackedAssets), size);
   for (const assetIds of chunks) {
-    const ws = connectClobMarketWS({
+    const handle = connectClobMarketWS({
       assetIds,
       onTick: onClobTick,
     });
-    if (ws) clobWss.push(ws);
+    clobWss.push(handle);
   }
 }
 
