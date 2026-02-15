@@ -20,6 +20,7 @@ export function useMarketStream({
   windowStart,
   useRawTicks,
   pinnedAssetId,
+  yesOnly,
   setMarkets,
 }: {
   slugs: string;
@@ -28,6 +29,7 @@ export function useMarketStream({
   windowStart: string | null;
   useRawTicks: boolean;
   pinnedAssetId: string;
+  yesOnly: boolean;
   setMarkets: React.Dispatch<React.SetStateAction<MarketSnapshot[]>>;
 }): StreamStatus {
   const [status, setStatus] = useState<StreamStatus>("offline");
@@ -42,6 +44,11 @@ export function useMarketStream({
       `&bucketMinutes=${bucketMinutes}` +
       (pinnedAssetId
         ? `&asset_id=${encodeURIComponent(pinnedAssetId)}`
+        : "") +
+      (yesOnly
+        ? `&yesOnly=1${
+            slugs.trim() ? `&event_slug=${encodeURIComponent(slugs)}` : ""
+          }`
         : "");
     const source = new EventSource(streamUrl);
     setStatus("connecting");
@@ -81,12 +88,26 @@ export function useMarketStream({
             volumes: [...o.volumes],
           })),
         }));
-        const marketById = (id: string) =>
-          next.find((m) => m.market_id === id || m.slug === id) ?? next[0];
+        const marketById = new Map<string, MarketSnapshot>();
+        for (const market of next) {
+          if (market.market_id) marketById.set(market.market_id, market);
+          marketById.set(market.slug, market);
+          for (const childId of market.child_market_ids ?? []) {
+            marketById.set(childId, market);
+          }
+        }
         const ensureOutcome = (
-          market: MarketSnapshot,
-          name: string | null
+          market: MarketSnapshot | null,
+          name: string | null,
+          marketId?: string | null
         ) => {
+          if (!market) return null;
+          if (marketId) {
+            const byMarketId = market.outcomes.find(
+              (o) => o.market_id === marketId
+            );
+            if (byMarketId) return byMarketId;
+          }
           if (!name) return null;
           const existing = market.outcomes.find((o) => o.outcome === name);
           if (existing) return existing;
@@ -176,8 +197,8 @@ export function useMarketStream({
         };
 
         for (const tick of pendingTicks.splice(0)) {
-          const market = marketById(tick.market_id);
-          const outcome = ensureOutcome(market, tick.outcome);
+          const market = marketById.get(tick.market_id) ?? null;
+          const outcome = ensureOutcome(market, tick.outcome, tick.market_id);
           if (!outcome) continue;
           const tsMs = Date.parse(tick.ts);
           if (!Number.isFinite(tsMs) || tsMs < baseMs) continue;
@@ -201,8 +222,8 @@ export function useMarketStream({
         }
 
         for (const tr of pendingTrades.splice(0)) {
-          const market = marketById(tr.market_id);
-          const outcome = ensureOutcome(market, tr.outcome);
+          const market = marketById.get(tr.market_id) ?? null;
+          const outcome = ensureOutcome(market, tr.outcome, tr.market_id);
           if (!outcome) continue;
           addVolumeToSeries(outcome.series, tr.ts, tr.size);
           const tradeMs = Date.parse(tr.ts);
@@ -215,21 +236,52 @@ export function useMarketStream({
         }
 
         for (const mv of pendingMoves.splice(0)) {
-          const market = marketById(mv.market_id);
-          const outcome = ensureOutcome(market, mv.outcome);
+          const marketId = String(mv.market_id ?? "");
+          const isEvent = marketId.startsWith("event:");
+          const eventSlug = isEvent ? marketId.slice("event:".length) : "";
+          const market = isEvent
+            ? marketById.get(eventSlug) ?? null
+            : marketById.get(marketId) ?? null;
+          if (!market) continue;
+
+          const label = isEvent
+            ? mv.window_type === "event"
+              ? "Event Movement"
+              : "Event Window"
+            : mv.window_type === "event"
+              ? "Movement"
+              : "Signal";
+          const kind =
+            mv.window_type === "event" || isEvent ? "movement" : "signal";
+          const color = isEvent
+            ? mv.window_type === "event"
+              ? "rgba(96, 169, 255, 0.22)"
+              : "rgba(96, 169, 255, 0.14)"
+            : mv.window_type === "event"
+              ? "rgba(80, 220, 140, 0.18)"
+              : "rgba(255, 170, 40, 0.18)";
+
+          const applyAnnotation = (outcome: OutcomeSeries) => {
+            outcome.annotations.push({
+              kind,
+              start_ts: mv.window_start,
+              end_ts: mv.window_end,
+              label,
+              explanation: mv.explanation ?? `${label}: ${mv.reason}`,
+              color,
+            });
+          };
+
+          if (isEvent) {
+            for (const outcome of market.outcomes) {
+              applyAnnotation(outcome);
+            }
+            continue;
+          }
+
+          const outcome = ensureOutcome(market, mv.outcome, mv.market_id);
           if (!outcome) continue;
-          const label = mv.window_type === "event" ? "Movement" : "Signal";
-          outcome.annotations.push({
-            kind: mv.window_type === "event" ? "movement" : "signal",
-            start_ts: mv.window_start,
-            end_ts: mv.window_end,
-            label,
-            explanation: mv.explanation ?? `${label}: ${mv.reason}`,
-            color:
-              mv.window_type === "event"
-                ? "rgba(80, 220, 140, 0.18)"
-                : "rgba(255, 170, 40, 0.18)",
-          });
+          applyAnnotation(outcome);
         }
 
         return next;
@@ -291,6 +343,7 @@ export function useMarketStream({
     windowStart,
     useRawTicks,
     pinnedAssetId,
+    yesOnly,
     setMarkets,
   ]);
 

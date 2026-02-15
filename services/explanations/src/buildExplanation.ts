@@ -43,11 +43,22 @@ export function buildExplanation(movement: any, signal: any): string {
     classificationSentence = "Move appears driven by new information or sentiment.";
   } else if (classification === "LIQUIDITY") {
     classificationSentence = "Liquidity risk is high; thin books can exaggerate moves.";
+  } else if (classification === "NEWS") {
+    classificationSentence = "Move appears driven by recent news coverage.";
   } else if (classification === "TIME") {
     classificationSentence = "Move may be related to time-to-resolution dynamics.";
   }
 
-  return [priceSentence, windowSentence, volumeSentence, liquiditySentence, classificationSentence]
+  const newsHeadlines: string[] = (movement as any)?.__newsHeadlines ?? [];
+  let newsSentence = "";
+  if (newsHeadlines.length > 0) {
+    const truncated = newsHeadlines
+      .slice(0, 2)
+      .map((h: string) => (h.length > 80 ? h.slice(0, 77) + "..." : h));
+    newsSentence = `Related news: "${truncated.join('"; "')}"`;
+  }
+
+  return [priceSentence, windowSentence, volumeSentence, liquiditySentence, classificationSentence, newsSentence]
     .filter(Boolean)
     .join(" ");
 }

@@ -27,7 +27,10 @@ export async function insertTrade(trade:TradeInsert)
 
 export async function insertTradeBatch(trades: TradeInsert[]) {
   if (trades.length === 0) return;
-  const { error } = await supabase.from("trades").insert(trades);
+  // Use upsert with ignoreDuplicates so one duplicate doesn't fail the whole batch
+  const { error } = await supabase
+    .from("trades")
+    .upsert(trades, { onConflict: "id", ignoreDuplicates: true });
   if (error) throw error;
 }
 
@@ -42,5 +45,26 @@ export async function upsertDominantOutcome(marketId: string, outcome: string, t
       },
       { onConflict: "market_id" }
     );
+  if (error) throw error;
+}
+
+export async function upsertMarketResolution(row: {
+  market_id: string;
+  slug?: string | null;
+  end_time?: string | null;
+  resolved_at?: string | null;
+  resolved?: boolean | null;
+  status?: string | null;
+  resolved_source?: string | null;
+  end_source?: string | null;
+  updated_at?: string | null;
+}) {
+  const payload = {
+    ...row,
+    updated_at: row.updated_at ?? new Date().toISOString(),
+  };
+  const { error } = await supabase
+    .from("market_resolution")
+    .upsert(payload, { onConflict: "market_id" });
   if (error) throw error;
 }

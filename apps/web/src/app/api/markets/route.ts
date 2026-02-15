@@ -9,6 +9,7 @@ import {
   slugFromRaw,
   titleFromRaw,
   colorForOutcome,
+  colorForIndex,
   fetchDominantOutcomes,
   fetchExplanations,
 } from "../../../lib/supabase";
@@ -116,6 +117,36 @@ function buildVolumeBuckets(
   return buckets;
 }
 
+async function fetchEventAnnotations(eventSlug: string, windowStartISO: string) {
+  const eventMarketId = `event:${eventSlug}`;
+  const moves = await pgFetch<RawMovement[]>(
+    `market_movements?select=id,market_id,outcome,window_start,window_end,window_type,reason` +
+      `&market_id=eq.${encodeURIComponent(eventMarketId)}` +
+      `&window_end=gte.${encodeURIComponent(windowStartISO)}` +
+      `&order=window_end.desc&limit=50`
+  );
+
+  if (!Array.isArray(moves) || moves.length === 0) return [];
+  const explanations = await fetchExplanations(moves.map((m) => m.id));
+
+  return moves.map((m) => {
+    const label = m.window_type === "event" ? "Event Movement" : "Event Window";
+    return {
+      kind: m.window_type === "event" ? "movement" : "signal",
+      start_ts: m.window_start,
+      end_ts: m.window_end,
+      label,
+      explanation:
+        explanations[m.id] ??
+        `${label}: ${m.reason.toLowerCase()} move detected.`,
+      color:
+        m.window_type === "event"
+          ? "rgba(96, 169, 255, 0.22)"
+          : "rgba(96, 169, 255, 0.14)",
+    };
+  });
+}
+
 export async function GET(req: Request) {
   const { searchParams } = new URL(req.url);
   const slugsParam = searchParams.get("slugs") ?? "";
@@ -172,49 +203,57 @@ export async function GET(req: Request) {
     }
   }
 
-  // When multiple markets share the same slug, keep only the most recent
-  if (!marketIdParam && slugList.length > 0 && markets.size > 1) {
-    const marketIds = Array.from(markets.keys());
-    const lastTickByMarket = new Map<string, number>();
-    if (marketIds.length > 0) {
+  // ── Group market_ids by slug to detect multi-market events ──────────
+  const marketIdsBySlug = new Map<string, string[]>();
+  for (const [marketId, meta] of markets.entries()) {
+    const arr = marketIdsBySlug.get(meta.slug) ?? [];
+    arr.push(marketId);
+    marketIdsBySlug.set(meta.slug, arr);
+  }
+
+  // Detect multi-market events: multiple market_ids with different titles
+  const multiMarketSlugs = new Set<string>();
+  for (const [slug, ids] of marketIdsBySlug.entries()) {
+    if (ids.length <= 1) continue;
+    const titles = new Set(ids.map((id) => markets.get(id)!.title));
+    if (titles.size > 1) {
+      multiMarketSlugs.add(slug);
+    } else {
+      // Same title = slug recycling, keep only the most recent
+      const lastTickByMarket = new Map<string, number>();
       const ticks = await pgFetch<Pick<RawTick, "market_id" | "ts">[]>(
         `market_mid_ticks?select=market_id,ts` +
-          `&market_id=in.(${marketIds.join(",")})` +
+          `&market_id=in.(${ids.join(",")})` +
           `&order=ts.desc&limit=2000`
       );
       for (const tk of ticks) {
         if (lastTickByMarket.has(tk.market_id)) continue;
         const ms = Date.parse(tk.ts);
-        if (!Number.isFinite(ms)) continue;
-        lastTickByMarket.set(tk.market_id, ms);
+        if (Number.isFinite(ms)) lastTickByMarket.set(tk.market_id, ms);
       }
-    }
-
-    const bestBySlug = new Map<string, { marketId: string; ts: number }>();
-    for (const [marketId, meta] of markets.entries()) {
-      const ts = lastTickByMarket.get(marketId) ?? 0;
-      const prev = bestBySlug.get(meta.slug);
-      if (!prev || ts > prev.ts) {
-        bestBySlug.set(meta.slug, { marketId, ts });
+      let bestId = ids[0];
+      let bestTs = 0;
+      for (const id of ids) {
+        const ts = lastTickByMarket.get(id) ?? 0;
+        if (ts > bestTs) {
+          bestTs = ts;
+          bestId = id;
+        }
       }
-    }
-
-    const selected = new Set(
-      Array.from(bestBySlug.values()).map((entry) => entry.marketId)
-    );
-    for (const id of Array.from(markets.keys())) {
-      if (!selected.has(id)) markets.delete(id);
+      for (const id of ids) {
+        if (id !== bestId) markets.delete(id);
+      }
     }
   }
 
-  // Discover outcomes from ticks
-  if (markets.size > 0) {
-    const marketIds = Array.from(markets.keys());
+  // Discover outcomes from ticks (for single-market entries)
+  const allMarketIds = Array.from(markets.keys());
+  if (allMarketIds.length > 0) {
     const tickOutcomes = await pgFetch<
       Pick<RawTick, "market_id" | "outcome" | "asset_id">[]
     >(
       `market_mid_ticks?select=market_id,outcome,asset_id` +
-        `&market_id=in.(${marketIds.join(",")})` +
+        `&market_id=in.(${allMarketIds.join(",")})` +
         (assetIdParam
           ? `&asset_id=eq.${encodeURIComponent(assetIdParam)}`
           : "") +
@@ -231,12 +270,144 @@ export async function GET(req: Request) {
     }
   }
 
-  const marketIds = Array.from(markets.keys());
-  const dominantByMarket = await fetchDominantOutcomes(marketIds);
+  const dominantByMarket = await fetchDominantOutcomes(allMarketIds);
 
+  // ── Helper: fetch outcome data for a single market_id + outcome ────
+  async function fetchOutcomeData(
+    marketId: string,
+    outcome: string
+  ) {
+    const ticks = await pgFetch<RawTick[]>(
+      `market_mid_ticks?select=market_id,outcome,asset_id,ts,mid` +
+        `&market_id=eq.${marketId}` +
+        `&outcome=eq.${encodeURIComponent(outcome)}` +
+        (assetIdParam
+          ? `&asset_id=eq.${encodeURIComponent(assetIdParam)}`
+          : "") +
+        `&ts=gte.${encodeURIComponent(windowStartISO)}` +
+        `&order=ts.asc&limit=5000`
+    );
+
+    const trades = await pgFetch<RawTrade[]>(
+      `trades?select=market_id,outcome,timestamp,size,side` +
+        `&market_id=eq.${marketId}` +
+        `&outcome=eq.${encodeURIComponent(outcome)}` +
+        `&timestamp=gte.${encodeURIComponent(windowStartISO)}` +
+        `&order=timestamp.asc&limit=5000`
+    );
+
+    const series = raw
+      ? ticks
+          .filter((tk) => tk.mid != null)
+          .map((tk) => ({
+            t: tk.ts,
+            price: toNum(tk.mid),
+            volume: 0,
+          }))
+      : buildBucketSeries(ticks, trades, windowStartMs, windowEndMs, bucketMinutes);
+
+    const volumes = buildVolumeBuckets(trades, windowStartMs, windowEndMs, bucketMinutes);
+
+    const movements = await pgFetch<RawMovement[]>(
+      `market_movements?select=id,market_id,outcome,window_start,window_end,window_type,reason` +
+        `&market_id=eq.${marketId}` +
+        `&outcome=eq.${encodeURIComponent(outcome)}` +
+        `&window_end=gte.${encodeURIComponent(windowStartISO)}` +
+        `&order=window_end.desc&limit=50`
+    );
+
+    const explanations = await fetchExplanations(movements.map((m) => m.id));
+
+    const annotations = movements.map((m) => {
+      const label = m.window_type === "event" ? "Movement" : "Signal";
+      return {
+        kind: m.window_type === "event" ? "movement" : "signal",
+        start_ts: m.window_start,
+        end_ts: m.window_end,
+        label,
+        explanation:
+          explanations[m.id] ??
+          `${label}: ${m.reason.toLowerCase()} move detected.`,
+        color:
+          m.window_type === "event"
+            ? "rgba(80, 220, 140, 0.22)"
+            : "rgba(255, 170, 40, 0.2)",
+      };
+    });
+
+    return { series, volumes, annotations, tickCount: ticks.length };
+  }
+
+  // ── Build payload ──────────────────────────────────────────────────
   const payloadMarkets = [];
 
+  // Track which slugs we've already emitted (to avoid duplicating multi-market)
+  const emittedSlugs = new Set<string>();
+
   for (const [marketId, meta] of markets.entries()) {
+    if (emittedSlugs.has(meta.slug)) continue;
+
+    // ── Multi-market event: merge all children, Yes-only ───────────
+    if (multiMarketSlugs.has(meta.slug)) {
+      emittedSlugs.add(meta.slug);
+      const childIds = marketIdsBySlug.get(meta.slug) ?? [marketId];
+      const outcomeSeries = [];
+
+      // Sort children by title for stable ordering
+      const sortedChildren = childIds
+        .map((id) => ({ id, title: markets.get(id)!.title }))
+        .sort((a, b) => a.title.localeCompare(b.title));
+
+      console.log("[/api/markets] multi-market", {
+        slug: meta.slug,
+        childCount: sortedChildren.length,
+        children: sortedChildren.map((c) => c.title),
+      });
+
+      const eventAnnotations = await fetchEventAnnotations(
+        meta.slug,
+        windowStartISO
+      );
+
+      for (let i = 0; i < sortedChildren.length; i++) {
+        const child = sortedChildren[i];
+        const data = await fetchOutcomeData(child.id, "Yes");
+
+        // Skip children with no data
+        if (data.series.length === 0 && data.tickCount === 0) continue;
+
+        console.log("[/api/markets] child ticks", {
+          marketId: child.id.slice(0, 12),
+          title: child.title,
+          tickCount: data.tickCount,
+        });
+
+        outcomeSeries.push({
+          outcome: child.title,
+          market_id: child.id,
+          color: colorForIndex(i),
+          series: data.series,
+          volumes: data.volumes,
+          annotations:
+            eventAnnotations.length > 0
+              ? [...data.annotations, ...eventAnnotations]
+              : data.annotations,
+        });
+      }
+
+      // Use the event slug as title — first child's slug is the event slug
+      payloadMarkets.push({
+        market_id: childIds[0],
+        slug: meta.slug,
+        title: meta.slug.replace(/-/g, " "),
+        outcomes: outcomeSeries,
+        child_market_ids: childIds,
+      });
+      continue;
+    }
+
+    // ── Single market: existing logic ─────────────────────────────
+    emittedSlugs.add(meta.slug);
     const dominant = dominantByMarket.get(marketId);
     const outcomes = dominant
       ? [dominant]
@@ -244,83 +415,32 @@ export async function GET(req: Request) {
         ? Array.from(meta.outcomes)
         : ["Yes", "No"];
 
+    console.log("[/api/markets]", {
+      marketId,
+      slug: meta.slug,
+      dominant,
+      discoveredOutcomes: Array.from(meta.outcomes),
+      queryOutcomes: outcomes,
+    });
+
     const outcomeSeries = [];
 
     for (const outcome of outcomes) {
-      const color = colorForOutcome(outcome);
+      const data = await fetchOutcomeData(marketId, outcome);
 
-      const ticks = await pgFetch<RawTick[]>(
-        `market_mid_ticks?select=market_id,outcome,asset_id,ts,mid` +
-          `&market_id=eq.${marketId}` +
-          `&outcome=eq.${encodeURIComponent(outcome)}` +
-          (assetIdParam
-            ? `&asset_id=eq.${encodeURIComponent(assetIdParam)}`
-            : "") +
-          `&ts=gte.${encodeURIComponent(windowStartISO)}` +
-          `&order=ts.asc&limit=5000`
-      );
-
-      const trades = await pgFetch<RawTrade[]>(
-        `trades?select=market_id,outcome,timestamp,size,side` +
-          `&market_id=eq.${marketId}` +
-          `&outcome=eq.${encodeURIComponent(outcome)}` +
-          `&timestamp=gte.${encodeURIComponent(windowStartISO)}` +
-          `&order=timestamp.asc&limit=5000`
-      );
-
-      const series = raw
-        ? ticks
-            .filter((tk) => tk.mid != null)
-            .map((tk) => ({
-              t: tk.ts,
-              price: toNum(tk.mid),
-              volume: 0,
-            }))
-        : buildBucketSeries(
-            ticks,
-            trades,
-            windowStartMs,
-            windowEndMs,
-            bucketMinutes
-          );
-
-      const volumes = buildVolumeBuckets(
-        trades,
-        windowStartMs,
-        windowEndMs,
-        bucketMinutes
-      );
-
-      const movements = await pgFetch<RawMovement[]>(
-        `market_movements?select=id,market_id,outcome,window_start,window_end,window_type,reason` +
-          `&market_id=eq.${marketId}` +
-          `&outcome=eq.${encodeURIComponent(outcome)}` +
-          `&window_end=gte.${encodeURIComponent(windowStartISO)}` +
-          `&order=window_end.desc&limit=50`
-      );
-
-      const explanations = await fetchExplanations(
-        movements.map((m) => m.id)
-      );
-
-      const annotations = movements.map((m) => {
-        const label = m.window_type === "event" ? "Movement" : "Signal";
-        return {
-          kind: m.window_type === "event" ? "movement" : "signal",
-          start_ts: m.window_start,
-          end_ts: m.window_end,
-          label,
-          explanation:
-            explanations[m.id] ??
-            `${label}: ${m.reason.toLowerCase()} move detected.`,
-          color:
-            m.window_type === "event"
-              ? "rgba(80, 220, 140, 0.22)"
-              : "rgba(255, 170, 40, 0.2)",
-        };
+      console.log("[/api/markets] ticks", {
+        marketId: marketId.slice(0, 12),
+        outcome,
+        tickCount: data.tickCount,
       });
 
-      outcomeSeries.push({ outcome, color, series, volumes, annotations });
+      outcomeSeries.push({
+        outcome,
+        color: colorForOutcome(outcome),
+        series: data.series,
+        volumes: data.volumes,
+        annotations: data.annotations,
+      });
     }
 
     payloadMarkets.push({

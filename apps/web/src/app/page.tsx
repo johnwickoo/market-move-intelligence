@@ -6,6 +6,7 @@ import type {
   Annotation,
   MarketSnapshot,
   OutcomeSeries,
+  SeriesPoint,
   PinnedSelection,
 } from "../lib/types";
 import { SignalBand } from "../components/SignalBand";
@@ -144,6 +145,62 @@ function inferSinceHours(slugs: string, bucketMinutes: number) {
   return 24;
 }
 
+function colorWithAlpha(color: string, alpha: number): string {
+  const normalized = color.trim();
+  if (normalized.startsWith("#")) {
+    const hex = normalized.slice(1);
+    const full =
+      hex.length === 3
+        ? hex
+            .split("")
+            .map((c) => c + c)
+            .join("")
+        : hex;
+    if (full.length === 6) {
+      const r = parseInt(full.slice(0, 2), 16);
+      const g = parseInt(full.slice(2, 4), 16);
+      const b = parseInt(full.slice(4, 6), 16);
+      if (Number.isFinite(r) && Number.isFinite(g) && Number.isFinite(b)) {
+        return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+      }
+    }
+  }
+  return normalized;
+}
+
+function buildLineData(series: SeriesPoint[]) {
+  const points = series
+    .map((p) => {
+      const ts = Date.parse(p.t);
+      if (!Number.isFinite(ts)) return null;
+      return { time: Math.floor(ts / 1000), value: p.price };
+    })
+    .filter((p): p is { time: number; value: number } => !!p)
+    .sort((a, b) => a.time - b.time);
+
+  const deduped: Array<{ time: number; value: number }> = [];
+  for (const point of points) {
+    const last = deduped[deduped.length - 1];
+    if (last && last.time === point.time) {
+      last.value = point.value;
+    } else {
+      deduped.push(point);
+    }
+  }
+
+  const nowSec = Math.floor(Date.now() / 1000);
+  const lastPoint = deduped[deduped.length - 1];
+  if (lastPoint && nowSec - lastPoint.time > 10) {
+    deduped.push({ time: nowSec, value: lastPoint.value });
+  }
+
+  return deduped.slice(-MAX_POINTS);
+}
+
+function outcomeKey(outcome: OutcomeSeries): string {
+  return outcome.market_id ?? outcome.outcome;
+}
+
 // ── page component ──────────────────────────────────────────────────
 
 export default function Page() {
@@ -190,22 +247,35 @@ export default function Page() {
     }
   }, []);
 
-  const [chartMode, setChartMode] = useState<"raw" | "1m">("raw");
-  const useRawTicks = chartMode === "raw";
   const [bucketMinutes, setBucketMinutes] = useState(inferredBucketMinutes);
   const [windowStart, setWindowStart] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [marketsFor, setMarketsFor] = useState<string | null>(null);
   const [lastPrice, setLastPrice] = useState(0);
   const [rangePct, setRangePct] = useState(0);
   const chartContainerRef = useRef<HTMLDivElement | null>(null);
   const chartRef = useRef<ReturnType<typeof createChart> | null>(null);
-  const lineSeriesRef = useRef<any>(null);
+  const lineSeriesRef = useRef<Map<string, any>>(new Map());
   const volumeSeriesRef = useRef<any>(null);
   const [signalWindows, setSignalWindows] = useState<Annotation[]>([]);
   const [hoveredSignal, setHoveredSignal] = useState<Annotation | null>(null);
   const [chartReady, setChartReady] = useState(false);
   const [signalLayoutTick, setSignalLayoutTick] = useState(0);
+  const [lineFilterKey, setLineFilterKey] = useState<string | null>(null);
+
+  const clearLineSeries = (
+    chartOverride?: ReturnType<typeof createChart> | null
+  ) => {
+    const chart = chartOverride ?? chartRef.current;
+    const seriesMap = lineSeriesRef.current;
+    if (chart) {
+      for (const series of seriesMap.values()) {
+        chart.removeSeries(series);
+      }
+    }
+    seriesMap.clear();
+  };
 
   // ── slug submission handler ──────────────────────────────────────
 
@@ -239,6 +309,7 @@ export default function Page() {
     async function load() {
       setLoading(true);
       setError(null);
+      setMarketsFor(null);
       try {
         const base = pinned.marketId
           ? `/api/markets?market_id=${encodeURIComponent(pinned.marketId)}`
@@ -247,7 +318,6 @@ export default function Page() {
           `${base}` +
             `&sinceHours=${inferredSinceHours}` +
             `&bucketMinutes=${inferredBucketMinutes}` +
-            `&raw=${useRawTicks ? "1" : "0"}` +
             (pinned.assetId
               ? `&asset_id=${encodeURIComponent(pinned.assetId)}`
               : ""),
@@ -256,15 +326,20 @@ export default function Page() {
         if (!res.ok) throw new Error(`API ${res.status}`);
         const json = await res.json();
         if (!active) return;
-        if (Array.isArray(json.markets) && json.markets.length > 0) {
-          const normalized = json.markets.map((m: MarketSnapshot) => ({
-            ...m,
-            outcomes: (m.outcomes ?? []).map((o: OutcomeSeries) => ({
-              ...o,
-              volumes: o.volumes ?? [],
-            })),
-          }));
-          setMarkets(normalized);
+        const rawMarkets = Array.isArray(json.markets) ? json.markets : [];
+        const normalized = rawMarkets.map((m: MarketSnapshot) => ({
+          ...m,
+          outcomes: (m.outcomes ?? []).map((o: OutcomeSeries) => ({
+            ...o,
+            volumes: o.volumes ?? [],
+          })),
+        }));
+        // Always replace markets — prevents stale data from a previous slug
+        // lingering when the new slug has no data yet.
+        setMarkets(normalized.length > 0 ? normalized : []);
+        if (normalized.length > 0) {
+          const key = pinned.marketId ? `market:${pinned.marketId}` : `slugs:${slugs}`;
+          setMarketsFor(key);
         }
         if (json.bucketMinutes && Number(json.bucketMinutes) > 0) {
           setBucketMinutes(Number(json.bucketMinutes));
@@ -284,7 +359,7 @@ export default function Page() {
     return () => {
       active = false;
     };
-  }, [slugs, inferredSinceHours, inferredBucketMinutes, useRawTicks, pinned]);
+  }, [slugs, inferredSinceHours, inferredBucketMinutes, pinned]);
 
   // ── chart setup ───────────────────────────────────────────────────
 
@@ -326,12 +401,6 @@ export default function Page() {
       },
     });
 
-    const lineSeries = chart.addLineSeries({
-      color: "#4f7cff",
-      lineWidth: 2,
-      priceFormat: { type: "price", precision: 3, minMove: 0.001 },
-    });
-
     const volumeSeries = chart.addHistogramSeries({
       priceScaleId: "volume",
       priceFormat: { type: "volume" },
@@ -342,7 +411,6 @@ export default function Page() {
     });
 
     chartRef.current = chart;
-    lineSeriesRef.current = lineSeries;
     volumeSeriesRef.current = volumeSeries;
     setChartReady(true);
 
@@ -357,9 +425,9 @@ export default function Page() {
 
     return () => {
       observer.disconnect();
+      clearLineSeries(chart);
       chart.remove();
       chartRef.current = null;
-      lineSeriesRef.current = null;
       volumeSeriesRef.current = null;
       setChartReady(false);
     };
@@ -375,40 +443,72 @@ export default function Page() {
   }, [markets, slug]);
 
   const selectedMarket = useMemo(
-    () => markets.find((m) => m.slug === slug) ?? markets[0],
+    () => markets.find((m) => m.slug === slug) ?? markets[0] ?? null,
     [slug, markets]
   );
 
-  // Prefer "Yes" if it exists; otherwise pick the outcome with most volume.
-  // This is computed once per market selection — subsequent updates won't flip it.
-  const dominantOutcome = useMemo(() => {
-    if (!selectedMarket?.outcomes?.length) return null;
-    const yes = selectedMarket.outcomes.find(
-      (o) => o.outcome.toLowerCase() === "yes"
-    );
-    if (yes) return yes.outcome;
-    let best = selectedMarket.outcomes[0];
-    let bestVolume = -1;
-    for (const o of selectedMarket.outcomes) {
-      const total = (o.volumes ?? []).reduce(
-        (sum, v) => sum + Number(v.buy ?? 0) + Number(v.sell ?? 0),
-        0
-      );
-      if (total > bestVolume) {
-        best = o;
-        bestVolume = total;
+  // Pick outcome:
+  // 1) Prefer the outcome with the most recent annotation (signal/movement).
+  // 2) Otherwise fall back to the most recent price point.
+  // This keeps the focused outcome aligned with recent movement even when
+  // the backend hasn't provided a dominant outcome.
+  const selectedOutcomeLabel = useMemo(() => {
+    const outcomes = selectedMarket?.outcomes ?? [];
+    if (outcomes.length === 0) return "Yes";
+    if (outcomes.length === 1) return outcomes[0]?.outcome ?? "Yes";
+
+    let bestByAnnotation: { outcome: string; ts: number } | null = null;
+    for (const outcome of outcomes) {
+      const annotations = outcome.annotations ?? [];
+      for (const ann of annotations) {
+        const ts = Date.parse(ann.end_ts);
+        if (!Number.isFinite(ts)) continue;
+        if (!bestByAnnotation || ts > bestByAnnotation.ts) {
+          bestByAnnotation = { outcome: outcome.outcome, ts };
+        }
       }
     }
-    return best.outcome;
+    if (bestByAnnotation) return bestByAnnotation.outcome;
+
+    let bestBySeries: { outcome: string; ts: number } | null = null;
+    for (const outcome of outcomes) {
+      const last = outcome.series?.[outcome.series.length - 1];
+      if (!last) continue;
+      const ts = Date.parse(last.t);
+      if (!Number.isFinite(ts)) continue;
+      if (!bestBySeries || ts > bestBySeries.ts) {
+        bestBySeries = { outcome: outcome.outcome, ts };
+      }
+    }
+    if (bestBySeries) return bestBySeries.outcome;
+
+    return outcomes[0]?.outcome ?? "Yes";
   }, [selectedMarket]);
+
+  const isMultiMarketStream = useMemo(() => {
+    if (pinned.marketId) return false;
+    const key = `slugs:${slugs}`;
+    if (marketsFor !== key) return false;
+    if (markets.length === 0) return false;
+    return markets.every(
+      (market) => (market.child_market_ids?.length ?? 0) > 0
+    );
+  }, [markets, pinned.marketId, slugs, marketsFor]);
 
   const marketIdKey = useMemo(() => {
     if (pinned.marketId) return pinned.marketId;
-    return markets
-      .map((m) => m.market_id)
-      .filter((m): m is string => !!m)
-      .join(",");
-  }, [markets, pinned.marketId]);
+    const key = `slugs:${slugs}`;
+    if (marketsFor !== key) return "";
+    const ids = new Set<string>();
+    for (const market of markets) {
+      if (isMultiMarketStream && market.child_market_ids?.length) {
+        for (const childId of market.child_market_ids) ids.add(childId);
+      } else if (market.market_id) {
+        ids.add(market.market_id);
+      }
+    }
+    return Array.from(ids).join(",");
+  }, [markets, pinned.marketId, slugs, marketsFor, isMultiMarketStream]);
 
   // ── SSE stream (extracted hook) ───────────────────────────────────
 
@@ -417,84 +517,181 @@ export default function Page() {
     marketIdKey,
     bucketMinutes,
     windowStart,
-    useRawTicks,
+    useRawTicks: false,
     pinnedAssetId: pinned.assetId,
+    yesOnly: isMultiMarketStream,
     setMarkets,
   });
 
-  const [outcome, setOutcome] = useState(selectedMarket.outcomes[0].outcome);
-  const outcomeLocked = useRef(false);
+  const selectedOutcome = useMemo(
+    () => {
+      const outcomes = selectedMarket?.outcomes ?? [];
+      if (lineFilterKey) {
+        return (
+          outcomes.find((o) => outcomeKey(o) === lineFilterKey) ??
+          outcomes[0] ??
+          null
+        );
+      }
+      return (
+        outcomes.find((o) => o.outcome === selectedOutcomeLabel) ??
+        outcomes[0] ??
+        null
+      );
+    },
+    [selectedMarket, selectedOutcomeLabel, lineFilterKey]
+  );
 
-  // Set outcome once on initial load or market change, then lock it
+  const visibleOutcomes = useMemo(() => {
+    const outcomes = selectedMarket?.outcomes ?? [];
+    if (!lineFilterKey) return outcomes;
+    return outcomes.filter((o) => outcomeKey(o) === lineFilterKey);
+  }, [selectedMarket, lineFilterKey]);
+
+  const visibleRange = useMemo(() => {
+    let minMs = Infinity;
+    let maxMs = -Infinity;
+    for (const outcome of visibleOutcomes) {
+      for (const point of outcome.series ?? []) {
+        const ts = Date.parse(point.t);
+        if (!Number.isFinite(ts)) continue;
+        minMs = Math.min(minMs, ts);
+        maxMs = Math.max(maxMs, ts);
+      }
+    }
+    if (!Number.isFinite(minMs) || !Number.isFinite(maxMs)) return null;
+    return { minMs, maxMs };
+  }, [visibleOutcomes]);
+
+  const signalStats = useMemo(() => {
+    let lastMs = 0;
+    for (const ann of signalWindows) {
+      const endMs = Date.parse(ann.end_ts);
+      if (Number.isFinite(endMs)) {
+        lastMs = Math.max(lastMs, endMs);
+      }
+    }
+    return { count: signalWindows.length, lastMs };
+  }, [signalWindows]);
+
   useEffect(() => {
-    if (!dominantOutcome) return;
-    if (outcomeLocked.current) return;
-    setOutcome(dominantOutcome);
-    outcomeLocked.current = true;
-  }, [dominantOutcome]);
+    if (!lineFilterKey) return;
+    const outcomes = selectedMarket?.outcomes ?? [];
+    if (!outcomes.some((o) => outcomeKey(o) === lineFilterKey)) {
+      setLineFilterKey(null);
+    }
+  }, [selectedMarket, lineFilterKey]);
 
-  // Unlock when slug changes (new market loaded)
-  useEffect(() => {
-    outcomeLocked.current = false;
-  }, [slugs]);
-
-  const selectedOutcome = useMemo(() => {
-    return (
-      selectedMarket.outcomes.find((o) => o.outcome === outcome) ??
-      selectedMarket.outcomes[0]
-    );
-  }, [selectedMarket, outcome]);
 
   useEffect(() => {
-    setSignalWindows(selectedOutcome.annotations ?? []);
+    const volumeApi = volumeSeriesRef.current;
+    clearLineSeries();
+    if (volumeApi) volumeApi.setData([]);
+    setSignalWindows([]);
     setHoveredSignal(null);
-  }, [selectedOutcome]);
+    setLineFilterKey(null);
+  }, [slugs, pinned.marketId]);
+
+  useEffect(() => {
+    const merged: Annotation[] = [];
+    const seen = new Set<string>();
+    for (const outcome of visibleOutcomes) {
+      for (const ann of outcome.annotations ?? []) {
+        const key = `${ann.kind}:${ann.start_ts}:${ann.end_ts}:${ann.label}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+
+        if (visibleRange) {
+          const startMs = Date.parse(ann.start_ts);
+          const endMs = Date.parse(ann.end_ts);
+          if (!Number.isFinite(startMs) || !Number.isFinite(endMs)) continue;
+          if (endMs < visibleRange.minMs || startMs > visibleRange.maxMs) continue;
+        }
+
+        merged.push(ann);
+      }
+    }
+    setSignalWindows(merged);
+    setHoveredSignal(null);
+  }, [visibleOutcomes, visibleRange]);
 
   // ── sync chart data ───────────────────────────────────────────────
 
   useEffect(() => {
-    const seriesApi = lineSeriesRef.current;
-    if (!seriesApi) return;
-    const points = selectedOutcome.series
-      .map((p) => {
-        const ts = Date.parse(p.t);
-        if (!Number.isFinite(ts)) return null;
-        return { time: Math.floor(ts / 1000), value: p.price };
-      })
-      .filter((p): p is { time: number; value: number } => !!p)
-      .sort((a, b) => a.time - b.time);
+    const chart = chartRef.current;
+    if (!chart) return;
+    if (!selectedMarket) {
+      clearLineSeries(chart);
+      return;
+    }
 
-    const deduped: Array<{ time: number; value: number }> = [];
-    for (const point of points) {
-      const last = deduped[deduped.length - 1];
-      if (last && last.time === point.time) {
-        last.value = point.value;
+    const seriesMap = lineSeriesRef.current;
+    const outcomes = selectedMarket.outcomes ?? [];
+    const outcomesToRender = lineFilterKey
+      ? outcomes.filter((o) => outcomeKey(o) === lineFilterKey)
+      : outcomes;
+    const activeKeys = new Set<string>();
+
+    for (const outcome of outcomesToRender) {
+      const key = outcomeKey(outcome);
+      if (!key) continue;
+      activeKeys.add(key);
+
+      let series = seriesMap.get(key);
+      if (!series) {
+        series = chart.addLineSeries({
+          color: outcome.color,
+          lineWidth: 2,
+          priceFormat: { type: "price", precision: 3, minMove: 0.001 },
+        });
+        seriesMap.set(key, series);
       } else {
-        deduped.push(point);
+        series.applyOptions({ color: outcome.color });
       }
+
+      series.setData(buildLineData(outcome.series));
     }
 
-    // Forward-fill: extend line to "now" using last known price
-    const nowSec = Math.floor(Date.now() / 1000);
-    const lastPoint = deduped[deduped.length - 1];
-    if (lastPoint && nowSec - lastPoint.time > 10) {
-      deduped.push({ time: nowSec, value: lastPoint.value });
+    for (const [key, series] of seriesMap.entries()) {
+      if (activeKeys.has(key)) continue;
+      chart.removeSeries(series);
+      seriesMap.delete(key);
     }
+  }, [selectedMarket, lineFilterKey]);
 
-    const trimmed = deduped.slice(-MAX_POINTS);
-    seriesApi.setData(trimmed);
-    seriesApi.applyOptions({ color: selectedOutcome.color });
-
+  useEffect(() => {
     const volumeApi = volumeSeriesRef.current;
+    const volumeOutcomes = lineFilterKey
+      ? selectedOutcome
+        ? [selectedOutcome]
+        : []
+      : selectedMarket?.outcomes ?? [];
+
+    if (!selectedOutcome && lineFilterKey) {
+      if (volumeApi) volumeApi.setData([]);
+      setLastPrice(0);
+      setRangePct(0);
+      return;
+    }
+
     if (volumeApi) {
-      const volumePoints = selectedOutcome.volumes
-        .map((v) => {
-          const ts = Date.parse(v.t);
+      const bucketMap = new Map<string, { buy: number; sell: number }>();
+      for (const outcome of volumeOutcomes) {
+        for (const v of outcome.volumes) {
+          if (!v.t) continue;
+          const entry = bucketMap.get(v.t) ?? { buy: 0, sell: 0 };
+          entry.buy += Number(v.buy ?? 0);
+          entry.sell += Number(v.sell ?? 0);
+          bucketMap.set(v.t, entry);
+        }
+      }
+
+      const volumePoints = Array.from(bucketMap.entries())
+        .map(([t, vals]) => {
+          const ts = Date.parse(t);
           if (!Number.isFinite(ts)) return null;
-          const buy = Number(v.buy ?? 0);
-          const sell = Number(v.sell ?? 0);
-          const total = buy + sell;
-          const delta = buy - sell;
+          const total = vals.buy + vals.sell;
+          const delta = vals.buy - vals.sell;
           const color =
             delta > 0
               ? "#2ecc71"
@@ -526,19 +723,28 @@ export default function Page() {
       volumeApi.setData(dedupedVol.slice(-MAX_POINTS));
     }
 
-    if (trimmed.length > 0) {
-      const values = trimmed.map((p) => p.value);
-      const min = Math.min(...values);
-      const max = Math.max(...values);
-      const last = trimmed[trimmed.length - 1]?.value ?? 0;
-      const range = Math.max(0.0001, max - min);
-      const pct = (range / Math.max(0.0001, max)) * 100;
-      setLastPrice(last);
-      setRangePct(pct);
+    if (selectedOutcome) {
+      const trimmed = buildLineData(selectedOutcome.series);
+      if (trimmed.length > 0) {
+        const values = trimmed.map((p) => p.value);
+        const min = Math.min(...values);
+        const max = Math.max(...values);
+        const last = trimmed[trimmed.length - 1]?.value ?? 0;
+        const range = Math.max(0.0001, max - min);
+        const pct = (range / Math.max(0.0001, max)) * 100;
+        setLastPrice(last);
+        setRangePct(pct);
+      } else {
+        setLastPrice(0);
+        setRangePct(0);
+      }
+    } else {
+      setLastPrice(0);
+      setRangePct(0);
     }
-  }, [selectedOutcome]);
+  }, [selectedOutcome, selectedMarket, lineFilterKey]);
 
-  const chartWindowLabel = `${useRawTicks ? "Raw ticks" : "1m buckets"} · ${inferredSinceHours}h`;
+  const chartWindowLabel = `1m buckets · ${inferredSinceHours}h`;
 
   // ── render ────────────────────────────────────────────────────────
 
@@ -567,6 +773,11 @@ export default function Page() {
               Load
             </button>
           </form>
+          {slugs && (
+            <div className="ingestion-pill">
+              Ingestion locked · {slugs}
+            </div>
+          )}
         </div>
         <div className="status-pill" data-state={streamStatus}>
           {loading ? "Loading" : streamStatus}
@@ -577,8 +788,8 @@ export default function Page() {
       <section className="mmi-panel">
         <div className="panel-header">
           <div>
-            <p className="market-title">{selectedMarket.title}</p>
-            <p className="market-slug">{selectedMarket.slug}</p>
+            <p className="market-title">{selectedMarket?.title ?? "Loading…"}</p>
+            <p className="market-slug">{selectedMarket?.slug ?? slugs}</p>
           </div>
           <div className="panel-metrics">
             <div className="metric">
@@ -589,9 +800,25 @@ export default function Page() {
               <span>Window range</span>
               <strong>{rangePct.toFixed(1)}%</strong>
             </div>
-            {selectedMarket.outcomes.length > 1 && (
+            <div
+              className="signal-pill"
+              data-active={signalStats.count > 0}
+              title={
+                signalStats.lastMs
+                  ? new Date(signalStats.lastMs).toLocaleString()
+                  : "No signals yet"
+              }
+            >
+              Signals: {signalStats.count}
+              {signalStats.lastMs
+                ? ` · Last ${new Date(
+                    signalStats.lastMs
+                  ).toLocaleTimeString()}`
+                : ""}
+            </div>
+            {(selectedMarket?.outcomes?.length ?? 0) > 1 && selectedOutcome && (
               <div className="dominant-pill">
-                Dominant: {selectedOutcome.outcome}
+                Focused: {selectedOutcome.outcome}
               </div>
             )}
             {pinned.marketId && (
@@ -599,24 +826,46 @@ export default function Page() {
                 Pinned: {pinned.marketId.slice(0, 8)}…
               </div>
             )}
-            <div className="mode-tabs">
-              <button
-                type="button"
-                className={useRawTicks ? "active" : ""}
-                onClick={() => setChartMode("raw")}
-              >
-                Raw ticks
-              </button>
-              <button
-                type="button"
-                className={!useRawTicks ? "active" : ""}
-                onClick={() => setChartMode("1m")}
-              >
-                1m buckets
-              </button>
-            </div>
           </div>
         </div>
+
+        {(selectedMarket?.outcomes?.length ?? 0) > 1 && (
+          <div className="outcome-filters">
+            <button
+              type="button"
+              className="outcome-filter"
+              data-active={!lineFilterKey}
+              onClick={() => setLineFilterKey(null)}
+            >
+              All outcomes
+            </button>
+            {selectedMarket?.outcomes.map((outcome) => {
+              const key = outcomeKey(outcome);
+              if (!key) return null;
+              const active = lineFilterKey === key;
+              const base = outcome.color;
+              return (
+                <button
+                  key={key}
+                  type="button"
+                  className="outcome-filter"
+                  data-active={active}
+                  onClick={() => setLineFilterKey(active ? null : key)}
+                  style={{
+                    borderColor: colorWithAlpha(base, 0.55),
+                    color: base,
+                    background: colorWithAlpha(base, active ? 0.2 : 0.08),
+                    boxShadow: active
+                      ? `0 0 12px ${colorWithAlpha(base, 0.35)}`
+                      : "none",
+                  }}
+                >
+                  {outcome.outcome}
+                </button>
+              );
+            })}
+          </div>
+        )}
 
         <div className="chart-card">
           <div className="chart-stage">
@@ -787,6 +1036,19 @@ export default function Page() {
           color: #e74c3c;
           box-shadow: 0 0 12px rgba(231, 76, 60, 0.15);
         }
+        .ingestion-pill {
+          display: inline-flex;
+          align-items: center;
+          gap: 8px;
+          margin-top: 10px;
+          padding: 6px 12px;
+          border-radius: 999px;
+          border: 1px solid rgba(255, 255, 255, 0.12);
+          background: rgba(12, 18, 30, 0.7);
+          color: var(--muted);
+          font-size: 12px;
+          letter-spacing: 0.04em;
+        }
         .mmi-panel {
           background: linear-gradient(
             145deg,
@@ -848,27 +1110,46 @@ export default function Page() {
           color: var(--ink);
           font-size: 12px;
         }
-        .mode-tabs {
-          display: flex;
-          gap: 6px;
-          padding: 4px;
-          border-radius: 999px;
-          border: 1px solid rgba(255, 255, 255, 0.08);
-          background: rgba(10, 14, 25, 0.7);
-        }
-        .mode-tabs button {
-          border: none;
-          background: transparent;
-          color: var(--muted);
+        .signal-pill {
           padding: 6px 12px;
           border-radius: 999px;
+          border: 1px solid rgba(255, 255, 255, 0.12);
+          background: rgba(12, 18, 30, 0.7);
+          color: var(--muted);
           font-size: 12px;
+          letter-spacing: 0.04em;
+          white-space: nowrap;
+        }
+        .signal-pill[data-active="true"] {
+          border-color: rgba(80, 220, 140, 0.4);
+          color: #bfead6;
+          box-shadow: 0 0 12px rgba(80, 220, 140, 0.15);
+        }
+        .outcome-filters {
+          display: flex;
+          flex-wrap: wrap;
+          gap: 10px;
+          margin-bottom: 18px;
+        }
+        .outcome-filter {
+          border: 1px solid rgba(255, 255, 255, 0.12);
+          background: rgba(10, 14, 25, 0.7);
+          color: var(--ink);
+          border-radius: 999px;
+          padding: 6px 14px;
+          font-size: 12px;
+          letter-spacing: 0.04em;
+          text-transform: uppercase;
           cursor: pointer;
           transition: all 0.2s ease;
         }
-        .mode-tabs button.active {
+        .outcome-filter[data-active="true"] {
+          border-color: rgba(255, 255, 255, 0.35);
           background: rgba(255, 255, 255, 0.08);
-          color: var(--ink);
+          transform: translateY(-1px);
+        }
+        .outcome-filter:hover {
+          border-color: rgba(255, 255, 255, 0.3);
         }
         .chart-card {
           background: linear-gradient(

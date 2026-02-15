@@ -16,7 +16,14 @@ export async function GET(req: Request) {
   const slugsParam = searchParams.get("slugs") ?? "";
   const marketIdsParam = searchParams.get("market_id") ?? "";
   const assetIdsParam = (searchParams.get("asset_id") ?? "").trim();
+  const yesOnly = searchParams.get("yesOnly") === "1";
+  const eventSlugParam =
+    (searchParams.get("event_slug") ?? searchParams.get("eventSlug") ?? "").trim();
   const slugList = slugsParam
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  const eventSlugList = eventSlugParam
     .split(",")
     .map((s) => s.trim())
     .filter(Boolean);
@@ -28,6 +35,7 @@ export async function GET(req: Request) {
   const markets = new Map<string, { slug: string; outcomes: Set<string> }>();
 
   if (marketIdsParam) {
+    // When market_ids provided explicitly (multi-market), use them directly
     for (const id of marketIdsParam.split(",").map((s) => s.trim())) {
       if (!id) continue;
       markets.set(id, { slug: id, outcomes: new Set<string>() });
@@ -49,14 +57,14 @@ export async function GET(req: Request) {
     }
   }
 
-  // Dedup: keep most-recent market per slug
-  if (!marketIdsParam && slugList.length > 0 && markets.size > 1) {
-    const marketIds = Array.from(markets.keys());
+  // Dedup: keep most-recent market per slug (skip when market_ids explicit or multi-market streaming)
+  if (!yesOnly && !marketIdsParam && slugList.length > 0 && markets.size > 1) {
+    const allIds = Array.from(markets.keys());
     const lastTickByMarket = new Map<string, number>();
-    if (marketIds.length > 0) {
+    if (allIds.length > 0) {
       const ticks = await pgFetch<Pick<RawTick, "market_id" | "ts">[]>(
         `market_mid_ticks?select=market_id,ts` +
-          `&market_id=in.(${marketIds.join(",")})` +
+          `&market_id=in.(${allIds.join(",")})` +
           `&order=ts.desc&limit=2000`
       );
       for (const tk of ticks) {
@@ -104,8 +112,22 @@ export async function GET(req: Request) {
     .map((s) => s.trim())
     .filter(Boolean);
   const assetIdSet = assetIds.length > 0 ? new Set(assetIds) : null;
+  const eventMarketIds = Array.from(
+    new Set(eventSlugList.map((s) => `event:${s}`))
+  );
+  const eventMarketIdSet = new Set(eventMarketIds);
 
-  const dominantByMarket = await fetchDominantOutcomes(marketIds);
+  const dominantByMarket = yesOnly
+    ? new Map<string, string>()
+    : await fetchDominantOutcomes(marketIds);
+
+  const shouldIncludeOutcome = (marketId: string, outcome: string | null) => {
+    if (eventMarketIdSet.has(marketId)) return true;
+    if (yesOnly) return String(outcome ?? "").toLowerCase() === "yes";
+    const dominant = dominantByMarket.get(marketId);
+    if (!dominant) return true;
+    return outcome === dominant;
+  };
 
   const encoder = new TextEncoder();
   let heartbeat: ReturnType<typeof setInterval> | null = null;
@@ -168,8 +190,7 @@ export async function GET(req: Request) {
           const seen = new Set<string>();
           for (const tk of latestTicks) {
             if (tk.mid == null) continue;
-            const dominant = dominantByMarket.get(tk.market_id);
-            if (dominant && tk.outcome !== dominant) continue;
+            if (!shouldIncludeOutcome(tk.market_id, tk.outcome)) continue;
             if (assetIdSet && tk.asset_id && !assetIdSet.has(tk.asset_id))
               continue;
             const key = `${tk.market_id}:${tk.outcome ?? ""}`;
@@ -204,8 +225,7 @@ export async function GET(req: Request) {
 
           for (const tk of midTicks) {
             if (tk.mid == null) continue;
-            const dominant = dominantByMarket.get(tk.market_id);
-            if (dominant && tk.outcome !== dominant) continue;
+            if (!shouldIncludeOutcome(tk.market_id, tk.outcome)) continue;
             if (assetIdSet && tk.asset_id && !assetIdSet.has(tk.asset_id))
               continue;
             lastTickIso = tk.ts > lastTickIso ? tk.ts : lastTickIso;
@@ -227,8 +247,7 @@ export async function GET(req: Request) {
           );
 
           for (const tr of trades) {
-            const dominant = dominantByMarket.get(tr.market_id);
-            if (dominant && tr.outcome !== dominant) continue;
+            if (!shouldIncludeOutcome(tr.market_id, tr.outcome)) continue;
             lastTradeIso =
               tr.timestamp > lastTradeIso ? tr.timestamp : lastTradeIso;
             send("trade", {
@@ -243,7 +262,11 @@ export async function GET(req: Request) {
 
           const moves = await pgFetch<RawMovement[]>(
             `market_movements?select=id,market_id,outcome,window_start,window_end,window_type,reason` +
-              `&market_id=in.(${marketIds.join(",")})` +
+              `&market_id=in.(${Array.from(
+                new Set([...marketIds, ...eventMarketIds])
+              )
+                .map(encodeURIComponent)
+                .join(",")})` +
               `&window_end=gt.${encodeURIComponent(lastMoveIso)}` +
               `&order=window_end.asc&limit=200`
           );
@@ -257,8 +280,7 @@ export async function GET(req: Request) {
           );
 
           for (const mv of moves) {
-            const dominant = dominantByMarket.get(mv.market_id);
-            if (dominant && mv.outcome !== dominant) continue;
+            if (!shouldIncludeOutcome(mv.market_id, mv.outcome)) continue;
             send("movement", {
               ...mv,
               explanation:

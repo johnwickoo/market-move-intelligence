@@ -33,6 +33,21 @@ CREATE TABLE market_dominant_outcomes (
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+CREATE TABLE market_resolution (
+  market_id TEXT PRIMARY KEY,
+  slug TEXT,
+  end_time TIMESTAMPTZ,
+  resolved_at TIMESTAMPTZ,
+  resolved BOOLEAN,
+  status TEXT,
+  resolved_source TEXT,
+  end_source TEXT,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX market_resolution_slug_idx
+  ON public.market_resolution USING btree (slug);
+
 CREATE TABLE market_mid_ticks (
   id BIGSERIAL PRIMARY KEY,
   market_id TEXT NOT NULL,

@@ -25,6 +25,7 @@ export type OutcomeSeries = {
   series: SeriesPoint[];
   volumes: VolumePoint[];
   annotations: Annotation[];
+  market_id?: string; // child market_id for multi-market events
 };
 
 export type MarketSnapshot = {
@@ -32,6 +33,7 @@ export type MarketSnapshot = {
   slug: string;
   title: string;
   outcomes: OutcomeSeries[];
+  child_market_ids?: string[];
 };
 
 export type PinnedSelection = {

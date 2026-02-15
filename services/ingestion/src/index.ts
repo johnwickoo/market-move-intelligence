@@ -1,12 +1,19 @@
 import "dotenv/config";
+
+// Catch unhandled rejections with full detail instead of crashing
+process.on("unhandledRejection", (reason: any) => {
+  console.error("[UNHANDLED REJECTION]", typeof reason, reason instanceof Error ? reason.stack : JSON.stringify(reason, null, 2));
+});
+
 import { connectPolymarketWS } from "./polymarket.ws";
 import { connectClobMarketWS } from "./polymarket.clob.ws";
 
 import { updateAggregateBuffered } from "../../aggregates/src/updateAggregate";
 import { detectMovement } from "../../movements/src/detectMovement";
+import { detectEventMovement } from "../../movements/src/detectMovementEvent";
 import { movementRealtime } from "../../movements/src/detectMovementRealtime";
 import { insertMidTick } from "../../storage/src/insertMidTick";
-import { insertTradeBatch, insertTrade, upsertDominantOutcome } from "../../storage/src/db";
+import { insertTradeBatch, insertTrade, upsertDominantOutcome, upsertMarketResolution } from "../../storage/src/db";
 import type { TradeInsert } from "../../storage/src/types";
 import * as fs from "fs/promises";
 import * as path from "path";
@@ -50,7 +57,15 @@ const assetMeta = new Map<string, { marketId: string; outcome: string | null }>(
 const trackedAssets = new Set<string>();
 const hydratedMarkets = new Set<string>();
 const marketAssets = new Map<string, Set<string>>();
+const marketPrimaryAsset = new Map<string, string>(); // first asset per market for realtime detector
 const hydrationInFlight = new Set<string>();
+const lastClobTickMs = new Map<string, number>(); // asset -> last CLOB tick timestamp
+const TRADE_MID_FALLBACK_MS = 30_000; // if no CLOB tick in 30s, use trade price as mid
+const resolvedSlugs = new Map<string, number>();
+const marketMetaCache = new Map<string, { ts: number; meta: MarketMeta }>();
+const marketResolutionById = new Map<string, { ms: number; source: string }>();
+const MARKET_META_TTL_MS = Number(process.env.MARKET_META_TTL_MS ?? 10 * 60_000);
+const RESOLUTION_SKEW_MS = Number(process.env.RESOLUTION_SKEW_MS ?? 5 * 60_000);
 const clobWss: Array<{ close: () => void }> = [];
 let clobReconnectTimer: NodeJS.Timeout | null = null;
 const MAX_CLOB_ASSETS = Number(process.env.MAX_CLOB_ASSETS ?? 100);
@@ -78,6 +93,11 @@ const lastTopByAsset = new Map<
   { bid: number | null; ask: number | null; mid: number | null; bucket: number }
 >();
 const MID_BUCKET_MS = 2000;
+const MID_MAX_SPREAD_PCT = Number(process.env.MID_MAX_SPREAD_PCT ?? 0.30);
+const LOG_MID_DEBUG = process.env.LOG_MID_DEBUG === "1";
+const LOG_CLOB_RAW = process.env.LOG_CLOB_RAW === "1";
+const MID_DEBUG_THROTTLE_MS = Number(process.env.MID_DEBUG_THROTTLE_MS ?? 5000);
+const lastMidDebug = new Map<string, number>();
 const latestSignalByAsset = new Map<string, { price: number; ts: number }>();
 const lastMovementGate = new Map<string, { price: number; ts: number }>();
 const MOVEMENT_MIN_MS = Number(process.env.MOVEMENT_MIN_MS ?? 10000);
@@ -101,6 +121,15 @@ let tradeFlushTimer: NodeJS.Timeout | null = null;
 const TRADE_DEDUPE_TTL_MS = Number(process.env.TRADE_DEDUPE_TTL_MS ?? 10 * 60_000);
 const recentTrades = new Map<string, number>();
 const pendingTradeLogs = new Map<string, { parts: string[]; timer: NodeJS.Timeout }>();
+
+function logMidDebug(key: string, ...args: any[]) {
+  if (!LOG_MID_DEBUG) return;
+  const now = Date.now();
+  const last = lastMidDebug.get(key) ?? 0;
+  if (now - last < MID_DEBUG_THROTTLE_MS) return;
+  lastMidDebug.set(key, now);
+  console.log(...args);
+}
 
 async function withRetry<T>(
   fn: () => Promise<T>,
@@ -143,6 +172,317 @@ async function appendManyToSpool(trades: TradeInsert[]) {
   if (trades.length === 0) return;
   const lines = trades.map((t) => JSON.stringify(t)).join("\n") + "\n";
   await fs.appendFile(SPOOL_PATH, lines, "utf8");
+}
+
+type MarketMeta = {
+  marketId: string | null;
+  slug: string | null;
+  assets: Array<{ assetId: string; outcome: string | null }>;
+  resolvedAtMs: number | null;
+  endTimeMs: number | null;
+  status: string | null;
+  resolvedFlag: boolean | null;
+  resolvedSource: string | null;
+  endSource: string | null;
+};
+
+const RESOLUTION_KEYS = [
+  "resolved_at",
+  "resolvedAt",
+  "resolved_time",
+  "resolvedTime",
+  "resolution_time",
+  "resolutionTime",
+  "resolution_date",
+  "resolutionDate",
+  "settlement_time",
+  "settlementTime",
+];
+
+const END_TIME_KEYS = [
+  "end_date",
+  "endDate",
+  "end_time",
+  "endTime",
+  "close_time",
+  "closeTime",
+  "close_date",
+  "closeDate",
+  "expiration",
+  "expires_at",
+  "expiresAt",
+  "event_end",
+  "eventEnd",
+];
+
+const STATUS_KEYS = ["status", "state", "market_status", "marketState", "phase"];
+const RESOLVED_FLAG_KEYS = [
+  "resolved",
+  "isResolved",
+  "is_resolved",
+  "settled",
+  "isSettled",
+  "closed",
+  "isClosed",
+  "is_closed",
+];
+
+function collectRoots(data: any): any[] {
+  const roots: any[] = [];
+  if (data && typeof data === "object") roots.push(data);
+  const nested = [
+    data?.data,
+    data?.payload,
+    data?.result,
+    data?.market,
+    data?.event,
+    data?.market?.event,
+  ];
+  for (const item of nested) {
+    if (item && typeof item === "object") roots.push(item);
+  }
+  return roots;
+}
+
+function parseTimestamp(value: unknown): number | null {
+  if (value == null) return null;
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value < 10_000_000_000 ? value * 1000 : value;
+  }
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (!trimmed) return null;
+    const n = Number(trimmed);
+    if (Number.isFinite(n)) {
+      return n < 10_000_000_000 ? n * 1000 : n;
+    }
+    const parsed = Date.parse(trimmed);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return null;
+}
+
+function extractTimeFromRoots(
+  roots: any[],
+  keys: string[]
+): { ms: number; key: string } | null {
+  for (const root of roots) {
+    if (!root || typeof root !== "object") continue;
+    for (const key of keys) {
+      if (root[key] == null) continue;
+      const ms = parseTimestamp(root[key]);
+      if (ms != null) return { ms, key };
+    }
+  }
+  return null;
+}
+
+function extractStatusFromRoots(
+  roots: any[]
+): { status: string | null; resolvedFlag: boolean | null } {
+  let status: string | null = null;
+  let resolvedFlag: boolean | null = null;
+  for (const root of roots) {
+    if (!root || typeof root !== "object") continue;
+    for (const key of STATUS_KEYS) {
+      if (status == null && typeof root[key] === "string") {
+        status = String(root[key]);
+      }
+    }
+    for (const key of RESOLVED_FLAG_KEYS) {
+      if (typeof root[key] === "boolean") {
+        resolvedFlag = root[key];
+      }
+    }
+    if (typeof root.active === "boolean" && root.active === false) {
+      resolvedFlag = true;
+    }
+  }
+  return { status, resolvedFlag };
+}
+
+function extractMarketIdFromRoots(roots: any[]): string | null {
+  const idKeys = ["conditionId", "marketId", "market_id", "id", "market"];
+  for (const root of roots) {
+    if (!root || typeof root !== "object") continue;
+    for (const key of idKeys) {
+      const val = root[key];
+      if (typeof val === "string" && val.trim()) return val.trim();
+    }
+  }
+  return null;
+}
+
+function extractSlugFromRoots(roots: any[]): string | null {
+  const slugKeys = ["eventSlug", "slug", "marketSlug", "market_slug"];
+  for (const root of roots) {
+    if (!root || typeof root !== "object") continue;
+    for (const key of slugKeys) {
+      const val = root[key];
+      if (typeof val === "string" && val.trim()) return val.trim();
+    }
+  }
+  return null;
+}
+
+function tryParseJsonArray(value: unknown): any[] | null {
+  if (Array.isArray(value)) return value;
+  if (typeof value === "string") {
+    try {
+      const parsed = JSON.parse(value);
+      if (Array.isArray(parsed)) return parsed;
+    } catch { /* not JSON */ }
+  }
+  return null;
+}
+
+function extractAssetsFromMeta(data: any): Array<{ assetId: string; outcome: string | null }> {
+  const candidates: Array<{ assetId: string; outcome: string | null }> = [];
+
+  const tokens = data?.tokens ?? data?.market?.tokens ?? data?.result?.tokens;
+  if (Array.isArray(tokens)) {
+    for (const t of tokens) {
+      const assetId = String(t?.asset_id ?? t?.token_id ?? t?.id ?? "").trim();
+      if (!assetId) continue;
+      const outcome = t?.outcome != null ? String(t.outcome) : null;
+      candidates.push({ assetId, outcome });
+    }
+  }
+
+  // Handle clobTokenIds + outcomes as parallel arrays (Polymarket slug API format).
+  // The gamma API returns these as JSON-encoded strings, not native arrays.
+  const rawClobTokenIds =
+    data?.clobTokenIds ?? data?.market?.clobTokenIds ?? data?.result?.clobTokenIds;
+  const rawOutcomeNames =
+    data?.outcomes ?? data?.market?.outcomes ?? data?.result?.outcomes;
+  const clobTokenIds = tryParseJsonArray(rawClobTokenIds);
+  const outcomeNames = tryParseJsonArray(rawOutcomeNames);
+  if (clobTokenIds && clobTokenIds.length > 0 && candidates.length === 0) {
+    for (let i = 0; i < clobTokenIds.length; i++) {
+      const assetId = String(clobTokenIds[i] ?? "").trim();
+      if (!assetId) continue;
+      const outcome =
+        outcomeNames && outcomeNames[i] != null
+          ? String(outcomeNames[i])
+          : null;
+      candidates.push({ assetId, outcome });
+    }
+  }
+
+  // Legacy: outcomes as objects with asset_id/token_id fields
+  if (candidates.length === 0 && outcomeNames) {
+    for (const o of outcomeNames) {
+      if (typeof o !== "object" || o === null) continue;
+      const assetId = String(o?.asset_id ?? o?.token_id ?? o?.id ?? "").trim();
+      if (!assetId) continue;
+      const outcome =
+        o?.name != null ? String(o.name) : o?.outcome != null ? String(o.outcome) : null;
+      candidates.push({ assetId, outcome });
+    }
+  }
+
+  return candidates;
+}
+
+function extractMarketMeta(data: any): MarketMeta {
+  const roots = collectRoots(data);
+  const resolved = extractTimeFromRoots(roots, RESOLUTION_KEYS);
+  const end = extractTimeFromRoots(roots, END_TIME_KEYS);
+  const { status, resolvedFlag } = extractStatusFromRoots(roots);
+  const marketId = extractMarketIdFromRoots(roots);
+  const slug = extractSlugFromRoots(roots);
+  const assets = extractAssetsFromMeta(data);
+
+  return {
+    marketId,
+    slug,
+    assets,
+    resolvedAtMs: resolved?.ms ?? null,
+    endTimeMs: end?.ms ?? null,
+    status,
+    resolvedFlag,
+    resolvedSource: resolved?.key ?? null,
+    endSource: end?.key ?? null,
+  };
+}
+
+function isMetaResolved(meta: MarketMeta, nowMs: number): boolean {
+  if (meta.resolvedFlag === true) return true;
+  if (meta.status) {
+    const s = meta.status.toLowerCase();
+    if (["resolved", "closed", "settled", "ended"].includes(s)) return true;
+  }
+  if (meta.resolvedAtMs != null && meta.resolvedAtMs <= nowMs + RESOLUTION_SKEW_MS) {
+    return true;
+  }
+  if (meta.endTimeMs != null && meta.endTimeMs <= nowMs + RESOLUTION_SKEW_MS) {
+    return true;
+  }
+  return false;
+}
+
+function persistMarketResolution(meta: MarketMeta, source: string) {
+  if (!meta.marketId) return;
+  const hasSignal =
+    meta.resolvedAtMs != null ||
+    meta.endTimeMs != null ||
+    meta.status != null ||
+    meta.resolvedFlag != null;
+  if (!hasSignal) return;
+
+  const resolved =
+    meta.resolvedFlag === true ||
+    (meta.status ? ["resolved", "closed", "settled", "ended"].includes(meta.status.toLowerCase()) : false) ||
+    (meta.resolvedAtMs != null && meta.resolvedAtMs <= Date.now() + RESOLUTION_SKEW_MS) ||
+    (meta.endTimeMs != null && meta.endTimeMs <= Date.now() + RESOLUTION_SKEW_MS);
+
+  const resolved_at = meta.resolvedAtMs != null ? new Date(meta.resolvedAtMs).toISOString() : null;
+  const end_time = meta.endTimeMs != null ? new Date(meta.endTimeMs).toISOString() : null;
+
+  const resolvedSource = meta.resolvedSource ? `${source}:${meta.resolvedSource}` : null;
+  const endSource = meta.endSource ? `${source}:${meta.endSource}` : null;
+
+  void withRetry(
+    () =>
+      upsertMarketResolution({
+        market_id: meta.marketId,
+        slug: meta.slug,
+        resolved_at,
+        end_time,
+        resolved,
+        status: meta.status,
+        resolved_source: resolvedSource,
+        end_source: endSource,
+        updated_at: new Date().toISOString(),
+      }),
+    "upsertMarketResolution"
+  ).catch((err: any) => {
+    console.warn(
+      "[resolution] upsert failed",
+      { market: meta.marketId?.slice(0, 12), slug: meta.slug ?? "-" },
+      err?.message ?? err
+    );
+  });
+}
+
+function noteResolutionFromMessage(msg: any, source: string) {
+  const roots = collectRoots(msg);
+  const marketId = extractMarketIdFromRoots(roots);
+  if (!marketId) return;
+  const resolved = extractTimeFromRoots(roots, RESOLUTION_KEYS);
+  const end = extractTimeFromRoots(roots, END_TIME_KEYS);
+  const picked = resolved ?? end;
+  if (!picked) return;
+  const prev = marketResolutionById.get(marketId);
+  if (!prev || picked.ms < prev.ms) {
+    marketResolutionById.set(marketId, { ms: picked.ms, source: `${source}:${picked.key}` });
+    console.log(
+      `[resolution] source=${source} market=${marketId.slice(0, 12)} time=${new Date(picked.ms).toISOString()} field=${picked.key}`
+    );
+  }
+  const meta = extractMarketMeta(msg);
+  const metaWithId = meta.marketId ? meta : { ...meta, marketId };
+  persistMarketResolution(metaWithId, source);
 }
 
 async function replaySpoolOnce() {
@@ -198,19 +538,19 @@ async function flushTradeBuffer() {
     await withRetry(() => insertTradeBatch(batch), "insertTradeBatch", 2);
     insertFailCount = 0;
     console.log(`[trade-batch] success size=${batch.length}`);
-  } catch {
+  } catch (err: any) {
     insertFailCount += 1;
     await appendManyToSpool(batch);
-    console.log(`[trade-batch] failed size=${batch.length} -> spooled`);
+    console.log(`[trade-batch] failed size=${batch.length} -> spooled:`, err?.message ?? err);
   }
 }
 
-async function fetchMarketAssets(opts: {
+async function fetchMarketMeta(opts: {
   marketId?: string | null;
   eventSlug?: string | null;
-}): Promise<Array<{ assetId: string; outcome: string | null }>> {
+}): Promise<MarketMeta | null> {
   const base = String(process.env.POLYMARKET_MARKET_METADATA_URL ?? "").trim();
-  if (!base) return [];
+  if (!base) return null;
 
   let url: URL;
   if (opts.eventSlug && base.endsWith("/markets/slug")) {
@@ -230,43 +570,92 @@ async function fetchMarketAssets(opts: {
       }),
     "fetchMarketAssets"
   );
-  if (!res.ok) return [];
-  const data: any = await res.json();
-
-  const candidates: Array<{ assetId: string; outcome: string | null }> = [];
-
-  const tokens = data?.tokens ?? data?.market?.tokens ?? data?.result?.tokens;
-  if (Array.isArray(tokens)) {
-    for (const t of tokens) {
-      const assetId = String(t?.asset_id ?? t?.token_id ?? t?.id ?? "").trim();
-      if (!assetId) continue;
-      const outcome = t?.outcome != null ? String(t.outcome) : null;
-      candidates.push({ assetId, outcome });
-    }
+  if (!res.ok) return null;
+  const raw: any = await res.json();
+  let data: any = raw;
+  if (Array.isArray(raw)) {
+    data = raw[0] ?? null;
+  } else if (Array.isArray(raw?.markets)) {
+    data = raw.markets[0] ?? null;
+  } else if (Array.isArray(raw?.data)) {
+    data = raw.data[0] ?? null;
+  } else if (Array.isArray(raw?.result)) {
+    data = raw.result[0] ?? null;
   }
+  if (!data) return null;
+  return extractMarketMeta(data);
+}
 
-  const outcomes = data?.outcomes ?? data?.market?.outcomes ?? data?.result?.outcomes;
-  if (Array.isArray(outcomes)) {
-    for (const o of outcomes) {
-      const assetId = String(o?.asset_id ?? o?.token_id ?? o?.id ?? "").trim();
-      if (!assetId) continue;
-      const outcome =
-        o?.name != null ? String(o.name) : o?.outcome != null ? String(o.outcome) : null;
-      candidates.push({ assetId, outcome });
-    }
+async function fetchMarketAssets(opts: {
+  marketId?: string | null;
+  eventSlug?: string | null;
+}): Promise<Array<{ assetId: string; outcome: string | null }>> {
+  const meta = await fetchMarketMeta(opts);
+  return meta?.assets ?? [];
+}
+
+async function fetchEventChildMarkets(slug: string): Promise<MarketMeta[] | null> {
+  const base = String(process.env.POLYMARKET_MARKET_METADATA_URL ?? "").trim();
+  if (!base) return null;
+  // Derive events API URL: /markets/slug → /events/slug
+  const eventsUrl = base.replace(/\/markets\/slug$/, "/events/slug");
+  if (eventsUrl === base) return null;
+
+  try {
+    const res = await withRetry(
+      () => fetch(`${eventsUrl}/${slug}`, { headers: { accept: "application/json" } }),
+      "fetchEventChildMarkets"
+    );
+    if (!res.ok) return null;
+    const data: any = await res.json();
+    const markets = data?.markets;
+    if (!Array.isArray(markets) || markets.length === 0) return null;
+    console.log(`[event-meta] ${slug}: found ${markets.length} child markets`);
+    return markets.map((m: any) => extractMarketMeta(m));
+  } catch (err: any) {
+    console.warn(`[event-meta] ${slug} fetch failed:`, err?.message ?? err);
+    return null;
   }
-
-  return candidates;
 }
 
 async function hydrateMarket(marketId: string, eventSlug: string | null) {
-  if (hydratedMarkets.has(marketId) || hydrationInFlight.has(marketId)) return;
+  if (hydratedMarkets.has(marketId)) { return; }
+  if (hydrationInFlight.has(marketId)) { return; }
+
+  // For multi-market event children, use the child's own slug for metadata lookup
+  const childSlug = childMarketSlugById.get(marketId.toLowerCase());
+  const slugForMeta = childSlug ?? eventSlug;
+  const isMultiMarketChild = !!childSlug;
+
+  console.log("[hydrate] starting", marketId.slice(0, 12), "slug=", slugForMeta);
   hydrationInFlight.add(marketId);
   try {
-    const assets = await fetchMarketAssets({
+    const meta = await fetchMarketMeta({
       marketId,
-      eventSlug,
+      eventSlug: slugForMeta,
     });
+    if (meta) {
+      const enriched = slugForMeta && !meta.slug ? { ...meta, slug: slugForMeta } : meta;
+      persistMarketResolution(enriched, "metadata");
+    }
+    const assets = meta?.assets ?? [];
+    if (meta && isMetaResolved(meta, Date.now())) {
+      const ts = meta.resolvedAtMs ?? meta.endTimeMs ?? Date.now();
+      // Don't mark the parent event slug as resolved when a single child is resolved
+      if (eventSlug && !isMultiMarketChild) {
+        resolvedSlugs.set(eventSlug, ts);
+        removeTrackedSlug(eventSlug);
+      }
+      cleanupResolvedMarket(meta);
+      console.log(
+        `[hydrate] skipped resolved market=${marketId.slice(0, 12)} slug=${slugForMeta ?? "-"} resolved_at=${new Date(ts).toISOString()}`
+      );
+      return;
+    }
+    console.log("[hydrate]", marketId.slice(0, 12), "slug=", slugForMeta, "assets=", assets.length, assets.map(a => `${a.assetId.slice(0, 12)}…(${a.outcome})`));
+    // Always mark hydrated after a successful metadata fetch to avoid re-calling
+    // the API on every trade. Assets may also arrive via the trade stream.
+    hydratedMarkets.add(marketId);
     if (assets.length > 0) {
       const set = new Set<string>();
       for (const a of assets) {
@@ -278,7 +667,9 @@ async function hydrateMarket(marketId: string, eventSlug: string | null) {
         trackedAssets.add(a.assetId);
       }
       marketAssets.set(marketId, set);
-      hydratedMarkets.add(marketId);
+      if (!marketPrimaryAsset.has(marketId)) {
+        marketPrimaryAsset.set(marketId, assets[0].assetId);
+      }
       scheduleClobReconnect();
     }
   } catch (e: any) {
@@ -392,6 +783,12 @@ function updateSelectionForMarket(marketId: string, nowMs: number) {
   if (changed) {
     marketSelections.set(marketId, top);
     trackedAssets.clear();
+    // Preserve all hydrated assets (from marketAssets) so multi-market
+    // children aren't wiped when a single market triggers selection update
+    for (const set of marketAssets.values()) {
+      for (const a of set) trackedAssets.add(a);
+    }
+    // Layer selection-based assets on top (may overlap)
     for (const set of marketSelections.values()) {
       for (const a of set) trackedAssets.add(a);
     }
@@ -424,8 +821,15 @@ function getDominantOutcome(marketId: string, nowMs: number): string | null {
   const outcome = meta?.outcome ?? null;
   if (!outcome) return null;
   dominantOutcomeByMarket.set(marketId, { outcome, ts: nowMs });
-  void upsertDominantOutcome(marketId, outcome, new Date(nowMs).toISOString()).catch((err) => {
-    console.warn("[dominant] upsert failed", err?.message ?? err);
+  void withRetry(
+    () => upsertDominantOutcome(marketId, outcome, new Date(nowMs).toISOString()),
+    "upsertDominantOutcome"
+  ).catch((err) => {
+    console.warn(
+      "[dominant] upsert failed",
+      { market: marketId.slice(0, 12), outcome },
+      err?.message ?? err
+    );
   });
   return outcome;
 }
@@ -578,24 +982,65 @@ function bestAskLevelFromAsks(
 }
 
 export function toSyntheticMid(msg: any) {
-  const assetId = String(msg?.asset_id ?? msg?.assetId ?? msg?.asset ?? "");
-  if (!assetId) return null;
-  const marketId = String(msg?.market ?? msg?.market_id ?? "");
+  const payload = msg?.data ?? msg?.payload ?? msg?.result ?? msg;
+  const assetId = String(
+    payload?.asset_id ??
+      payload?.assetId ??
+      payload?.asset ??
+      msg?.asset_id ??
+      msg?.assetId ??
+      msg?.asset ??
+      ""
+  ).trim();
+  if (!assetId) {
+    logMidDebug("mid:missing-asset", "[mid] drop: missing asset id", Object.keys(msg ?? {}));
+    return null;
+  }
+  const marketId = String(
+    payload?.market ??
+      payload?.market_id ??
+      payload?.marketId ??
+      msg?.market ??
+      msg?.market_id ??
+      msg?.marketId ??
+      ""
+  ).trim();
 
-  const bidLevel = bestBidLevelFromBids(msg?.bids);
-  const askLevel = bestAskLevelFromAsks(msg?.asks);
+  const bids = payload?.bids ?? payload?.orderbook?.bids ?? msg?.bids ?? msg?.orderbook?.bids;
+  const asks = payload?.asks ?? payload?.orderbook?.asks ?? msg?.asks ?? msg?.orderbook?.asks;
+  const bidLevel = bestBidLevelFromBids(bids);
+  const askLevel = bestAskLevelFromAsks(asks);
   const bestBidRaw =
-    msg?.best_bid != null ? Number(msg.best_bid) : bidLevel?.price;
+    payload?.best_bid != null
+      ? Number(payload.best_bid)
+      : msg?.best_bid != null
+        ? Number(msg.best_bid)
+        : bidLevel?.price;
   const bestAskRaw =
-    msg?.best_ask != null ? Number(msg.best_ask) : askLevel?.price;
+    payload?.best_ask != null
+      ? Number(payload.best_ask)
+      : msg?.best_ask != null
+        ? Number(msg.best_ask)
+        : askLevel?.price;
   const bestBidSize =
-    msg?.best_bid_size != null ? Number(msg.best_bid_size) : bidLevel?.size ?? null;
+    payload?.best_bid_size != null
+      ? Number(payload.best_bid_size)
+      : msg?.best_bid_size != null
+        ? Number(msg.best_bid_size)
+        : bidLevel?.size ?? null;
   const bestAskSize =
-    msg?.best_ask_size != null ? Number(msg.best_ask_size) : askLevel?.size ?? null;
+    payload?.best_ask_size != null
+      ? Number(payload.best_ask_size)
+      : msg?.best_ask_size != null
+        ? Number(msg.best_ask_size)
+        : askLevel?.size ?? null;
 
   const bidOk = Number.isFinite(bestBidRaw);
   const askOk = Number.isFinite(bestAskRaw);
-  if (!bidOk && !askOk) return null;
+  if (!bidOk && !askOk) {
+    logMidDebug(`mid:no-bbo:${assetId}`, "[mid] drop: no bid/ask", { assetId });
+    return null;
+  }
 
   const bestBid = bidOk ? (bestBidRaw as number) : null;
   const bestAsk = askOk ? (bestAskRaw as number) : null;
@@ -612,12 +1057,31 @@ export function toSyntheticMid(msg: any) {
     spread != null && mid != null && mid > 0 ? spread / mid : null;
 
   // guard: ignore garbage mid when spread is crazy wide
-  if (spreadPct != null && spreadPct > 0.30) return null;
+  const maxSpread = Number.isFinite(MID_MAX_SPREAD_PCT) ? MID_MAX_SPREAD_PCT : 0.30;
+  if (maxSpread > 0 && spreadPct != null && spreadPct > maxSpread) {
+    logMidDebug(`mid:spread:${assetId}`, "[mid] drop: wide spread", {
+      assetId,
+      spreadPct,
+      mid,
+      bestBid,
+      bestAsk,
+    });
+    return null;
+  }
 
-  const tsMs =
-    typeof msg?.timestamp === "number"
-      ? (msg.timestamp < 10_000_000_000 ? msg.timestamp * 1000 : msg.timestamp)
-      : Date.now();
+  const tsRaw = payload?.timestamp ?? msg?.timestamp;
+  let tsMs = Date.now();
+  if (typeof tsRaw === "number") {
+    tsMs = tsRaw < 10_000_000_000 ? tsRaw * 1000 : tsRaw;
+  } else if (typeof tsRaw === "string") {
+    const n = Number(tsRaw);
+    if (Number.isFinite(n)) {
+      tsMs = n < 10_000_000_000 ? n * 1000 : n;
+    } else {
+      const parsed = Date.parse(tsRaw);
+      if (Number.isFinite(parsed)) tsMs = parsed;
+    }
+  }
 
   if (mid != null && Number.isFinite(mid)) {
     latestSignalByAsset.set(assetId, { price: mid, ts: tsMs });
@@ -638,22 +1102,69 @@ export function toSyntheticMid(msg: any) {
   };
 }
 
-
-
 console.log("[ingestion] starting...");
+
+// #region agent log
+fetch('http://127.0.0.1:7243/ingest/a2ce0bcd-2fd9-4a62-b9b6-9bec63aa6bf3', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({
+    id: `log_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+    timestamp: Date.now(),
+    location: 'services/ingestion/src/index.ts:startup',
+    message: 'ingestion startup',
+    runId: 'pre-fix',
+    hypothesisId: 'H4',
+    data: {
+      hasWsUrl: !!process.env.POLYMARKET_WS_URL,
+    },
+  }),
+}).catch(() => {});
+// #endregion agent log
 
 /**
  * 1) Activity WS: Trades
  */
 const url = process.env.POLYMARKET_WS_URL;
-if (!url) throw new Error("Missing POLYMARKET_WS_URL in services/ingestion/.env");
+if (!url) {
+  // #region agent log
+  fetch('http://127.0.0.1:7243/ingest/a2ce0bcd-2fd9-4a62-b9b6-9bec63aa6bf3', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      id: `log_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+      timestamp: Date.now(),
+      location: 'services/ingestion/src/index.ts:missing-ws-url',
+      message: 'POLYMARKET_WS_URL missing at startup',
+      runId: 'pre-fix',
+      hypothesisId: 'H5',
+      data: {},
+    }),
+  }).catch(() => {});
+  // #endregion agent log
+  throw new Error("Missing POLYMARKET_WS_URL in services/ingestion/.env");
+}
 
-let eventSlugs = String(process.env.POLYMARKET_EVENT_SLUGS ?? "")
-  .split(",")
-  .map((s) => s.trim())
-  .filter(Boolean);
-const eventSlugSet = new Set(eventSlugs);
-const LOG_EVENT_SLUGS = process.env.LOG_EVENT_SLUGS === "1";
+// When true, only the slug from Supabase tracked_slugs is used (frontend is source of truth).
+const TRACK_SINGLE_SLUG = process.env.TRACK_SINGLE_SLUG !== "0";
+
+let eventSlugs: string[];
+const eventSlugSet = new Set<string>();
+if (TRACK_SINGLE_SLUG) {
+  // Single-slug mode: do not seed from env; syncTrackedSlugs will populate from DB (frontend).
+  eventSlugs = [];
+} else {
+  eventSlugs = String(process.env.POLYMARKET_EVENT_SLUGS ?? "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  for (const s of eventSlugs) eventSlugSet.add(s);
+}
+const trackedMarketIdBySlug = new Map<string, string>();
+const allMarketIdsBySlug = new Map<string, string[]>(); // event slug → all child conditionIds (multi-market events)
+const childMarketSlugById = new Map<string, string>();   // conditionId → child market's own slug (for hydration)
+const childMarketEventSlugById = new Map<string, string>(); // conditionId → event slug (multi-market)
+const trackedMarketIds = new Set<string>();
 const LOG_TRADE_DEBUG = process.env.LOG_TRADE_DEBUG === "1";
 const BACKFILL_URL = String(process.env.POLYMARKET_TRADES_BACKFILL_URL ?? "").trim();
 const BACKFILL_INTERVAL_MS = Number(process.env.BACKFILL_INTERVAL_MS ?? 60_000);
@@ -662,7 +1173,6 @@ const BACKFILL_SILENCE_MS = Number(process.env.BACKFILL_SILENCE_MS ?? 120_000);
 const MAX_BACKFILL_TRADES_PER_SLUG = Number(process.env.MAX_BACKFILL_TRADES_PER_SLUG ?? 200);
 let backfillRunning = false;
 const lastTradeBySlug = new Map<string, number>();
-
 connectPolymarketWS({
   url,
   // subscribe without filters and filter locally for reliability
@@ -675,17 +1185,74 @@ connectPolymarketWS({
   staleMs: Number(process.env.WS_STALE_MS ?? 60_000),
   staleCheckMs: Number(process.env.WS_STALE_CHECK_MS ?? 10_000),
   onMessage: async (msg) => {
-    const rawEventSlug = String((msg as any)?.payload?.eventSlug ?? "");
-    if (LOG_EVENT_SLUGS && rawEventSlug) {
-      console.log("[trade][slug]", rawEventSlug);
+    // ── fast-path filter: drop unrelated trades before any work ──
+    const payload = (msg as any)?.payload ?? msg;
+    const rawMarketId = String(
+      payload?.conditionId ?? payload?.market_id ?? payload?.marketId ?? ""
+    ).trim().toLowerCase();
+
+    if (TRACK_SINGLE_SLUG || eventSlugSet.size > 0 || trackedMarketIds.size > 0) {
+      // Quick market-ID check first (cheapest)
+      const hasTrackedMarket = rawMarketId && trackedMarketIds.has(rawMarketId);
+      if (!hasTrackedMarket) {
+        // Fall back to slug check
+        let hasTrackedSlug = false;
+        const slugFields = [
+          payload?.eventSlug,
+          payload?.slug,
+          payload?.marketSlug,
+          payload?.market_slug,
+          payload?.event_slug,
+        ];
+        for (const s of slugFields) {
+          if (typeof s === "string" && s.trim() && eventSlugSet.has(s.trim())) {
+            hasTrackedSlug = true;
+            break;
+          }
+        }
+        if (!hasTrackedSlug) return;
+      }
     }
-    if (rawEventSlug && !eventSlugSet.has(rawEventSlug)) return;
-    if (rawEventSlug) lastTradeBySlug.set(rawEventSlug, Date.now());
+
+    noteResolutionFromMessage(msg, "ws");
+
+    // Build slug candidates for matched trades (used downstream for hydration)
+    const slugCandidates = new Set<string>();
+    for (const s of [payload?.eventSlug, payload?.slug, payload?.marketSlug, payload?.market_slug, payload?.event_slug]) {
+      if (typeof s === "string" && s.trim()) slugCandidates.add(s.trim());
+    }
+
+    if (slugCandidates.size > 0) {
+      const now = Date.now();
+      for (const s of slugCandidates) {
+        if (eventSlugSet.has(s)) lastTradeBySlug.set(s, now);
+      }
+    }
 
     const trade = toTradeInsert(msg);
     if (!trade) return;
     const tradeTsMs = Date.parse(trade.timestamp);
-    if (Number.isFinite(tradeTsMs) && isDuplicateTrade(trade.id, tradeTsMs)) return;
+    if (Number.isFinite(tradeTsMs) && isDuplicateTrade(trade.id, tradeTsMs)) {
+      // #region agent log
+      fetch('http://127.0.0.1:7243/ingest/a2ce0bcd-2fd9-4a62-b9b6-9bec63aa6bf3', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          id: `log_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+          timestamp: Date.now(),
+          location: 'services/ingestion/src/index.ts:onMessage:duplicate-skip',
+          message: 'trade skipped as duplicate',
+          runId: 'pre-fix',
+          hypothesisId: 'H6',
+          data: {
+            tradeId: trade.id,
+            tradeTsMs,
+          },
+        }),
+      }).catch(() => {});
+      // #endregion agent log
+      return;
+    }
 
     const rawAssetId = String((trade as any)?.raw?.payload?.asset ?? "");
     if (rawAssetId) {
@@ -698,16 +1265,52 @@ connectPolymarketWS({
       }
       if (!trackedAssets.has(rawAssetId)) {
         trackedAssets.add(rawAssetId);
+        if (!marketPrimaryAsset.has(trade.market_id)) {
+          marketPrimaryAsset.set(trade.market_id, rawAssetId);
+        }
         scheduleClobReconnect();
       }
       const nowMs = Date.parse(trade.timestamp);
       if (Number.isFinite(nowMs)) {
         updateAssetStats(trade.market_id, rawAssetId, Number(trade.price), Number(trade.size), nowMs);
         updateSelectionForMarket(trade.market_id, nowMs);
+
+        // Trade-price fallback: if CLOB hasn't sent data for this asset recently,
+        // generate a mid tick from the trade price so the chart has data.
+        const lastClob = lastClobTickMs.get(rawAssetId) ?? 0;
+        if (nowMs - lastClob > TRADE_MID_FALLBACK_MS) {
+          const tradePrice = Number(trade.price);
+          if (Number.isFinite(tradePrice) && tradePrice > 0) {
+            const outcome = trade.outcome ? String(trade.outcome) : null;
+            if (shouldStoreMid(rawAssetId, null, null, tradePrice, nowMs)) {
+              withRetry(
+                () =>
+                  insertMidTick({
+                    market_id: trade.market_id,
+                    outcome,
+                    asset_id: rawAssetId,
+                    ts: new Date(nowMs).toISOString(),
+                    best_bid: null,
+                    best_ask: null,
+                    mid: tradePrice,
+                    spread: null,
+                    spread_pct: null,
+                    raw: { source: "trade_fallback", price: tradePrice },
+                  }),
+                "insertMidTick:tradeFallback"
+              ).then(() => {
+                if (process.env.LOG_MID === "1") {
+                  console.log(`[mid:trade-fallback] market=${trade.market_id.slice(0, 12)} outcome=${outcome} mid=${tradePrice.toFixed(4)}`);
+                }
+              }).catch(() => {});
+            }
+          }
+        }
       }
     }
 
-    void hydrateMarket(trade.market_id, rawEventSlug || null);
+    const hydrateSlug = slugCandidates.size > 0 ? Array.from(slugCandidates)[0] : null;
+    void hydrateMarket(trade.market_id, hydrateSlug);
 
     try {
       const now = Date.now();
@@ -726,9 +1329,45 @@ connectPolymarketWS({
         }, TRADE_BUFFER_FLUSH_MS);
       }
       await withRetry(() => updateAggregateBuffered(trade), "updateAggregate");
+      // #region agent log
+      fetch('http://127.0.0.1:7243/ingest/a2ce0bcd-2fd9-4a62-b9b6-9bec63aa6bf3', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          id: `log_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+          timestamp: Date.now(),
+          location: 'services/ingestion/src/index.ts:onMessage:processed',
+          message: 'trade processed successfully',
+          runId: 'pre-fix',
+          hypothesisId: 'H7',
+          data: {
+            tradeId: trade.id,
+            marketId: trade.market_id,
+            price: trade.price,
+            size: trade.size,
+          },
+        }),
+      }).catch(() => {});
+      // #endregion agent log
+
+      const nowMs = Date.parse(trade.timestamp);
+      if (Number.isFinite(nowMs)) {
+        const eventSlug = resolveEventSlugForMarket(trade.market_id, slugCandidates);
+        if (eventSlug) {
+          const childIds = allMarketIdsBySlug.get(eventSlug);
+          if (childIds && childIds.length >= 2) {
+            void withRetry(
+              () => detectEventMovement({ eventSlug, childMarketIds: childIds, nowMs }),
+              "detectEventMovement",
+              2
+            ).catch((err: any) => {
+              console.warn("[movement-event] detect failed", err?.message ?? err);
+            });
+          }
+        }
+      }
 
       // avoid duplicate movement signals across outcomes
-      const nowMs = Date.parse(trade.timestamp);
       const dominantOutcome = Number.isFinite(nowMs)
         ? getDominantOutcome(trade.market_id, nowMs)
         : null;
@@ -767,9 +1406,66 @@ connectPolymarketWS({
       if (m.includes("duplicate key value violates unique constraint")) return;
       if (m === "spooled") return;
       console.error("[trade] insert failed:", m);
+      // #region agent log
+      fetch('http://127.0.0.1:7243/ingest/a2ce0bcd-2fd9-4a62-b9b6-9bec63aa6bf3', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          id: `log_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+          timestamp: Date.now(),
+          location: 'services/ingestion/src/index.ts:onMessage:error',
+          message: 'trade processing threw error',
+          runId: 'pre-fix',
+          hypothesisId: 'H8',
+          data: {
+            tradeId: trade?.id ?? null,
+            errorMessage: m,
+          },
+        }),
+      }).catch(() => {});
+      // #endregion agent log
     }
   },
 });
+
+async function backfillByConditionId(
+  slug: string,
+  conditionId: string,
+  sinceMs: number
+): Promise<number> {
+  const url = new URL(BACKFILL_URL);
+  url.searchParams.set("market", conditionId);
+  url.searchParams.set("since", String(Math.floor(sinceMs / 1000)));
+
+  const res = await withRetry(
+    () => fetch(url.toString(), { headers: { accept: "application/json" } }),
+    "backfillFetch"
+  );
+  if (!res.ok) return 0;
+  const data: any = await res.json();
+  const list =
+    (Array.isArray(data) && data) || data?.trades || data?.data || data?.result || [];
+  if (!Array.isArray(list) || list.length === 0) return 0;
+
+  console.log(`[backfill] ${slug} fetched ${list.length} candidates (conditionId ${conditionId.slice(0, 12)})`);
+  let kept = 0;
+  for (const t of list) {
+    if (Number.isFinite(MAX_BACKFILL_TRADES_PER_SLUG) && MAX_BACKFILL_TRADES_PER_SLUG > 0 && kept >= MAX_BACKFILL_TRADES_PER_SLUG) break;
+    const trade = toTradeInsertFromObj(t);
+    if (!trade) continue;
+    const tradeTsMs = Date.parse(trade.timestamp);
+    if (Number.isFinite(tradeTsMs) && isDuplicateTrade(trade.id, tradeTsMs)) continue;
+    try {
+      await insertTrade(trade);
+      await updateAggregateBuffered(trade);
+      kept += 1;
+      lastTradeBySlug.set(slug, Date.parse(trade.timestamp));
+    } catch (e: any) {
+      if (e?.message?.includes("duplicate key value violates unique constraint")) continue;
+    }
+  }
+  return kept;
+}
 
 async function runBackfillOnce() {
   if (!BACKFILL_URL || backfillRunning) return;
@@ -782,51 +1478,64 @@ async function runBackfillOnce() {
       if (lastSeen != null && now - lastSeen < BACKFILL_SILENCE_MS) {
         continue;
       }
-      const url = new URL(BACKFILL_URL);
-      url.searchParams.set("eventSlug", slug);
-      url.searchParams.set("since", String(Math.floor(sinceMs / 1000)));
 
-      const res = await withRetry(
-        () =>
-          fetch(url.toString(), {
-            headers: { accept: "application/json" },
-          }),
-        "backfillFetch"
-      );
-      if (!res.ok) continue;
-      const data: any = await res.json();
+      // Collect conditionIds: single-market or multi-market event children
+      const singleId = trackedMarketIdBySlug.get(slug);
+      const multiIds = allMarketIdsBySlug.get(slug);
+      const conditionIds = singleId
+        ? [singleId]
+        : multiIds && multiIds.length > 0
+          ? multiIds
+          : [];
 
-      const list =
-        (Array.isArray(data) && data) ||
-        data?.trades ||
-        data?.data ||
-        data?.result ||
-        [];
-      if (!Array.isArray(list)) continue;
-
-      let kept = 0;
-      for (const t of list) {
-        const tSlug = String(t?.eventSlug ?? t?.slug ?? "");
-        if (tSlug && tSlug !== slug) continue;
-        if (
-          Number.isFinite(MAX_BACKFILL_TRADES_PER_SLUG) &&
-          MAX_BACKFILL_TRADES_PER_SLUG > 0 &&
-          kept >= MAX_BACKFILL_TRADES_PER_SLUG
-        ) {
-          break;
+      if (conditionIds.length > 0) {
+        let totalKept = 0;
+        for (const cid of conditionIds) {
+          const kept = await backfillByConditionId(slug, cid, sinceMs);
+          totalKept += kept;
         }
-        const trade = toTradeInsertFromObj(t);
-        if (!trade) continue;
-        const tradeTsMs = Date.parse(trade.timestamp);
-        if (Number.isFinite(tradeTsMs) && isDuplicateTrade(trade.id, tradeTsMs)) continue;
-        try {
-          await insertTrade(trade);
-          await updateAggregateBuffered(trade);
-          kept += 1;
-          lastTradeBySlug.set(slug, Date.parse(trade.timestamp));
-        } catch (e: any) {
-          const m = e?.message ?? "";
-          if (m.includes("duplicate key value violates unique constraint")) continue;
+        if (totalKept > 0) {
+          console.log(`[backfill] ${slug} ingested ${totalKept} trade(s) total`);
+        }
+      } else {
+        // Fallback: eventSlug param (unreliable but last resort)
+        const url = new URL(BACKFILL_URL);
+        url.searchParams.set("eventSlug", slug);
+        url.searchParams.set("since", String(Math.floor(sinceMs / 1000)));
+
+        const res = await withRetry(
+          () => fetch(url.toString(), { headers: { accept: "application/json" } }),
+          "backfillFetch"
+        );
+        if (!res.ok) continue;
+        const data: any = await res.json();
+        const list =
+          (Array.isArray(data) && data) || data?.trades || data?.data || data?.result || [];
+        if (!Array.isArray(list)) continue;
+
+        let kept = 0;
+        if (list.length > 0) {
+          console.log(`[backfill] ${slug} fetched ${list.length} candidates (via eventSlug)`);
+        }
+        for (const t of list) {
+          const tSlug = String(t?.eventSlug ?? t?.slug ?? "");
+          if (tSlug && tSlug !== slug) continue;
+          if (Number.isFinite(MAX_BACKFILL_TRADES_PER_SLUG) && MAX_BACKFILL_TRADES_PER_SLUG > 0 && kept >= MAX_BACKFILL_TRADES_PER_SLUG) break;
+          const trade = toTradeInsertFromObj(t);
+          if (!trade) continue;
+          const tradeTsMs = Date.parse(trade.timestamp);
+          if (Number.isFinite(tradeTsMs) && isDuplicateTrade(trade.id, tradeTsMs)) continue;
+          try {
+            await insertTrade(trade);
+            await updateAggregateBuffered(trade);
+            kept += 1;
+            lastTradeBySlug.set(slug, Date.parse(trade.timestamp));
+          } catch (e: any) {
+            if (e?.message?.includes("duplicate key value violates unique constraint")) continue;
+          }
+        }
+        if (kept > 0) {
+          console.log(`[backfill] ${slug} ingested ${kept} trade(s)`);
         }
       }
     }
@@ -851,13 +1560,128 @@ setInterval(() => {
 // ── Dynamic slug sync from tracked_slugs table ──────────────────────
 const SLUG_SYNC_MS = Number(process.env.SLUG_SYNC_MS ?? 30_000);
 
+async function getMarketMetaForSlug(slug: string): Promise<MarketMeta | null> {
+  const now = Date.now();
+  const cached = marketMetaCache.get(slug);
+  if (cached && now - cached.ts < MARKET_META_TTL_MS) return cached.meta;
+  const rawMeta = await fetchMarketMeta({ eventSlug: slug });
+  const meta = rawMeta ? { ...rawMeta, slug: rawMeta.slug ?? slug } : null;
+  if (meta) {
+    marketMetaCache.set(slug, { ts: now, meta });
+    const ms = meta.resolvedAtMs ?? meta.endTimeMs;
+    if (meta.marketId && ms != null) {
+      const prev = marketResolutionById.get(meta.marketId);
+      if (!prev || ms < prev.ms) {
+        marketResolutionById.set(meta.marketId, { ms, source: "metadata" });
+      }
+    }
+    persistMarketResolution(meta, "metadata");
+  }
+  return meta;
+}
+
+function removeTrackedSlug(slug: string) {
+  if (!eventSlugSet.has(slug)) return;
+  eventSlugSet.delete(slug);
+  eventSlugs = eventSlugs.filter((s) => s !== slug);
+  lastTradeBySlug.delete(slug);
+  const marketId = trackedMarketIdBySlug.get(slug);
+  if (marketId) {
+    trackedMarketIdBySlug.delete(slug);
+    let stillUsed = false;
+    for (const id of trackedMarketIdBySlug.values()) {
+      if (id === marketId) {
+        stillUsed = true;
+        break;
+      }
+    }
+    if (!stillUsed) trackedMarketIds.delete(marketId);
+  }
+  // Clean up multi-market event children
+  const childIds = allMarketIdsBySlug.get(slug);
+  if (childIds) {
+    for (const cid of childIds) {
+      trackedMarketIds.delete(cid);
+      childMarketSlugById.delete(cid);
+      childMarketEventSlugById.delete(cid);
+    }
+    allMarketIdsBySlug.delete(slug);
+  }
+}
+
+function cleanupResolvedMarket(meta: MarketMeta | null) {
+  const marketId = meta?.marketId;
+  if (!marketId) return;
+  const normalizedId = marketId.toLowerCase();
+  const assets = marketAssets.get(marketId);
+  if (assets) {
+    for (const assetId of assets) {
+      trackedAssets.delete(assetId);
+      assetMeta.delete(assetId);
+      lastClobTickMs.delete(assetId);
+    }
+    marketAssets.delete(marketId);
+  }
+  marketPrimaryAsset.delete(marketId);
+  hydratedMarkets.delete(marketId);
+  childMarketSlugById.delete(normalizedId);
+  childMarketEventSlugById.delete(normalizedId);
+  let stillUsed = false;
+  for (const id of trackedMarketIdBySlug.values()) {
+    if (id === normalizedId) {
+      stillUsed = true;
+      break;
+    }
+  }
+  if (!stillUsed) {
+    // Also check multi-market event children
+    for (const ids of allMarketIdsBySlug.values()) {
+      if (ids.includes(normalizedId)) {
+        stillUsed = true;
+        break;
+      }
+    }
+  }
+  if (!stillUsed) trackedMarketIds.delete(normalizedId);
+  scheduleClobReconnect();
+}
+
+function resolveEventSlugForMarket(marketId: string, slugCandidates: Set<string>) {
+  const normalizedId = marketId.toLowerCase();
+  const direct = childMarketEventSlugById.get(normalizedId);
+  if (direct) return direct;
+
+  for (const s of slugCandidates) {
+    const ids = allMarketIdsBySlug.get(s);
+    if (ids && ids.includes(normalizedId)) return s;
+  }
+
+  for (const [slug, ids] of allMarketIdsBySlug.entries()) {
+    if (ids.includes(normalizedId)) return slug;
+  }
+
+  return null;
+}
+
+let syncSupabaseWarned = false;
 async function syncTrackedSlugs() {
   try {
     const sbUrl = process.env.SUPABASE_URL;
     const sbKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
-    if (!sbUrl || !sbKey) return;
+    if (!sbUrl || !sbKey) {
+      if (TRACK_SINGLE_SLUG && !syncSupabaseWarned) {
+        syncSupabaseWarned = true;
+        console.warn(
+          "[slug-sync] SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY required in single-slug mode; tracked slug will not update from frontend."
+        );
+      }
+      return;
+    }
+    const baseQuery = TRACK_SINGLE_SLUG
+      ? "tracked_slugs?select=slug,created_at&active=eq.true&order=created_at.desc&limit=1"
+      : "tracked_slugs?select=slug&active=eq.true";
     const res = await fetch(
-      `${sbUrl}/rest/v1/tracked_slugs?select=slug&active=eq.true`,
+      `${sbUrl}/rest/v1/${baseQuery}`,
       {
         headers: {
           apikey: sbKey,
@@ -866,21 +1690,120 @@ async function syncTrackedSlugs() {
       }
     );
     if (!res.ok) return;
-    const rows = (await res.json()) as { slug: string }[];
+    const rows = (await res.json()) as { slug: string; created_at?: string }[];
+    const desiredSlugs = new Set(rows.map((r) => r.slug.trim()).filter(Boolean));
+    if (TRACK_SINGLE_SLUG && desiredSlugs.size > 0) {
+      console.log("[slug-sync] tracking from DB:", Array.from(desiredSlugs).join(", "));
+      for (const existing of Array.from(eventSlugSet)) {
+        if (!desiredSlugs.has(existing)) {
+          const marketId = trackedMarketIdBySlug.get(existing);
+          removeTrackedSlug(existing);
+          if (marketId) cleanupResolvedMarket({ marketId, slug: existing } as MarketMeta);
+        }
+      }
+    }
     let added = 0;
+    let skipped = 0;
     for (const row of rows) {
       const s = row.slug.trim();
-      if (s && !eventSlugSet.has(s)) {
+      if (!s) continue;
+      if (resolvedSlugs.has(s)) {
+        skipped += 1;
+        continue;
+      }
+      const meta = await getMarketMetaForSlug(s);
+      if (meta?.marketId) {
+        const normalizedId = meta.marketId.toLowerCase();
+        trackedMarketIdBySlug.set(s, normalizedId);
+        trackedMarketIds.add(normalizedId);
+        console.log("[slug-sync] tracked marketId:", normalizedId.slice(0, 16) + "…");
+      } else if (!allMarketIdsBySlug.has(s)) {
+        // Single-market meta returned null → try events API for multi-market event slug
+        const childMetas = await fetchEventChildMarkets(s);
+        if (childMetas && childMetas.length > 0) {
+          const childIds: string[] = [];
+          for (const child of childMetas) {
+            if (!child.marketId) continue;
+            const nid = child.marketId.toLowerCase();
+            childIds.push(nid);
+            trackedMarketIds.add(nid);
+            // Store child's own slug for hydration metadata lookups
+            if (child.slug) childMarketSlugById.set(nid, child.slug);
+            childMarketEventSlugById.set(nid, s);
+          }
+          if (childIds.length > 0) {
+            allMarketIdsBySlug.set(s, childIds);
+            console.log(`[slug-sync] multi-market event: ${s} → ${childIds.length} child markets`);
+          }
+        }
+      }
+      const resolvedByMarket =
+        meta?.marketId && marketResolutionById.has(meta.marketId)
+          ? marketResolutionById.get(meta.marketId)?.ms ?? null
+          : null;
+      const resolved =
+        meta && (isMetaResolved(meta, Date.now()) ||
+        (resolvedByMarket != null && resolvedByMarket <= Date.now() + RESOLUTION_SKEW_MS));
+
+      if (resolved) {
+        const ts =
+          meta?.resolvedAtMs ??
+          meta?.endTimeMs ??
+          resolvedByMarket ??
+          Date.now();
+        resolvedSlugs.set(s, ts);
+        removeTrackedSlug(s);
+        cleanupResolvedMarket(meta ?? null);
+        console.log(
+          `[slug-sync] skipping resolved slug=${s} resolved_at=${new Date(ts).toISOString()}`
+        );
+        skipped += 1;
+        continue;
+      }
+
+      if (!eventSlugSet.has(s)) {
         eventSlugSet.add(s);
         eventSlugs.push(s);
         added++;
         console.log("[slug-sync] new slug:", s);
+        // Proactively hydrate so CLOB gets subscribed even if no trades arrive yet
+        if (meta?.marketId) {
+          void hydrateMarket(meta.marketId, s);
+        }
+        // Multi-market: hydrate all child markets
+        const childIds = allMarketIdsBySlug.get(s);
+        if (childIds) {
+          for (const cid of childIds) {
+            void hydrateMarket(cid, s);
+          }
+        }
       }
     }
     if (added > 0) {
       console.log(
         `[slug-sync] added ${added} slug(s), total: ${eventSlugSet.size}`
       );
+    }
+    if (skipped > 0) {
+      console.log(`[slug-sync] skipped ${skipped} resolved slug(s)`);
+    }
+
+    if (TRACK_SINGLE_SLUG && desiredSlugs.size > 0) {
+      const allowedMarketIds = new Set<string>();
+      for (const slug of desiredSlugs) {
+        const id = trackedMarketIdBySlug.get(slug);
+        if (id) allowedMarketIds.add(id);
+        // Also include multi-market event child IDs
+        const childIds = allMarketIdsBySlug.get(slug);
+        if (childIds) {
+          for (const cid of childIds) allowedMarketIds.add(cid);
+        }
+      }
+      for (const marketId of Array.from(marketAssets.keys())) {
+        if (!allowedMarketIds.has(marketId)) {
+          cleanupResolvedMarket({ marketId } as MarketMeta);
+        }
+      }
     }
   } catch (err: any) {
     console.error("[slug-sync] error:", err?.message ?? err);
@@ -911,6 +1834,7 @@ function rebuildClobConnections() {
   clobWss.length = 0;
 
   if (trackedAssets.size === 0) return;
+  console.log("[clob-rebuild] trackedAssets=", trackedAssets.size, "assets:", Array.from(trackedAssets).map(a => `${a.slice(0, 8)}…`));
   const size = Number.isFinite(MAX_CLOB_ASSETS) && MAX_CLOB_ASSETS > 0 ? MAX_CLOB_ASSETS : 100;
   const chunks = chunkAssets(Array.from(trackedAssets), size);
   for (const assetIds of chunks) {
@@ -930,62 +1854,141 @@ function scheduleClobReconnect() {
   }, 5000);
 }
 
+function expandClobMessages(msg: any): any[] {
+  if (!msg) return [];
+  const candidate = msg?.data ?? msg?.payload ?? msg?.result ?? msg;
+  if (Array.isArray(candidate)) return candidate;
+
+  const changes = candidate?.price_changes ?? msg?.price_changes;
+  if (Array.isArray(changes)) {
+    const market =
+      candidate?.market ??
+      candidate?.market_id ??
+      candidate?.marketId ??
+      msg?.market ??
+      msg?.market_id ??
+      msg?.marketId ??
+      null;
+    const timestamp =
+      candidate?.timestamp ?? candidate?.ts ?? msg?.timestamp ?? msg?.ts ?? null;
+    const base = {
+      market,
+      market_id: market,
+      timestamp,
+      best_bid: candidate?.best_bid ?? msg?.best_bid,
+      best_ask: candidate?.best_ask ?? msg?.best_ask,
+      bids: candidate?.bids ?? msg?.bids,
+      asks: candidate?.asks ?? msg?.asks,
+      orderbook: candidate?.orderbook ?? msg?.orderbook,
+    };
+    return changes.map((change) => ({ ...base, ...change }));
+  }
+
+  if (candidate && typeof candidate === "object" && candidate !== msg) {
+    const market =
+      (candidate as any)?.market ??
+      (candidate as any)?.market_id ??
+      (candidate as any)?.marketId ??
+      msg?.market ??
+      msg?.market_id ??
+      msg?.marketId ??
+      null;
+    const timestamp =
+      (candidate as any)?.timestamp ??
+      (candidate as any)?.ts ??
+      msg?.timestamp ??
+      msg?.ts ??
+      null;
+    const enriched: any = { ...candidate };
+    if (market != null && enriched.market == null && enriched.market_id == null && enriched.marketId == null) {
+      enriched.market = market;
+      enriched.market_id = market;
+    }
+    if (timestamp != null && enriched.timestamp == null) {
+      enriched.timestamp = timestamp;
+    }
+    return [enriched];
+  }
+
+  return [candidate];
+}
+
 async function onClobTick(msg: any) {
-    // Uncomment once to inspect the true message format
-    // console.log("[clob raw]", JSON.stringify(msg).slice(0, 400));
-
-    const t = toSyntheticMid(msg);
-    if (!t) return;
-
-    const meta = assetMeta.get(t.assetId);
-    const marketId = t.marketId || meta?.marketId;
-    const outcome = meta?.outcome ?? null;
-    if (!marketId) return;
-
-    if (outcome === "Yes" && t.mid != null && Number.isFinite(t.mid)) {
-      void movementRealtime.onPriceUpdate({
-        market_id: marketId,
-        asset_id: t.assetId,
-        outcome,
-        price: t.mid,
-        spreadPct: t.spreadPct,
-        bestBidSize: t.bestBidSize ?? null,
-        bestAskSize: t.bestAskSize ?? null,
-        tsMs: t.tsMs,
-        source: "mid",
-      });
+    noteResolutionFromMessage(msg, "clob");
+    if (LOG_CLOB_RAW) {
+      console.log("[clob raw]", JSON.stringify(msg).slice(0, 300));
     }
 
-    try {
-      if (t.mid == null || !Number.isFinite(t.mid)) return;
-      if (!shouldStoreMid(t.assetId, t.bestBid, t.bestAsk, t.mid, t.tsMs)) return;
-      await withRetry(
-        () =>
-          insertMidTick({
-            market_id: marketId,
-            outcome,
-            asset_id: t.assetId,
-            ts: new Date(t.tsMs).toISOString(),
-            best_bid: t.bestBid,
-            best_ask: t.bestAsk,
-            mid: t.mid,
-            spread: t.spread,
-            spread_pct: t.spreadPct,
-            raw: { best_bid: t.bestBid, best_ask: t.bestAsk },
-          }),
-        "insertMidTick"
-      );
+    const items = expandClobMessages(msg);
+    if (items.length === 0) return;
 
-      if (process.env.LOG_MID === "1") {
-        const tsIso = new Date(t.tsMs).toISOString();
-        console.log(
-          `[mid] market=${marketId} outcome=${outcome ?? "n/a"} asset=${t.assetId} ts=${tsIso} ` +
-            `bid=${t.bestBid?.toFixed(4) ?? "n/a"} ask=${t.bestAsk?.toFixed(4) ?? "n/a"} ` +
-            `mid=${(t.mid ?? 0).toFixed(4)} spread%=${t.spreadPct?.toFixed(4) ?? "n/a"}`
-        );
+    for (const item of items) {
+      const t = toSyntheticMid(item);
+      if (!t) {
+        const assetId = String(item?.asset_id ?? item?.assetId ?? item?.asset ?? "");
+        logMidDebug(`mid:null:${assetId}`, "[clob] toSyntheticMid returned null", {
+          keys: Object.keys(item ?? {}),
+          hasBids: Array.isArray(item?.bids) || Array.isArray(item?.orderbook?.bids),
+          hasAsks: Array.isArray(item?.asks) || Array.isArray(item?.orderbook?.asks),
+          hasPriceChanges: Array.isArray(item?.price_changes),
+        });
+        continue;
       }
-    } catch (e: any) {
-      console.error("[mid] insert failed:", e?.message ?? e);
+
+      const meta = assetMeta.get(t.assetId);
+      const marketId = t.marketId || meta?.marketId;
+      const outcome = meta?.outcome ?? null;
+      if (!marketId) continue;
+
+      // Feed realtime detector for exactly one asset per market to avoid double-counting.
+      // For Yes/No markets the primary is "Yes"; for Up/Down it's the first token.
+      const isPrimary = marketPrimaryAsset.get(marketId) === t.assetId;
+      if (isPrimary && t.mid != null && Number.isFinite(t.mid)) {
+        void movementRealtime.onPriceUpdate({
+          market_id: marketId,
+          asset_id: t.assetId,
+          outcome,
+          price: t.mid,
+          spreadPct: t.spreadPct,
+          bestBidSize: t.bestBidSize ?? null,
+          bestAskSize: t.bestAskSize ?? null,
+          tsMs: t.tsMs,
+          source: "mid",
+        }).catch((err: any) => console.warn("[movement-rt] error:", err?.message ?? err));
+      }
+
+      try {
+        if (t.mid == null || !Number.isFinite(t.mid)) continue;
+        lastClobTickMs.set(t.assetId, t.tsMs);
+        if (!shouldStoreMid(t.assetId, t.bestBid, t.bestAsk, t.mid, t.tsMs)) continue;
+        await withRetry(
+          () =>
+            insertMidTick({
+              market_id: marketId,
+              outcome,
+              asset_id: t.assetId,
+              ts: new Date(t.tsMs).toISOString(),
+              best_bid: t.bestBid,
+              best_ask: t.bestAsk,
+              mid: t.mid,
+              spread: t.spread,
+              spread_pct: t.spreadPct,
+              raw: { best_bid: t.bestBid, best_ask: t.bestAsk },
+            }),
+          "insertMidTick"
+        );
+
+        if (process.env.LOG_MID === "1") {
+          const tsIso = new Date(t.tsMs).toISOString();
+          console.log(
+            `[mid] market=${marketId} outcome=${outcome ?? "n/a"} asset=${t.assetId} ts=${tsIso} ` +
+              `bid=${t.bestBid?.toFixed(4) ?? "n/a"} ask=${t.bestAsk?.toFixed(4) ?? "n/a"} ` +
+              `mid=${(t.mid ?? 0).toFixed(4)} spread%=${t.spreadPct?.toFixed(4) ?? "n/a"}`
+          );
+        }
+      } catch (e: any) {
+        console.error("[mid] insert failed:", e?.message ?? e);
+      }
     }
 }
 

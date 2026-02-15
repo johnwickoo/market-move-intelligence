@@ -79,7 +79,11 @@ export function connectClobMarketWS(opts: ClobMarketOpts) {
         return;
       }
 
-      await opts.onTick(parsed);
+      try {
+        await opts.onTick(parsed);
+      } catch (err: any) {
+        console.error("[clob] onTick error:", err?.message ?? err);
+      }
     });
 
     ws.on("close", () => {

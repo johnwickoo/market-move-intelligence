@@ -12,7 +12,7 @@
     "build": "npm --workspace @market-move-intelligence/web run build",
     "dev": "npm --workspace @market-move-intelligence/web run dev",
     "lint": "echo \"TODO: add lint\"",
-    "test": "echo \"TODO: add test\""
+    "test": "npx ts-node services/signals/test/timeScore.test.ts"
   },
   "devDependencies": {
     "@types/react": "^19.2.9",

@@ -1,5 +1,7 @@
 import { supabase } from "../../storage/src/db";
 import { buildExplanation } from "../../explanations/src/buildExplanation";
+import { fetchNewsScore } from "../../news/src/newsapi.client";
+import { computeTimeScore, parseTimeValue } from "./timeScore";
 
 function clamp01(x: number) {
   return Math.max(0, Math.min(1, x));
@@ -8,6 +10,50 @@ function clamp01(x: number) {
 function safeNum(x: any, fallback = 0) {
   const n = Number(x);
   return Number.isFinite(n) ? n : fallback;
+}
+
+const TIME_SCORE_HORIZON_HOURS = Number(process.env.TIME_SCORE_HORIZON_HOURS ?? 72);
+const TIME_SCORE_CACHE_MS = Number(process.env.TIME_SCORE_CACHE_MS ?? 60_000);
+const timeScoreCache = new Map<
+  string,
+  { ts: number; score: number; targetMs: number | null }
+>();
+
+async function fetchTimeScore(marketId: string) {
+  const now = Date.now();
+  const cached = timeScoreCache.get(marketId);
+  if (cached && now - cached.ts < TIME_SCORE_CACHE_MS) {
+    return cached;
+  }
+
+  const { data, error } = await supabase
+    .from("market_resolution")
+    .select("end_time,resolved_at,resolved,status")
+    .eq("market_id", marketId)
+    .maybeSingle();
+
+  if (error || !data) {
+    const fallback = { ts: now, score: 0, targetMs: null };
+    timeScoreCache.set(marketId, fallback);
+    return fallback;
+  }
+
+  const resolvedAtMs = parseTimeValue((data as any).resolved_at);
+  const endTimeMs = parseTimeValue((data as any).end_time);
+  const targetMs = resolvedAtMs ?? endTimeMs;
+  const resolvedFlag = Boolean((data as any).resolved);
+  const status = (data as any).status ? String((data as any).status) : null;
+  const score = computeTimeScore({
+    targetMs,
+    resolved: resolvedFlag,
+    status,
+    nowMs: now,
+    horizonHours: TIME_SCORE_HORIZON_HOURS,
+  });
+
+  const out = { ts: now, score, targetMs };
+  timeScoreCache.set(marketId, out);
+  return out;
 }
 
 export async function scoreSignals(movement: any) {
@@ -91,19 +137,41 @@ export async function scoreSignals(movement: any) {
   const infoScore = clamp01(infoScoreRaw);
 
   /**
-   * 5) TIME SCORE (keep minimal for now)
-   * You can replace later with “how close to resolution date” etc.
+   * 5) TIME SCORE
+   * Based on proximity to resolution/end time (market_resolution table).
    */
-  const timeScore = 0.2;
+  let timeScore = 0;
+  try {
+    const timeResult = await fetchTimeScore(movement.market_id);
+    timeScore = timeResult.score;
+  } catch (err: any) {
+    console.warn("[signals] time score fetch failed, defaulting to 0", err?.message);
+  }
+
+  /**
+   * 5b) NEWS SCORE (0..1)
+   * "Is there recent news coverage related to this market?"
+   * Fetched from NewsAPI.org, cached by slug+hour.
+   */
+  let newsScore = 0;
+  let newsHeadlines: string[] = [];
+  try {
+    const newsResult = await fetchNewsScore(movement.market_id);
+    newsScore = newsResult.score;
+    newsHeadlines = newsResult.topHeadlines;
+  } catch (err: any) {
+    console.warn("[signals] news fetch failed, defaulting to 0", err?.message);
+  }
 
   /**
    * 6) Classification logic (simple + explainable)
    *
-   * - If liquidityRisk is high, classify LIQUIDITY (we don't trust the move)
-   * - Else if capitalScore >= 0.6 => CAPITAL
-   * - Else if infoScore >= 0.5 => INFO
-   * - Else if priceScore >= 0.6 => INFO (price moved but ambiguous)
-   * - Else => CAPITAL (default bucket)
+   * Priority order:
+   * 1. LIQUIDITY — don't trust the move
+   * 2. NEWS — strong news coverage + meaningful info signal
+   * 3. CAPITAL — large money flows
+   * 4. INFO — price moved without capital
+   * 5. TIME — fallback
    */
   let classification = "CAPITAL";
   let confidence = capitalScore;
@@ -116,17 +184,22 @@ export async function scoreSignals(movement: any) {
     classification = "LIQUIDITY";
     confidence = liquidityRisk;
   }
-  // 2) Capital
+  // 2) NEWS: strong news coverage + meaningful info signal
+  else if (newsScore >= 0.5 && infoScore >= 0.3) {
+    classification = "NEWS";
+    confidence = newsScore * 0.6 + infoScore * 0.4;
+  }
+  // 3) Capital
   else if (capitalScore >= 0.6) {
     classification = "CAPITAL";
     confidence = capitalScore;
   }
-  // 3) Info only if we have depth (prevents thin-book mislabels)
+  // 4) Info only if we have depth (prevents thin-book mislabels)
   else if (infoScore >= 0.5 && hasInfoDepth) {
     classification = "INFO";
     confidence = infoScore;
   }
-  // 4) Price moved but ambiguous:
+  // 5) Price moved but ambiguous:
   //    - if thin, call it LIQUIDITY
   //    - else call it INFO (like before)
   else if (priceScore >= 0.6) {
@@ -138,12 +211,14 @@ export async function scoreSignals(movement: any) {
       confidence = priceScore;
     }
   }
-  // 5) Time fallback
+  // 6) Time fallback
   else if (timeScore > confidence) {
     classification = "TIME";
     confidence = timeScore;
   }
 
+  // Attach headlines to movement for buildExplanation
+  (movement as any).__newsHeadlines = newsHeadlines;
 
   // Final confidence penalty if market is thin (even if not LIQUIDITY)
   // Keeps signals conservative.
@@ -154,11 +229,9 @@ export async function scoreSignals(movement: any) {
     capital_score: capitalScore,
     info_score: infoScore,
     time_score: timeScore,
+    news_score: newsScore,
     classification,
     confidence: adjustedConfidence,
-    // Optional: store extra diagnostics if you add columns later
-    // price_score: priceScore,
-    // liquidity_risk: liquidityRisk,
   };
 
   const { error } = await supabase.from("signal_scores").insert(row);
@@ -201,6 +274,8 @@ export async function scoreSignals(movement: any) {
     priceScore: priceScore.toFixed(3),
     capitalScore: capitalScore.toFixed(3),
     infoScore: infoScore.toFixed(3),
+    newsScore: newsScore.toFixed(3),
+    timeScore: timeScore.toFixed(3),
     liquidityRisk: liquidityRisk.toFixed(3),
   });
 

@@ -29,12 +29,26 @@ export function SignalBand({
         setStyle(null);
         return;
       }
-      const startCoord = timeScale.timeToCoordinate(
-        Math.floor(startMs / 1000) as UTCTimestamp
-      );
-      const endCoord = timeScale.timeToCoordinate(
-        Math.floor(endMs / 1000) as UTCTimestamp
-      );
+      const startTime = Math.floor(startMs / 1000) as UTCTimestamp;
+      const endTime = Math.floor(endMs / 1000) as UTCTimestamp;
+      let startCoord = timeScale.timeToCoordinate(startTime);
+      let endCoord = timeScale.timeToCoordinate(endTime);
+
+      if (startCoord == null || endCoord == null) {
+        const range = timeScale.getVisibleRange();
+        if (!range) {
+          setStyle(null);
+          return;
+        }
+        const clamp = (t: number) =>
+          Math.min(Math.max(t, range.from as number), range.to as number);
+        const clampedStart = clamp(startTime as number);
+        const clampedEnd = clamp(endTime as number);
+        startCoord = timeScale.timeToCoordinate(
+          clampedStart as UTCTimestamp
+        );
+        endCoord = timeScale.timeToCoordinate(clampedEnd as UTCTimestamp);
+      }
       if (startCoord == null || endCoord == null) {
         setStyle(null);
         return;
