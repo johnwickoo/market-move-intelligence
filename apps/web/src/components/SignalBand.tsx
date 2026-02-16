@@ -4,15 +4,19 @@ import { createChart, UTCTimestamp } from "lightweight-charts";
 import { useEffect, useState } from "react";
 import type { Annotation } from "../lib/types";
 
+export const LANE_HEIGHT = 20; // 18px band + 2px gap
+
 export function SignalBand({
   signal,
   chart,
   layoutVersion,
+  lane = 0,
   onHover,
 }: {
   signal: Annotation;
   chart: ReturnType<typeof createChart> | null;
   layoutVersion: number;
+  lane?: number;
   onHover: (signal: Annotation | null) => void;
 }) {
   const [style, setStyle] = useState<{ left: number; width: number } | null>(
@@ -99,6 +103,8 @@ export function SignalBand({
       style={{
         left: `${style.left}px`,
         width: `${style.width}px`,
+        top: `${lane * LANE_HEIGHT}px`,
+        height: "18px",
         background: signal.color,
       }}
       onMouseEnter={() => onHover(signal)}

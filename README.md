@@ -1,6 +1,6 @@
 # Market Move Intelligence
 
-Real-time detection and classification of price movements on Polymarket prediction markets. The system ingests live trade and order-book data, detects significant price and volume movements across two complementary time horizons, scores each movement by likely driver, and surfaces annotated signals on a live chart.
+Real-time detection and classification of price movements on Polymarket prediction markets. The system ingests live trade and order-book data, detects significant price and volume movements across multiple time horizons using velocity-normalized thresholds, scores each movement by likely driver, and surfaces annotated signals on a live chart via SSE.
 
 ## Architecture Overview
 
@@ -11,10 +11,12 @@ Polymarket WebSocket (CLOB)   ──┘        │                         │
                                          │                         │
                               ┌──────────┴──────────┐              │
                               ▼                     ▼              │
-                     24h Movement Detector   Realtime Detector     │
+                     Multi-Window Detector   Realtime Detector     │
+                     (5m / 15m / 1h / 4h)   (60min in-memory)     │
                               │                     │              │
                               ▼                     ▼              │
                         Signal Scorer         movement_events      │
+                     (velocity + recency)                          │
                               │                                    │
                               ▼                                    │
                      Explanation Builder                            │
@@ -31,12 +33,13 @@ Polymarket WebSocket (CLOB)   ──┘        │                         │
 
 | Directory | Purpose |
 |---|---|
-| `services/ingestion` | Connects to Polymarket WebSockets, normalizes trades and order-book ticks, stores to Supabase, gates detection calls |
-| `services/movements` | Two detectors: `detectMovement` (24h, DB-backed) and `MovementRealtime` (60min, in-memory) |
-| `services/signals` | Scores movements into CAPITAL / INFO / LIQUIDITY / TIME classifications |
+| `services/ingestion` | Connects to Polymarket WebSockets (trade + CLOB), normalizes data, stores to Supabase, gates detection calls |
+| `services/movements` | Multi-window detector (`detectMovement` — 5m/15m/1h/4h, DB-backed) and `MovementRealtime` (60min, in-memory) |
+| `services/signals` | Scores movements into CAPITAL / INFO / VELOCITY / LIQUIDITY / NEWS / TIME with recency weighting |
 | `services/explanations` | Generates human-readable summaries of detected movements |
+| `services/news` | Fetches news coverage scores from NewsAPI.org |
 | `services/storage` | Supabase client and DB insert helpers |
-| `apps/web` | Next.js 15 frontend with live chart, SSE streaming, slug management |
+| `apps/web` | Next.js 15 frontend with live chart, SSE streaming, swim-lane signal bands |
 
 ---
 
@@ -44,81 +47,107 @@ Polymarket WebSocket (CLOB)   ──┘        │                         │
 
 The system runs two complementary detectors in parallel. Each is optimized for a different latency/accuracy trade-off.
 
-### 1. 24-Hour Movement Detector
+### 1. Multi-Window Movement Detector
 
 **File:** `services/movements/src/detectMovement.ts`
 
-Runs on every qualifying trade. Queries the database for a rolling 24-hour window of trades and mid-price ticks, computes price drift, price range, and volume ratios against historical baselines, then emits a `market_movements` row when thresholds are breached.
+Replaces the legacy single 24h detector with four parallel detection windows, each calibrated for prediction market dynamics. Runs on every qualifying trade with a single outer DB fetch (4h window) and per-window filtering.
+
+#### Window Definitions
+
+| Window | Duration | Price Threshold | Thin Threshold | Min Abs Move | Purpose |
+|---|---|---|---|---|---|
+| **5m** | 5 min | 3% | 5% | 2c | Impulse detection — catches catalyst-driven spikes |
+| **15m** | 15 min | 4% | 7% | 2c | Momentum confirmation — validates 5m signals |
+| **1h** | 1 hour | 6% | 10% | 3c | Sustained move — structural shift in pricing |
+| **4h** | 4 hours | 8% | 12% | 3c | Regime change — filters daily noise |
+| **event** | Variable | Inherited | Inherited | Inherited | Since-last-signal anchoring |
+
+Each window also supports a volume threshold (default 1.5x baseline) and minimum tick/trade counts to prevent firing on sparse data.
+
+#### Why Multi-Window?
+
+Prediction markets are impulse-driven, not drift-driven like equities. A significant move in a binary market typically happens in minutes (news breaks, poll drops, ruling announced), not hours. The old 24h window would fire after the move was already over — by the time an 8% 24h drift triggers, the information is fully priced in.
+
+Multi-window detection catches moves at different stages:
+- **5m** fires during the initial impulse while the move is still actionable
+- **15m** confirms the impulse wasn't just a blip
+- **1h** validates that the move has sustained through follow-on activity
+- **4h** identifies regime shifts and filters out noise
+
+#### Velocity Metric
+
+The detector computes a velocity score for every movement:
+
+```
+velocity = |price_delta| / sqrt(window_minutes)
+```
+
+This is standard diffusion scaling. A 3% move in 5 minutes produces velocity = 0.013, while an 8% move in 4 hours produces velocity = 0.005. The faster move scores higher because it represents a sharper information arrival.
+
+The velocity threshold (default 0.008) can independently trigger a movement with reason `VELOCITY`, even when standard price/volume thresholds aren't breached.
 
 #### Data Collection
 
-The detector gathers four categories of data per invocation:
+The detector makes a single outer DB fetch for the 4h window, then filters per window:
 
-**Trades (24h window):**
+**Trades (outer 4h window):**
 - Queries the `trades` table for the target market + outcome
-- Computes `volume24h`, `avgTradeSize24h`, `tradesCount`
-- Counts `uniquePriceLevels` (distinct trade prices rounded to 2 decimals)
+- Per window: filters to the window's time range, computes volume, trade count, unique price levels, avg trade size
 
-**Mid-Price Ticks (24h window):**
-- Queries `market_mid_ticks` (order-book mid prices, not trade prints)
-- Computes `startMid`, `endMid`, `minMid`, `maxMid`
-- Derives `midDriftPct` = (end - start) / start (sustained directional move)
-- Derives `midRangePct` = (max - min) / min (intraday spike/whipsaw)
-- Computes `avgSpreadPct` (average bid-ask spread)
+**Mid-Price Ticks (outer 4h window):**
+- Queries `market_mid_ticks` (order-book mid prices)
+- Per window: computes start/end/min/max mid, drift, range, avg spread
 
 **Baseline Volume:**
 - Loads `market_aggregates` for total historical volume and `first_seen_at`
 - Calculates `baselineDaily` = total_volume / observed_days (capped at 30 days)
-- Calculates `baselineHourly` = baselineDaily / 24
-- Requires at least 7 days of history before volume comparisons are considered reliable
+- Requires at least 7 days of history before volume comparisons are reliable
 
 **Hourly Spikes:**
-- Buckets trades into 24 hourly bins
-- Finds peak hourly volume (`maxHourVol`)
-- Computes `hourlyRatio` = maxHourVol / baselineHourly
+- Buckets trades into hourly bins within the window
+- Finds peak hourly volume and computes `hourlyRatio` against baseline
 
 #### Price Detection Logic
 
 A price movement fires when ALL of these conditions are met:
 
-1. **Has ticks:** At least 2 mid-price ticks exist in the window
+1. **Has ticks:** At least N mid-price ticks exist in the window (2 for 5m, up to 5 for 4h)
 2. **Price eligible:** The minimum mid-price >= 0.05 (filters out near-zero noise)
-3. **Absolute move:** |max - min| >= 0.03 (3 cents minimum to avoid micro-noise)
-4. **Threshold breach:** Either `midDriftPct` OR `midRangePct` exceeds the threshold:
-   - Normal market: **8%** (`MOVEMENT_PRICE_THRESHOLD`)
-   - Thin liquidity: **12%** (`MOVEMENT_THIN_PRICE_THRESHOLD`)
+3. **Absolute move:** |max - min| >= the window's `minAbsMove` threshold
+4. **Threshold breach:** Either `midDriftPct` OR `midRangePct` exceeds the window's price threshold
+   - Normal market: window-specific threshold (3% for 5m, 8% for 4h)
+   - Thin liquidity: elevated threshold (5% for 5m, 12% for 4h)
 
 #### Volume Detection Logic
 
 A volume movement fires when EITHER:
 
-- `volumeRatio` (24h volume / baseline daily) >= **1.5x** (`MOVEMENT_VOLUME_THRESHOLD`)
-- `hourlyRatio` (peak hour / baseline hourly) >= **1.5x**
+- `volumeRatio` (window volume / baseline daily) >= window's volume threshold (default 1.5x)
+- `hourlyRatio` (peak hour / baseline hourly) >= same threshold
 
-Requires at least 3 days of observed history to avoid false positives on new markets.
+#### Velocity Detection Logic
 
-#### Event-Anchored Detection (Shorter Timeframe)
+A velocity movement fires when:
 
-When a previous movement exists for this market, the detector re-anchors its start price to the end price of the last movement. This creates an "event" window (shorter than 24h) that detects continued price movement since the last signal.
+- `velocity` >= `VELOCITY_THRESHOLD` (default 0.008)
+- AND at least the minimum number of ticks exist in the window
 
-- `effectiveStartISO` = last movement's `window_end`
-- `startMid` = last movement's `end_price`
-- `midDriftPct` is recalculated from the anchor point
-- `eventMinMid` / `eventMaxMid` are recalculated over the shorter window
-
-This means the system can detect a series of staircase moves: the first triggers on the 24h window, subsequent moves trigger as "event" windows anchored to the last signal.
+This catches fast, sharp moves that may not breach the absolute price threshold.
 
 #### Price Confirmation
 
 When price thresholds are breached but volume has NOT confirmed:
 
-1. Look at the last N minutes of ticks (default: 10 minutes, `MOVEMENT_CONFIRM_MINUTES`)
+1. Look at the last N minutes of ticks (default: 5 minutes, `MOVEMENT_CONFIRM_MINUTES`)
 2. Require at least M ticks in that window (default: 3, `MOVEMENT_CONFIRM_MIN_TICKS`)
-3. For upward moves: confirm if the window's minimum price sustains >= 50% of threshold above start
-4. For downward moves: confirm if the window's maximum price sustains >= 50% of threshold below start
-5. Alternatively, confirm if absolute move >= 0.03
+3. For upward moves: confirm if recent minimum sustains >= 50% of threshold above start
+4. For downward moves: confirm if recent maximum sustains >= 50% of threshold below start
+5. Alternatively, confirm if absolute move >= window's `minAbsMove`
 
-If confirmation fails, the price signal is suppressed. This prevents triggering on momentary spikes that immediately revert.
+#### Event-Anchored Detection
+
+When a previous movement exists for this market, the detector re-anchors its start price to the end price of the last movement. This creates an "event" window that detects continued price movement since the last signal, using the longest active window's thresholds.
 
 #### Liquidity Guard
 
@@ -127,25 +156,31 @@ The detector flags markets as "thin liquidity" when ANY of:
 | Condition | Threshold |
 |---|---|
 | Average bid-ask spread | >= 5% |
-| Trade count (24h) | < 15 |
+| Trade count (in window) | < 15 |
 | Unique price levels | < 8 |
 
 When thin liquidity is detected:
-- Price thresholds increase from 8% to 12% (requires larger moves to trigger)
+- Price thresholds increase to the window's `thinPriceThreshold`
 - The `thin_liquidity` flag is stored on the movement row
-- Signal scoring penalizes confidence (see Signal Scoring below)
+- Signal scoring penalizes confidence
 
 #### Idempotency
 
-Each movement gets a deterministic ID: `{marketId}:{outcome}:{windowType}:{hourBucket}`.
+Each movement gets a deterministic ID: `{marketId}:{outcome}:{windowType}:{bucket}`.
 
-This limits output to **one movement per market+outcome per hour** per window type. The insert uses a duplicate-key check — if the ID already exists, the insert is silently skipped.
+The bucket divisor varies by window type (5m buckets for 5m windows, 1h buckets for 4h windows). This limits output to one movement per market+outcome per bucket per window type. Duplicate-key inserts are silently skipped.
 
-Additionally, a process-level cooldown gate prevents re-running the detector more than once per 60 seconds per market+outcome pair.
+Per-window anti-spam cooldowns prevent re-running the detector too frequently (30s for 5m, 60s for longer windows).
 
 #### Output
 
-On trigger, inserts a row into `market_movements` with all computed metrics, then calls `scoreSignals()` for classification and explanation generation.
+On trigger, inserts a row into `market_movements` with all computed metrics plus velocity, then calls `scoreSignals()` for classification and explanation generation.
+
+#### Event-Level Detection
+
+**File:** `services/movements/src/detectMovementEvent.ts`
+
+For multi-outcome events (e.g., "Who will win the election?" with many candidates), the event detector aggregates across child markets using volume-weighted price composites. It runs 1h and 4h windows (shorter windows don't apply well to cross-market aggregation) and computes velocity the same way.
 
 ---
 
@@ -203,8 +238,6 @@ Breakout UP:   current price >= historical max * 1.03  (3% above)
 Breakout DOWN: current price <= historical min * 0.97  (3% below)
 ```
 
-This detects when price breaks out of its recent 60-minute trading range by a meaningful margin.
-
 #### Trigger 2: EMA Crossover
 
 Maintains two exponential moving averages with different time constants:
@@ -228,8 +261,6 @@ Crossover detection:
 
 Events from mid-price updates (source: "mid") require a recent actual trade to have occurred within 60 seconds (`TRADE_CONFIRM_MS`). This prevents phantom signals from order-book changes that never result in fills.
 
-The ingestion service calls `movementRealtime.onTrade()` on each trade to update the last-trade timestamp per asset.
-
 #### Output
 
 Emits one of four event types into the `movement_events` table:
@@ -249,11 +280,11 @@ A 60-second cooldown (`EVENT_COOLDOWN_MS`) prevents duplicate events of the same
 
 **File:** `services/signals/src/scoreSignals.ts`
 
-After a 24h movement is detected, the scoring system classifies it into one of four categories and assigns a confidence score. This runs only for 24h/event movements (not real-time breakouts).
+After a movement is detected, the scoring system classifies it by likely driver and assigns a confidence score. This runs for all multi-window movements (not real-time breakouts).
 
 ### Score Components
 
-Each movement is evaluated on four dimensions, all normalized to 0..1:
+Each movement is evaluated on six dimensions, all normalized to 0..1:
 
 #### Capital Score — "Did money show up?"
 
@@ -263,7 +294,6 @@ capitalScore = 0.6 * clamp(volumeRatio / 2.0) + 0.4 * clamp(hourlyRatio / 2.0)
 
 - 2x daily volume = max capital score
 - Weighted 60% daily, 40% hourly spike
-- High capital score suggests institutional or whale activity
 
 #### Price Score — "Did price meaningfully move?"
 
@@ -273,7 +303,17 @@ priceScore = 0.5 * clamp(drift / 0.15) + 0.5 * clamp(range / 0.15)
 
 - 15% drift or range = max price score
 - Drift captures sustained directional moves
-- Range captures intraday spikes and whipsaws
+- Range captures spikes and whipsaws
+
+#### Velocity Score — "How fast did price move?"
+
+```
+velocityScore = clamp(velocity / 0.02)
+```
+
+- `velocity = |price_delta| / sqrt(minutes)` (from the detector)
+- 0.02 velocity = max score (e.g., 5% move in ~6 minutes)
+- Captures the speed of information arrival independent of magnitude
 
 #### Liquidity Risk — "Is this movement trustworthy?"
 
@@ -285,22 +325,18 @@ thinRisk   = thin ? 1 : 0
 liquidityRisk = 0.6 * thinRisk + 0.25 * tradeRisk + 0.15 * levelRisk
 ```
 
-- Thin book flag dominates (60% weight)
-- Trade count sparsity is secondary (25%)
-- Price level diversity is tertiary (15%)
-
 #### Info Score — "Price moved without capital behind it"
 
 ```
 infoScore = priceScore * (1 - capitalScore) * (1 - clamp(volumeRatio / 2))
 ```
 
-High info score means price moved significantly but volume was normal or low — suggesting the move was driven by new information, sentiment, or news rather than large capital flows.
+High info score means price moved significantly but volume was normal or low.
 
-#### Time Score
+#### Time Score / News Score
 
-Computed from `market_resolution` using proximity to `resolved_at` / `end_time`.
-Defaults to 0 when no resolution data exists.
+- **Time Score:** Computed from `market_resolution` using proximity to `resolved_at` / `end_time`
+- **News Score:** Fetched from NewsAPI.org, cached by slug+hour
 
 ### Classification
 
@@ -309,29 +345,46 @@ Evaluated in priority order (first match wins):
 | Priority | Condition | Classification |
 |---|---|---|
 | 1 | `thin AND liquidityRisk >= 0.6` OR `liquidityRisk >= 0.75` | **LIQUIDITY** — Don't trust the move |
-| 2 | `capitalScore >= 0.6` | **CAPITAL** — Large money flows |
-| 3 | `infoScore >= 0.5 AND (tradesCount >= 50 OR priceLevels >= 8)` | **INFO** — Information/sentiment driven |
-| 4 | `priceScore >= 0.6 AND thin` | **LIQUIDITY** — Price moved but book is thin |
-| 5 | `priceScore >= 0.6 AND !thin` | **INFO** — Price moved, capital ambiguous |
-| 6 | `timeScore > confidence` | **TIME** — Time dynamics |
-| 7 | Fallback | **CAPITAL** — Default bucket |
+| 2 | `newsScore >= 0.5 AND infoScore >= 0.3` | **NEWS** — Driven by news coverage |
+| 3 | `velocityScore >= 0.6 AND priceScore >= 0.3` | **VELOCITY** — Rapid impulse move |
+| 4 | `capitalScore >= 0.6` | **CAPITAL** — Large money flows |
+| 5 | `infoScore >= 0.5 AND hasInfoDepth` | **INFO** — Information/sentiment driven |
+| 6 | `priceScore >= 0.6 AND thin` | **LIQUIDITY** — Price moved but book is thin |
+| 7 | `priceScore >= 0.6 AND !thin` | **INFO** — Price moved, capital ambiguous |
+| 8 | `timeScore > confidence` | **TIME** — Time dynamics |
+| 9 | Fallback | **CAPITAL** — Default bucket |
+
+### Recency Weighting
+
+Shorter detection windows produce more actionable signals. A recency multiplier adjusts final confidence based on the source window:
+
+| Window | Recency Weight |
+|---|---|
+| 5m | 1.00 |
+| 15m | 0.85 |
+| event | 0.80 |
+| 1h | 0.65 |
+| 4h | 0.45 |
+| 24h (legacy) | 0.25 |
 
 ### Confidence Adjustment
 
-All signals receive a final liquidity penalty:
+All signals receive a final liquidity penalty and recency boost:
 
 ```
-adjustedConfidence = confidence * (1 - 0.35 * liquidityRisk)
+adjustedConfidence = confidence * (1 - 0.35 * liquidityRisk) * (0.5 + 0.5 * recency)
 ```
 
-This means thin markets can reduce confidence by up to 35%, keeping the system conservative.
+This means:
+- Thin markets can reduce confidence by up to 35%
+- A 5m signal gets full confidence; a 4h signal gets ~72% of raw confidence
 
 ### Output
 
 Inserts into `signal_scores`:
-- `movement_id`, `capital_score`, `info_score`, `time_score`
-- `classification` (CAPITAL | INFO | LIQUIDITY | TIME)
-- `confidence` (0..1, adjusted for liquidity risk)
+- `movement_id`, `capital_score`, `info_score`, `time_score`, `news_score`
+- `classification` (CAPITAL | INFO | VELOCITY | LIQUIDITY | NEWS | TIME)
+- `confidence` (0..1, adjusted for liquidity risk and recency)
 
 Then calls `buildExplanation()` and inserts the result into `movement_explanations`.
 
@@ -343,11 +396,44 @@ Then calls `buildExplanation()` and inserts the result into `movement_explanatio
 
 Generates plain-English summaries by composing sentences:
 
-1. **Price sentence:** "Price moved X% over Yh."
-2. **Window sentence:** "This is the rolling 24h window." or "This is a recent move since the last signal."
+1. **Price sentence:** "Price moved X% over Y min/hours." (adapts units to window size)
+2. **Window sentence:** Window-specific context (e.g., "This is a rapid impulse detected in the 5-minute window." vs "This is a sustained move over the 4-hour window.")
 3. **Volume sentence:** Based on volume ratio — below average, near typical, spiked above normal, or insufficient baseline
 4. **Liquidity sentence:** "Orderbook appears thin, so price moves may be exaggerated." (if applicable)
 5. **Classification sentence:** Maps classification to a human-readable driver explanation
+6. **Velocity sentence:** "Velocity is high — sharp move relative to window size." (if reason is VELOCITY)
+7. **News sentence:** Related headline excerpts (if available)
+
+---
+
+## Frontend
+
+**File:** `apps/web/src/app/page.tsx`
+
+### Live Signal Display
+
+Signal annotations appear as colored bands at the bottom of the price chart. When multiple signals overlap in time, they are assigned to **swim lanes** — each lane is a separate vertical row, preventing bands from stacking on top of each other and blocking hover interactions.
+
+- **Green bands:** Short-window impulses (5m, 15m) — high urgency
+- **Orange bands:** Longer-window signals (1h, 4h) — contextual
+- **Blue bands:** Event-level aggregated movements
+
+Hovering a band shows a tooltip with the signal label, time window, and full explanation text.
+
+### Live Signal Updates
+
+New signals arrive in real-time via Server-Sent Events (SSE) without requiring a page reload:
+
+1. The `/api/stream` endpoint polls `market_movements` every 2 seconds for new rows
+2. New movements are pushed as `movement` SSE events with explanation text
+3. The frontend receives them via `useMarketStream` and appends to the annotation arrays
+4. New signal bands appear immediately on the chart
+5. The signal pill in the header pulses green when new signals arrive
+6. A manual refresh button (&#x21bb;) on the signal pill re-fetches the full signal history from the API
+
+### Signal Pill
+
+Shows `Signals: N · Last HH:MM:SS` in the header. Pulses when new signals arrive via the stream. Clicking the refresh button triggers an API re-fetch that merges any missing signals without losing live series data.
 
 ---
 
@@ -377,7 +463,7 @@ Polymarket trade WS message
 ### Order-Book Flow
 
 ```
-Polymarket CLOB WS message
+Polymarket CLOB WS message (batched, max 20 assets per connection)
   → Extract synthetic mid-price from best bid/ask
   → Filter for "Yes" outcome only
   → movementRealtime.onPriceUpdate()
@@ -389,7 +475,7 @@ Polymarket CLOB WS message
 
 ### Dynamic Slug Management
 
-Tracked slugs are stored in Supabase `tracked_slugs` table. The ingestion service polls this table every 30 seconds (`syncTrackedSlugs()`), merging new slugs into its active filter set without requiring a restart.
+Tracked slugs are stored in Supabase `tracked_slugs` table. The ingestion service polls this table every 30 seconds (`syncTrackedSlugs()`), merging new slugs into its active filter set without requiring a restart. Adding new slugs triggers an immediate backfill.
 
 The frontend writes to this table via `/api/track` when a user loads a new slug.
 
@@ -404,7 +490,8 @@ The frontend writes to this table via `/api/track` when a user loads a new slug.
 | `market_mid_latest` | Current best bid/ask/mid per asset |
 | `market_aggregates` | Rolling total volume and first-seen timestamp per market |
 | `market_dominant_outcomes` | Which outcome has the most recent activity per market |
-| `market_movements` | Detected 24h and event-anchored movements with full metrics |
+| `market_movements` | Detected multi-window and event-anchored movements with full metrics |
+| `market_resolution` | Market end times and resolution status for time-score computation |
 | `movement_events` | Real-time breakout and EMA crossover detections |
 | `signal_scores` | Classification and confidence scores per movement |
 | `movement_explanations` | Human-readable explanation text per movement |
@@ -416,17 +503,56 @@ The frontend writes to this table via `/api/track` when a user loads a new slug.
 
 All detection thresholds are configurable via environment variables:
 
-### 24h Movement Detector
+### Multi-Window Movement Detector
+
+#### 5-Minute Window
 
 | Variable | Default | Description |
 |---|---|---|
-| `MOVEMENT_PRICE_THRESHOLD` | 0.08 | Min price drift/range to trigger (8%) |
-| `MOVEMENT_THIN_PRICE_THRESHOLD` | 0.12 | Price threshold when liquidity is thin (12%) |
-| `MOVEMENT_VOLUME_THRESHOLD` | 1.5 | Volume ratio multiplier to trigger (1.5x baseline) |
+| `MOVEMENT_5M_PRICE_THRESHOLD` | 0.03 | Min price drift/range to trigger (3%) |
+| `MOVEMENT_5M_THIN_THRESHOLD` | 0.05 | Price threshold when liquidity is thin (5%) |
+| `MOVEMENT_5M_MIN_ABS` | 0.02 | Minimum absolute price change (2 cents) |
+| `MOVEMENT_5M_VOLUME_THRESHOLD` | 1.5 | Volume ratio multiplier |
+| `MOVEMENT_5M_COOLDOWN_MS` | 30000 | Anti-spam cooldown (30s) |
+
+#### 15-Minute Window
+
+| Variable | Default | Description |
+|---|---|---|
+| `MOVEMENT_15M_PRICE_THRESHOLD` | 0.04 | Min price drift/range to trigger (4%) |
+| `MOVEMENT_15M_THIN_THRESHOLD` | 0.07 | Price threshold when liquidity is thin (7%) |
+| `MOVEMENT_15M_MIN_ABS` | 0.02 | Minimum absolute price change (2 cents) |
+| `MOVEMENT_15M_VOLUME_THRESHOLD` | 1.5 | Volume ratio multiplier |
+| `MOVEMENT_15M_COOLDOWN_MS` | 60000 | Anti-spam cooldown (60s) |
+
+#### 1-Hour Window
+
+| Variable | Default | Description |
+|---|---|---|
+| `MOVEMENT_1H_PRICE_THRESHOLD` | 0.06 | Min price drift/range to trigger (6%) |
+| `MOVEMENT_1H_THIN_THRESHOLD` | 0.10 | Price threshold when liquidity is thin (10%) |
+| `MOVEMENT_1H_MIN_ABS` | 0.03 | Minimum absolute price change (3 cents) |
+| `MOVEMENT_1H_VOLUME_THRESHOLD` | 1.5 | Volume ratio multiplier |
+| `MOVEMENT_1H_COOLDOWN_MS` | 60000 | Anti-spam cooldown (60s) |
+
+#### 4-Hour Window
+
+| Variable | Default | Description |
+|---|---|---|
+| `MOVEMENT_4H_PRICE_THRESHOLD` | 0.08 | Min price drift/range to trigger (8%) |
+| `MOVEMENT_4H_THIN_THRESHOLD` | 0.12 | Price threshold when liquidity is thin (12%) |
+| `MOVEMENT_4H_MIN_ABS` | 0.03 | Minimum absolute price change (3 cents) |
+| `MOVEMENT_4H_VOLUME_THRESHOLD` | 1.5 | Volume ratio multiplier |
+| `MOVEMENT_4H_COOLDOWN_MS` | 60000 | Anti-spam cooldown (60s) |
+
+#### Shared
+
+| Variable | Default | Description |
+|---|---|---|
 | `MOVEMENT_MIN_PRICE_FOR_ALERT` | 0.05 | Skip markets with mid below this level |
-| `MOVEMENT_MIN_ABS_MOVE` | 0.03 | Minimum absolute price change (3 cents) |
-| `MOVEMENT_CONFIRM_MINUTES` | 10 | Minutes to look back for price confirmation |
+| `MOVEMENT_CONFIRM_MINUTES` | 5 | Minutes to look back for price confirmation |
 | `MOVEMENT_CONFIRM_MIN_TICKS` | 3 | Minimum ticks required for confirmation |
+| `MOVEMENT_VELOCITY_THRESHOLD` | 0.008 | Velocity threshold for VELOCITY trigger |
 
 ### Real-Time Detector
 
@@ -453,6 +579,15 @@ All detection thresholds are configurable via environment variables:
 | `MIN_INFO_TRADES` | 50 | Min trades to allow INFO classification |
 | `MIN_INFO_LEVELS` | 8 | Min price levels to allow INFO classification |
 | `LIQUIDITY_OVERRIDE` | 0.6 | Liquidity risk threshold for thin+LIQUIDITY override |
+| `TIME_SCORE_HORIZON_HOURS` | 72 | Hours before resolution where time score ramps |
+| `TIME_SCORE_CACHE_MS` | 60000 | Cache TTL for time score lookups |
+
+### Ingestion
+
+| Variable | Default | Description |
+|---|---|---|
+| `MAX_CLOB_ASSETS` | 20 | Max assets per CLOB WebSocket connection |
+| `MAX_ASSETS_PER_MARKET` | 3 | Max assets tracked per market |
 
 ---
 
@@ -500,3 +635,5 @@ npm --workspace @market-move-intelligence/web run dev
 2. Enter a Polymarket event slug in the input field and click Load
 3. The slug is registered in `tracked_slugs` and picked up by the ingestion service within 30 seconds
 4. The chart populates with price data, volume bars, and movement annotations as data flows in
+5. New signals appear live via SSE — the signal pill pulses green when new signals arrive
+6. Click the refresh button on the signal pill to re-fetch historical signals without reloading

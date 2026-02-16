@@ -1,7 +1,7 @@
 "use client";
 
 import { createChart, ColorType } from "lightweight-charts";
-import { use, useEffect, useMemo, useRef, useState } from "react";
+import { use, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type {
   Annotation,
   MarketSnapshot,
@@ -9,7 +9,7 @@ import type {
   SeriesPoint,
   PinnedSelection,
 } from "../lib/types";
-import { SignalBand } from "../components/SignalBand";
+import { SignalBand, LANE_HEIGHT } from "../components/SignalBand";
 import { useMarketStream } from "../hooks/useMarketStream";
 
 // ── constants ───────────────────────────────────────────────────────
@@ -310,6 +310,8 @@ export default function Page(props: PageProps) {
   const [chartReady, setChartReady] = useState(false);
   const [signalLayoutTick, setSignalLayoutTick] = useState(0);
   const [lineFilterKey, setLineFilterKey] = useState<string | null>(null);
+  const [signalFlash, setSignalFlash] = useState(false);
+  const prevSignalCountRef = useRef(0);
 
   const clearLineSeries = (
     chartOverride?: ReturnType<typeof createChart> | null
@@ -657,6 +659,99 @@ export default function Page(props: PageProps) {
     setHoveredSignal(null);
   }, [visibleOutcomes]);
 
+  // ── swim-lane assignment for overlapping signal bands ─────────────
+  const { laneMap, laneCount } = useMemo(() => {
+    const lanes: number[] = new Array(signalWindows.length).fill(0);
+    // Sort indices by start time for greedy lane packing
+    const indices = signalWindows
+      .map((_, i) => i)
+      .sort((a, b) => {
+        const aMs = Date.parse(signalWindows[a].start_ts);
+        const bMs = Date.parse(signalWindows[b].start_ts);
+        return aMs - bMs;
+      });
+    // laneEnds[lane] = end timestamp (ms) of the last annotation in that lane
+    const laneEnds: number[] = [];
+    for (const i of indices) {
+      const startMs = Date.parse(signalWindows[i].start_ts);
+      const endMs = Date.parse(signalWindows[i].end_ts);
+      // Find the lowest lane where this annotation doesn't overlap
+      let placed = false;
+      for (let l = 0; l < laneEnds.length; l++) {
+        if (startMs >= laneEnds[l]) {
+          lanes[i] = l;
+          laneEnds[l] = endMs;
+          placed = true;
+          break;
+        }
+      }
+      if (!placed) {
+        lanes[i] = laneEnds.length;
+        laneEnds.push(endMs);
+      }
+    }
+    return { laneMap: lanes, laneCount: Math.max(1, laneEnds.length) };
+  }, [signalWindows]);
+
+  // ── flash when new signals arrive via SSE ─────────────────────────
+  useEffect(() => {
+    const prev = prevSignalCountRef.current;
+    prevSignalCountRef.current = signalWindows.length;
+    if (prev > 0 && signalWindows.length > prev) {
+      setSignalFlash(true);
+      const t = setTimeout(() => setSignalFlash(false), 2000);
+      return () => clearTimeout(t);
+    }
+  }, [signalWindows.length]);
+
+  // ── manual signal refresh (re-fetches from API without full page reload)
+  const refreshSignals = useCallback(async () => {
+    if (!slugs && !pinned.marketId) return;
+    try {
+      const base = pinned.marketId
+        ? `/api/markets?market_id=${encodeURIComponent(pinned.marketId)}`
+        : `/api/markets?slugs=${encodeURIComponent(slugs)}`;
+      const res = await fetch(
+        `${base}&sinceHours=${inferredSinceHours}&bucketMinutes=${inferredBucketMinutes}` +
+          (pinned.assetId ? `&asset_id=${encodeURIComponent(pinned.assetId)}` : ""),
+        { cache: "no-store" }
+      );
+      if (!res.ok) return;
+      const json = await res.json();
+      const rawMarkets = Array.isArray(json.markets) ? json.markets : [];
+      // Merge fresh annotations into existing markets (preserves live series data)
+      setMarkets((prev) =>
+        prev.map((m) => {
+          const fresh = rawMarkets.find(
+            (f: MarketSnapshot) => f.slug === m.slug
+          );
+          if (!fresh) return m;
+          return {
+            ...m,
+            outcomes: m.outcomes.map((o) => {
+              const freshOutcome = (fresh.outcomes ?? []).find(
+                (fo: OutcomeSeries) => fo.outcome === o.outcome
+              );
+              if (!freshOutcome) return o;
+              // Merge annotations: keep existing + add any new ones
+              const existingKeys = new Set(
+                o.annotations.map((a: Annotation) => `${a.start_ts}:${a.end_ts}`)
+              );
+              const newAnns = (freshOutcome.annotations ?? []).filter(
+                (a: Annotation) => !existingKeys.has(`${a.start_ts}:${a.end_ts}`)
+              );
+              return newAnns.length > 0
+                ? { ...o, annotations: [...o.annotations, ...newAnns] }
+                : o;
+            }),
+          };
+        })
+      );
+    } catch {
+      // silent — non-critical refresh
+    }
+  }, [slugs, pinned.marketId, pinned.assetId, inferredSinceHours, inferredBucketMinutes]);
+
   // ── sync chart data ───────────────────────────────────────────────
 
   useEffect(() => {
@@ -848,7 +943,7 @@ export default function Page(props: PageProps) {
               <strong>{rangePct.toFixed(1)}%</strong>
             </div>
             <div
-              className="signal-pill"
+              className={`signal-pill${signalFlash ? " signal-flash" : ""}`}
               data-active={signalStats.count > 0}
               title={
                 signalStats.lastMs
@@ -862,6 +957,14 @@ export default function Page(props: PageProps) {
                     signalStats.lastMs
                   ).toLocaleTimeString()}`
                 : ""}
+              <button
+                type="button"
+                className="signal-refresh-btn"
+                onClick={refreshSignals}
+                title="Refresh signals"
+              >
+                &#x21bb;
+              </button>
             </div>
             {(selectedMarket?.outcomes?.length ?? 0) > 1 && selectedOutcome && (
               <div className="dominant-pill">
@@ -917,13 +1020,17 @@ export default function Page(props: PageProps) {
         <div className="chart-card">
           <div className="chart-stage">
             <div ref={chartContainerRef} className="lw-chart" />
-            <div className="signal-strip">
+            <div
+              className="signal-strip"
+              style={{ height: `${laneCount * LANE_HEIGHT}px` }}
+            >
               {signalWindows.map((signal, idx) => (
                 <SignalBand
                   key={`${signal.kind}-${signal.start_ts}-${idx}`}
                   signal={signal}
                   chart={chartReady ? chartRef.current : null}
                   layoutVersion={signalLayoutTick}
+                  lane={laneMap[idx] ?? 0}
                   onHover={setHoveredSignal}
                 />
               ))}
@@ -1172,6 +1279,29 @@ export default function Page(props: PageProps) {
           color: #bfead6;
           box-shadow: 0 0 12px rgba(80, 220, 140, 0.15);
         }
+        .signal-pill.signal-flash {
+          animation: signalPulse 2s ease-out;
+        }
+        @keyframes signalPulse {
+          0%   { box-shadow: 0 0 0 0 rgba(80, 220, 140, 0.6); }
+          20%  { box-shadow: 0 0 18px 4px rgba(80, 220, 140, 0.45); }
+          100% { box-shadow: 0 0 12px rgba(80, 220, 140, 0.15); }
+        }
+        .signal-refresh-btn {
+          background: none;
+          border: none;
+          color: inherit;
+          font-size: 14px;
+          cursor: pointer;
+          margin-left: 6px;
+          padding: 0 2px;
+          opacity: 0.5;
+          transition: opacity 0.15s;
+          vertical-align: middle;
+        }
+        .signal-refresh-btn:hover {
+          opacity: 1;
+        }
         .outcome-filters {
           display: flex;
           flex-wrap: wrap;
@@ -1228,16 +1358,17 @@ export default function Page(props: PageProps) {
           left: 12px;
           right: 12px;
           bottom: 8px;
-          height: 18px;
           z-index: 3;
         }
         .signal-band {
           position: absolute;
-          top: 0;
-          bottom: 0;
           border-radius: 10px;
           opacity: 0.7;
           cursor: pointer;
+          transition: opacity 0.15s;
+        }
+        .signal-band:hover {
+          opacity: 1;
         }
         .signal-tooltip {
           position: absolute;
