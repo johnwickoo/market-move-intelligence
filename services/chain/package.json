@@ -1,0 +1,14 @@
+{
+  "name": "@market-move-intelligence/chain",
+  "version": "0.1.0",
+  "private": true,
+  "main": "src/attestSignal.ts",
+  "devDependencies": {
+    "ts-node": "^10.9.2",
+    "typescript": "^5.5.0"
+  },
+  "dependencies": {
+    "@solana/web3.js": "^1.98.0",
+    "bs58": "^6.0.0"
+  }
+}

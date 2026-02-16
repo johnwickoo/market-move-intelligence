@@ -2,6 +2,8 @@ import { supabase } from "../../storage/src/db";
 import { buildExplanation } from "../../explanations/src/buildExplanation";
 import { fetchNewsScore, resolveSlugAndTitle } from "../../news/src/newsapi.client";
 import { computeTimeScore, parseTimeValue } from "./timeScore";
+import { attestSignal } from "../../chain/src/attestSignal";
+import type { SignalClassification } from "../../chain/src/types";
 
 function clamp01(x: number) {
   return Math.max(0, Math.min(1, x));
@@ -237,6 +239,19 @@ export async function scoreSignals(movement: any) {
     confidence * (1 - 0.35 * liquidityRisk) * (0.5 + 0.5 * recency)
   );
 
+  // Drop low-confidence signals — prevents LIQUIDITY and other weak
+  // signals from cluttering the frontend and wasting AI explanation calls.
+  const MIN_CONFIDENCE = Number(process.env.SIGNAL_MIN_CONFIDENCE ?? 0.25);
+  if (adjustedConfidence < MIN_CONFIDENCE) {
+    console.log(
+      `[signals] skipped low-confidence`,
+      movement.id,
+      classification,
+      adjustedConfidence.toFixed(3)
+    );
+    return;
+  }
+
   const row = {
     movement_id: movement.id,
     capital_score: capitalScore,
@@ -255,8 +270,18 @@ export async function scoreSignals(movement: any) {
 
   let marketTitle: string | undefined;
   try {
-    const resolved = await resolveSlugAndTitle(movement.market_id);
+    // For event-level signals, resolve the top mover's child market title
+    // so the explanation can name the specific market that drove the move.
+    const topMoverId = (movement as any).__topMoverMarketId as string | null;
+    const resolveId = topMoverId || movement.market_id;
+    const resolved = await resolveSlugAndTitle(resolveId);
     marketTitle = resolved.title ?? undefined;
+
+    // If we resolved a child market, prefix with event context
+    if (topMoverId && marketTitle && movement.outcome === "EVENT") {
+      const eventSlug = String(movement.market_id ?? "").replace(/^event:/, "");
+      marketTitle = `${marketTitle} (event: ${eventSlug})`;
+    }
   } catch {}
 
   const explanationText = await buildExplanation(movement, row, marketTitle);
@@ -269,6 +294,19 @@ export async function scoreSignals(movement: any) {
     });
     throw explainErr;
   }
+
+  // Fire-and-forget: attest signal on Solana (non-blocking).
+  // attestSignal never throws — failures are logged and swallowed.
+  attestSignal({
+    movement_id: movement.id,
+    market_id: movement.market_id,
+    classification: classification as SignalClassification,
+    confidence: adjustedConfidence,
+    capital_score: capitalScore,
+    info_score: infoScore,
+    time_score: timeScore,
+    news_score: newsScore,
+  });
 
   console.log(
     "[signals] inserted",

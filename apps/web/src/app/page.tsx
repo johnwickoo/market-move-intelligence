@@ -241,8 +241,14 @@ type PageProps = {
 };
 
 export default function Page(props: PageProps) {
-  const searchParams = use(props.searchParams ?? Promise.resolve({}));
-  const _params = use(props.params ?? Promise.resolve({}));
+  const searchParams = use(
+    props.searchParams ??
+      Promise.resolve({} as Record<string, string | string[] | undefined>)
+  );
+  const _params = use(
+    props.params ??
+      Promise.resolve({} as Record<string, string | undefined>)
+  );
 
   const [markets, setMarkets] = useState<MarketSnapshot[]>(demoMarkets);
   const [slugs, setSlugs] = useState(ENV_DEFAULT_SLUG);

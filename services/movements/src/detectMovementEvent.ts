@@ -62,7 +62,7 @@ const EVENT_WINDOWS: EventWindowDef[] = [
     priceThreshold: Number(process.env.MOVEMENT_1H_PRICE_THRESHOLD ?? 0.06),
     thinPriceThreshold: Number(process.env.MOVEMENT_1H_THIN_THRESHOLD ?? 0.10),
     minAbsMove: Number(process.env.MOVEMENT_1H_MIN_ABS ?? 0.03),
-    volumeThreshold: Number(process.env.MOVEMENT_1H_VOLUME_THRESHOLD ?? 1.5),
+    volumeThreshold: Number(process.env.MOVEMENT_1H_VOLUME_THRESHOLD ?? 2.0),
     bucketDivisorMs: 30 * 60_000,
   },
   {
@@ -71,7 +71,7 @@ const EVENT_WINDOWS: EventWindowDef[] = [
     priceThreshold: Number(process.env.MOVEMENT_4H_PRICE_THRESHOLD ?? 0.08),
     thinPriceThreshold: Number(process.env.MOVEMENT_4H_THIN_THRESHOLD ?? 0.12),
     minAbsMove: Number(process.env.MOVEMENT_4H_MIN_ABS ?? 0.03),
-    volumeThreshold: Number(process.env.MOVEMENT_4H_VOLUME_THRESHOLD ?? 1.5),
+    volumeThreshold: Number(process.env.MOVEMENT_4H_VOLUME_THRESHOLD ?? 2.0),
     bucketDivisorMs: 60 * 60_000,
   },
 ];
@@ -81,6 +81,7 @@ const MIN_PRICE_FOR_ALERT = Number(
 );
 
 const VELOCITY_THRESHOLD = Number(process.env.MOVEMENT_VELOCITY_THRESHOLD ?? 0.008);
+const MIN_DRIFT_FOR_VOLUME = Number(process.env.MOVEMENT_MIN_DRIFT_FOR_VOLUME ?? 0.02);
 
 const lastCheckedMs = new Map<string, number>();
 
@@ -261,6 +262,8 @@ export async function detectEventMovement({
 
     for (const [marketId, stats] of perMarket.entries()) {
       if (stats.lastTs < nowCutoff) continue;
+      // Skip penny-priced children — they pollute weighted averages
+      if (stats.end < MIN_PRICE_FOR_ALERT && stats.start < MIN_PRICE_FOR_ALERT) continue;
       const weight = volumeByMarket.get(marketId) ?? 0;
       if (weight <= 0) continue;
       entries.push({
@@ -270,6 +273,17 @@ export async function detectEventMovement({
     }
 
     if (entries.length < EVENT_MIN_CHILD_MARKETS) continue;
+
+    // Identify the top mover — child market with the biggest volume-weighted drift.
+    // This is surfaced in logs and passed to the explanation system.
+    let topMover: { marketId: string; absDrift: number; volume: number } | null = null;
+    for (const e of entries) {
+      const drift = e.start > 0 ? Math.abs((e.end - e.start) / e.start) : 0;
+      const score = drift * e.weight;
+      if (!topMover || score > topMover.absDrift * topMover.volume) {
+        topMover = { marketId: e.marketId, absDrift: drift, volume: e.weight };
+      }
+    }
 
     const startPrice = weightedAvg(entries.map((e) => ({ value: e.start, weight: e.weight })));
     const endPrice = weightedAvg(entries.map((e) => ({ value: e.end, weight: e.weight })));
@@ -300,9 +314,9 @@ export async function detectEventMovement({
 
     const priceEligible = minPrice >= MIN_PRICE_FOR_ALERT;
     const driftHit = Math.abs(driftPct) >= threshold;
-    const rangeHit = rangePct >= threshold;
     const absHit = absMove >= w.minAbsMove;
-    const priceHit = priceEligible && absHit && (driftHit || rangeHit);
+    // Require directional drift — range alone (oscillation) is noise.
+    const priceHit = priceEligible && absHit && driftHit;
 
     const volHit =
       (volumeRatio != null && volumeRatio >= w.volumeThreshold) ||
@@ -313,6 +327,13 @@ export async function detectEventMovement({
     const velocityHit = velocity >= VELOCITY_THRESHOLD;
 
     if (!priceHit && !volHit && !velocityHit) continue;
+
+    // Volume-only signals require meaningful price movement AND
+    // the weighted average must be above the penny-price floor.
+    if (volHit && !priceHit && !velocityHit) {
+      if (Math.abs(driftPct) < MIN_DRIFT_FOR_VOLUME) continue;
+      if (endPrice < MIN_PRICE_FOR_ALERT) continue;
+    }
 
     const reason: MovementInsert["reason"] =
       velocityHit && priceHit
@@ -359,11 +380,13 @@ export async function detectEventMovement({
       continue;
     }
 
-    await scoreSignals({ ...row, velocity });
+    const topMoverId = topMover?.marketId ?? null;
+    await scoreSignals({ ...row, velocity, __topMoverMarketId: topMoverId });
     console.log(
       `[movement-event] ${w.type}/${reason} event=${eventSlug} price=${endPrice.toFixed(4)} ` +
         `drift=${driftPct.toFixed(3)} range=${rangePct.toFixed(3)} ` +
-        `vel=${velocity.toFixed(4)} vol=${totalVolume.toFixed(2)} ratio=${volumeRatio?.toFixed(2) ?? "n/a"}`
+        `vel=${velocity.toFixed(4)} vol=${totalVolume.toFixed(2)} ratio=${volumeRatio?.toFixed(2) ?? "n/a"} ` +
+        `topMover=${topMoverId?.slice(0, 12) ?? "n/a"} children=${entries.length}`
     );
   }
 }

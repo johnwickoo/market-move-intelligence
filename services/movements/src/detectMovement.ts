@@ -66,11 +66,11 @@ const WINDOWS: WindowDef[] = [
     priceThreshold: Number(process.env.MOVEMENT_5M_PRICE_THRESHOLD ?? 0.03),
     thinPriceThreshold: Number(process.env.MOVEMENT_5M_THIN_THRESHOLD ?? 0.05),
     minAbsMove: Number(process.env.MOVEMENT_5M_MIN_ABS ?? 0.02),
-    volumeThreshold: Number(process.env.MOVEMENT_5M_VOLUME_THRESHOLD ?? 1.5),
+    volumeThreshold: Number(process.env.MOVEMENT_5M_VOLUME_THRESHOLD ?? 2.0),
     minTicks: 2,
     minTrades: 2,
     bucketDivisorMs: 5 * 60_000,   // 1 signal per 5min bucket
-    cooldownMs: Number(process.env.MOVEMENT_5M_COOLDOWN_MS ?? 30_000),
+    cooldownMs: Number(process.env.MOVEMENT_5M_COOLDOWN_MS ?? 60_000),
   },
   {
     type: "15m",
@@ -78,11 +78,11 @@ const WINDOWS: WindowDef[] = [
     priceThreshold: Number(process.env.MOVEMENT_15M_PRICE_THRESHOLD ?? 0.04),
     thinPriceThreshold: Number(process.env.MOVEMENT_15M_THIN_THRESHOLD ?? 0.07),
     minAbsMove: Number(process.env.MOVEMENT_15M_MIN_ABS ?? 0.02),
-    volumeThreshold: Number(process.env.MOVEMENT_15M_VOLUME_THRESHOLD ?? 1.5),
+    volumeThreshold: Number(process.env.MOVEMENT_15M_VOLUME_THRESHOLD ?? 2.0),
     minTicks: 3,
     minTrades: 3,
     bucketDivisorMs: 15 * 60_000,
-    cooldownMs: Number(process.env.MOVEMENT_15M_COOLDOWN_MS ?? 60_000),
+    cooldownMs: Number(process.env.MOVEMENT_15M_COOLDOWN_MS ?? 120_000),
   },
   {
     type: "1h",
@@ -90,11 +90,11 @@ const WINDOWS: WindowDef[] = [
     priceThreshold: Number(process.env.MOVEMENT_1H_PRICE_THRESHOLD ?? 0.06),
     thinPriceThreshold: Number(process.env.MOVEMENT_1H_THIN_THRESHOLD ?? 0.10),
     minAbsMove: Number(process.env.MOVEMENT_1H_MIN_ABS ?? 0.03),
-    volumeThreshold: Number(process.env.MOVEMENT_1H_VOLUME_THRESHOLD ?? 1.5),
+    volumeThreshold: Number(process.env.MOVEMENT_1H_VOLUME_THRESHOLD ?? 2.0),
     minTicks: 4,
     minTrades: 5,
     bucketDivisorMs: 30 * 60_000,
-    cooldownMs: Number(process.env.MOVEMENT_1H_COOLDOWN_MS ?? 60_000),
+    cooldownMs: Number(process.env.MOVEMENT_1H_COOLDOWN_MS ?? 180_000),
   },
   {
     type: "4h",
@@ -102,11 +102,11 @@ const WINDOWS: WindowDef[] = [
     priceThreshold: Number(process.env.MOVEMENT_4H_PRICE_THRESHOLD ?? 0.08),
     thinPriceThreshold: Number(process.env.MOVEMENT_4H_THIN_THRESHOLD ?? 0.12),
     minAbsMove: Number(process.env.MOVEMENT_4H_MIN_ABS ?? 0.03),
-    volumeThreshold: Number(process.env.MOVEMENT_4H_VOLUME_THRESHOLD ?? 1.5),
+    volumeThreshold: Number(process.env.MOVEMENT_4H_VOLUME_THRESHOLD ?? 2.0),
     minTicks: 5,
     minTrades: 8,
     bucketDivisorMs: 60 * 60_000,
-    cooldownMs: Number(process.env.MOVEMENT_4H_COOLDOWN_MS ?? 60_000),
+    cooldownMs: Number(process.env.MOVEMENT_4H_COOLDOWN_MS ?? 300_000),
   },
 ];
 
@@ -122,6 +122,18 @@ const WIDE_SPREAD = 0.05;
 // A 5% move in 5min = 0.05/sqrt(5) = 0.022
 // An 8% move in 4h  = 0.08/sqrt(240) = 0.005
 const VELOCITY_THRESHOLD = Number(process.env.MOVEMENT_VELOCITY_THRESHOLD ?? 0.008);
+
+// Minimum drift required for volume-only signals. Prevents noise from
+// high-volume events where price barely moves (e.g., 6x volume but 0.5% drift).
+const MIN_DRIFT_FOR_VOLUME = Number(process.env.MOVEMENT_MIN_DRIFT_FOR_VOLUME ?? 0.02);
+
+// Global per-market cooldown: max 1 signal per market+outcome across ALL
+// window types. Prevents 5m+15m+1h+4h from all firing for the same move.
+const GLOBAL_COOLDOWN_MS = Number(process.env.MOVEMENT_GLOBAL_COOLDOWN_MS ?? 180_000);
+const lastEmitMs = new Map<string, number>();
+
+// Minimum elapsed time for "event" window (since-last-signal anchoring).
+const EVENT_MIN_ELAPSED_MS = Number(process.env.MOVEMENT_EVENT_MIN_ELAPSED_MS ?? 10 * 60_000);
 
 function toNum(x: any): number {
   const n = typeof x === "number" ? x : Number(x);
@@ -262,6 +274,13 @@ export async function detectMovement(trade: TradeInsert) {
     if (ticks.length < w.minTicks && trades.length < w.minTrades) continue;
     const hasTicks = ticks.length >= 2;
 
+    // Skip outcomes priced below the alert floor — prevents noise from
+    // penny-priced child markets in multi-outcome events.
+    if (hasTicks) {
+      const lastMid = safeNum(ticks[ticks.length - 1].mid);
+      if (lastMid < MIN_PRICE_FOR_ALERT) continue;
+    }
+
     // ── Price analysis from mid ticks ──
     let startMid: number | null = null;
     let endMid: number | null = null;
@@ -320,9 +339,9 @@ export async function detectMovement(trade: TradeInsert) {
     const priceEligible = minMid != null && minMid >= MIN_PRICE_FOR_ALERT;
     const threshold = thinLiquidity ? w.thinPriceThreshold : w.priceThreshold;
     const driftHit = driftPct != null && Math.abs(driftPct) >= threshold;
-    const rangeHit = rangePct != null && rangePct >= threshold;
     const absHit = absMove != null && absMove >= w.minAbsMove;
-    const priceHit = hasTicks && priceEligible && absHit && (driftHit || rangeHit);
+    // Require directional drift — range alone (oscillation without net move) is noise.
+    const priceHit = hasTicks && priceEligible && absHit && driftHit;
 
     // ── Volume metrics ──
     // Scale hourly volume against baseline for this window's duration
@@ -386,6 +405,19 @@ export async function detectMovement(trade: TradeInsert) {
     // ── Decision: emit? ──
     if (!priceConfirmed && !volHit && !velocityHit) continue;
 
+    // Volume-only signals require meaningful price movement — suppress
+    // "high volume, flat price" noise.
+    if (volHit && !priceConfirmed && !velocityHit) {
+      const absDrift = driftPct != null ? Math.abs(driftPct) : 0;
+      if (absDrift < MIN_DRIFT_FOR_VOLUME) continue;
+    }
+
+    // Global per-market cooldown: only 1 signal per market+outcome every N ms
+    // across all window types. Prevents burst of 5m+15m+1h+4h for one move.
+    const globalKey = `${marketId}:${outcome ?? "NA"}`;
+    const lastEmit = lastEmitMs.get(globalKey) ?? 0;
+    if (nowMs - lastEmit < GLOBAL_COOLDOWN_MS) continue;
+
     const reason: MovementInsert["reason"] =
       velocityHit && priceConfirmed
         ? "VELOCITY"
@@ -424,7 +456,8 @@ export async function detectMovement(trade: TradeInsert) {
       velocity,
     };
 
-    await insertMovement(row, marketId, outcome, thinLiquidity);
+    const inserted = await insertMovement(row, marketId, outcome, thinLiquidity);
+    if (inserted) lastEmitMs.set(globalKey, nowMs);
   }
 
   // ── "event" window: since last signal ──────────────────────────
@@ -432,7 +465,8 @@ export async function detectMovement(trade: TradeInsert) {
     const eventComputeKey = `${marketId}:${outcome ?? "NA"}:event`;
     if (!shouldSkipCompute(eventComputeKey, nowMs, 60_000)) {
       const eventStartMs = Date.parse(lastMoveEndISO);
-      if (Number.isFinite(eventStartMs) && eventStartMs < nowMs) {
+      const eventElapsedMs = Number.isFinite(eventStartMs) ? nowMs - eventStartMs : 0;
+      if (Number.isFinite(eventStartMs) && eventStartMs < nowMs && eventElapsedMs >= EVENT_MIN_ELAPSED_MS) {
         const eventTicks = allTicks
           ? allTicks.filter((t) => {
               const ts = Date.parse(t.ts);
@@ -444,9 +478,10 @@ export async function detectMovement(trade: TradeInsert) {
           return Number.isFinite(ts) && ts >= eventStartMs && ts <= nowMs;
         });
 
-        if (eventTicks.length >= 2 && eventTrades.length >= 2) {
+        const eLastMid = safeNum(eventTicks[eventTicks.length - 1]?.mid);
+        if (eventTicks.length >= 2 && eventTrades.length >= 2 && eLastMid >= MIN_PRICE_FOR_ALERT) {
+          const eEndMid = eLastMid;
           const eStartMid = lastMoveEndPrice;
-          const eEndMid = safeNum(eventTicks[eventTicks.length - 1].mid);
           let eMinMid: number | null = null;
           let eMaxMid: number | null = null;
           for (const tk of eventTicks) {
@@ -468,11 +503,15 @@ export async function detectMovement(trade: TradeInsert) {
           const eventThreshold = 0.06;
           const eventMinAbs = 0.03;
           const eDriftHit = eDriftPct != null && Math.abs(eDriftPct) >= eventThreshold;
-          const eRangeHit = eRangePct != null && eRangePct >= eventThreshold;
           const eAbsHit = eAbsMove != null && eAbsMove >= eventMinAbs;
           const ePriceEligible = eMinMid != null && eMinMid >= MIN_PRICE_FOR_ALERT;
 
-          if (ePriceEligible && eAbsHit && (eDriftHit || eRangeHit)) {
+          // Global cooldown also applies to event window
+          const eventGlobalKey = `${marketId}:${outcome ?? "NA"}`;
+          const eventLastEmit = lastEmitMs.get(eventGlobalKey) ?? 0;
+          const eventCooldownOk = nowMs - eventLastEmit >= GLOBAL_COOLDOWN_MS;
+
+          if (ePriceEligible && eAbsHit && eDriftHit && eventCooldownOk) {
             const eVolume = eventTrades.reduce(
               (sum, t) => sum + safeNum(t.size ?? 0),
               0
@@ -517,7 +556,8 @@ export async function detectMovement(trade: TradeInsert) {
               velocity: eVelocity,
             };
 
-            await insertMovement(row, marketId, outcome, false);
+            const eventInserted = await insertMovement(row, marketId, outcome, false);
+            if (eventInserted) lastEmitMs.set(eventGlobalKey, nowMs);
           }
         }
       }
