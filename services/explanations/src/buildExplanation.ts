@@ -12,7 +12,7 @@ const WINDOW_LABELS: Record<string, string> = {
   "24h": "24-hour",
 };
 
-export function buildExplanation(movement: any, signal: any): string {
+export function buildTemplateExplanation(movement: any, signal: any): string {
   const pctChange = Math.abs(safeNum(movement?.pct_change, 0));
   const windowType = String(movement?.window_type ?? "");
   const windowLabel = WINDOW_LABELS[windowType] ?? windowType;
@@ -101,4 +101,17 @@ export function buildExplanation(movement: any, signal: any): string {
   return [priceSentence, windowSentence, velocitySentence, volumeSentence, liquiditySentence, classificationSentence, newsSentence]
     .filter(Boolean)
     .join(" ");
+}
+
+// ── async AI-first wrapper ──────────────────────────────────────────
+
+import { generateExplanationSafe } from "./ai.client";
+
+export async function buildExplanation(
+  movement: any,
+  signal: any,
+  marketTitle?: string
+): Promise<string> {
+  const { text } = await generateExplanationSafe(movement, signal, marketTitle);
+  return text;
 }

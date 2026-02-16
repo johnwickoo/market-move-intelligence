@@ -1,5 +1,6 @@
 import { supabase } from "../../storage/src/db";
 import { buildSearchQuery } from "./keyword.builder";
+import { generateSearchKeywords } from "./ai.keyword";
 import type { NewsArticle, NewsApiResponse, NewsResult } from "./types";
 
 const NEWSAPI_KEY = process.env.NEWSAPI_KEY ?? "";
@@ -26,7 +27,7 @@ function titleFromRaw(raw: any): string | null {
   return p?.title ?? p?.market_title ?? null;
 }
 
-async function resolveSlugAndTitle(
+export async function resolveSlugAndTitle(
   marketId: string
 ): Promise<{ slug: string | null; title: string | null }> {
   const { data } = await supabase
@@ -168,7 +169,8 @@ export async function fetchNewsScore(marketId: string): Promise<NewsResult> {
   const { slug, title } = await resolveSlugAndTitle(marketId);
   if (!slug) return zero;
 
-  const query = buildSearchQuery(slug, title);
+  const aiQuery = await generateSearchKeywords(slug, title);
+  const query = aiQuery || buildSearchQuery(slug, title);
   if (!query.trim()) return zero;
 
   const nowMs = Date.now();

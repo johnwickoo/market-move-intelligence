@@ -1,6 +1,6 @@
 import { supabase } from "../../storage/src/db";
 import { buildExplanation } from "../../explanations/src/buildExplanation";
-import { fetchNewsScore } from "../../news/src/newsapi.client";
+import { fetchNewsScore, resolveSlugAndTitle } from "../../news/src/newsapi.client";
 import { computeTimeScore, parseTimeValue } from "./timeScore";
 
 function clamp01(x: number) {
@@ -253,7 +253,13 @@ export async function scoreSignals(movement: any) {
     throw error;
   }
 
-  const explanationText = buildExplanation(movement, row);
+  let marketTitle: string | undefined;
+  try {
+    const resolved = await resolveSlugAndTitle(movement.market_id);
+    marketTitle = resolved.title ?? undefined;
+  } catch {}
+
+  const explanationText = await buildExplanation(movement, row, marketTitle);
   const { error: explainErr } = await supabase
     .from("movement_explanations")
     .insert({ movement_id: movement.id, text: explanationText });
