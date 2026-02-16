@@ -1,14 +1,15 @@
 import OpenAI from "openai";
 
-const AI_MODEL = process.env.AI_EXPLANATION_MODEL ?? "gpt-4o-mini";
+const AI_MODEL = process.env.AI_EXPLANATION_MODEL ?? "llama-3.3-70b-versatile";
+const AI_BASE_URL = process.env.AI_BASE_URL ?? "https://api.groq.com/openai/v1";
 
 let _client: OpenAI | null = null;
 
 function getClient(): OpenAI | null {
   if (_client) return _client;
-  const key = process.env.OPENAI_API_KEY;
+  const key = process.env.GROQ_API_KEY ?? process.env.OPENAI_API_KEY;
   if (!key) return null;
-  _client = new OpenAI({ apiKey: key });
+  _client = new OpenAI({ apiKey: key, baseURL: AI_BASE_URL });
   return _client;
 }
 
