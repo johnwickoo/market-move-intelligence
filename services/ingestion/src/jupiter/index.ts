@@ -1,8 +1,12 @@
-import "dotenv/config";
-import { connectDriftWS, type DriftWsHandle } from "./drift.ws";
-import { driftTradeToInsert, driftOrderbookToMidTick } from "./drift.transform";
-import { fetchDriftTrades } from "./drift.api";
-import { resolveMarketsToTrack } from "./drift.markets";
+import * as path from "path";
+import * as dotenv from "dotenv";
+dotenv.config({ path: path.resolve(__dirname, "../../.env") });
+import { createJupiterPoller } from "./jupiter.poller";
+import {
+  jupiterTradeToInsert,
+  jupiterOrderbookToMidTick,
+} from "./jupiter.transform";
+import { resolveMarketsToTrack } from "./jupiter.markets";
 import { insertTradeBatch } from "../../../storage/src/db";
 import { insertMidTick } from "../../../storage/src/insertMidTick";
 import { updateAggregateBuffered } from "../../../aggregates/src/updateAggregate";
@@ -11,20 +15,25 @@ import type { TradeInsert } from "../../../storage/src/types";
 import * as fs from "fs";
 
 // ── Config ──────────────────────────────────────────────────────────
-const TRADE_BUFFER_MAX = Number(process.env.DRIFT_TRADE_BUFFER_MAX ?? 100);
+const TRADE_BUFFER_MAX = Number(process.env.JUP_TRADE_BUFFER_MAX ?? 100);
 const TRADE_BUFFER_FLUSH_MS = Number(
-  process.env.DRIFT_TRADE_BUFFER_FLUSH_MS ?? 1000
+  process.env.JUP_TRADE_BUFFER_FLUSH_MS ?? 1000
 );
 const TRADE_DEDUPE_TTL_MS = Number(
-  process.env.DRIFT_TRADE_DEDUPE_TTL_MS ?? 10 * 60_000
+  process.env.JUP_TRADE_DEDUPE_TTL_MS ?? 10 * 60_000
 );
-const SLUG_SYNC_MS = Number(process.env.DRIFT_SLUG_SYNC_MS ?? 30_000);
-const BACKFILL_ON_START = process.env.DRIFT_BACKFILL_ON_START !== "0";
-const BACKFILL_LIMIT = Number(process.env.DRIFT_BACKFILL_LIMIT ?? 100);
+const SLUG_SYNC_MS = Number(process.env.JUP_SLUG_SYNC_MS ?? 30_000);
+// Free tier: 1 RPS. Trades poll every 5s + orderbook round-robin with 1.5s gap
+// between each request. 10 markets = full orderbook cycle every ~15s.
+const TRADE_POLL_MS = Number(process.env.JUP_TRADE_POLL_MS ?? 5_000);
+const MIN_REQUEST_GAP_MS = Number(process.env.JUP_MIN_REQUEST_GAP_MS ?? 1_500);
+// Max markets to poll orderbooks for (top N by 24h volume).
+// Trades are tracked for ALL discovered markets regardless.
+const MAX_ORDERBOOK_MARKETS = Number(process.env.JUP_MAX_ORDERBOOK_MARKETS ?? 20);
 const SPOOL_PATH =
-  process.env.DRIFT_SPOOL_PATH ?? "/tmp/mmi-drift-trade-spool.ndjson";
+  process.env.JUP_SPOOL_PATH ?? "/tmp/mmi-jup-trade-spool.ndjson";
 
-// Movement gating — same logic as Polymarket adapter
+// Movement gating
 const MOVEMENT_MIN_MS = Number(process.env.MOVEMENT_MIN_MS ?? 10_000);
 const MOVEMENT_MIN_STEP = Number(process.env.MOVEMENT_MIN_STEP ?? 0.01);
 
@@ -34,15 +43,15 @@ const tradeBuffer: TradeInsert[] = [];
 let flushTimer: NodeJS.Timeout | null = null;
 let insertFailCount = 0;
 const INSERT_FAIL_THRESHOLD = 3;
+const trackedMarketIds = new Set<string>(); // raw Jupiter market IDs
 
-// Movement gating per market:outcome
 const lastMovementGate = new Map<
   string,
   { price: number; ts: number }
 >();
 
 // ── Logging ─────────────────────────────────────────────────────────
-const LOG_PATH = process.env.DRIFT_LOG_PATH ?? "/tmp/mmi-drift.log";
+const LOG_PATH = process.env.JUP_LOG_PATH ?? "/tmp/mmi-jupiter.log";
 const logStream = fs.createWriteStream(LOG_PATH, { flags: "a" });
 const origLog = console.log;
 const origWarn = console.warn;
@@ -51,7 +60,6 @@ const origError = console.error;
 function stamp() {
   return new Date().toISOString();
 }
-
 console.log = (...args: any[]) => {
   const line = `${stamp()} [LOG] ${args.join(" ")}\n`;
   logStream.write(line);
@@ -70,13 +78,11 @@ console.error = (...args: any[]) => {
 
 // ── Trade dedup ─────────────────────────────────────────────────────
 function isDuplicateTrade(id: string): boolean {
-  const now = Date.now();
   if (recentTrades.has(id)) return true;
-  recentTrades.set(id, now);
+  recentTrades.set(id, Date.now());
   return false;
 }
 
-// Periodic eviction
 setInterval(() => {
   const cutoff = Date.now() - TRADE_DEDUPE_TTL_MS;
   for (const [id, ts] of recentTrades) {
@@ -84,18 +90,18 @@ setInterval(() => {
   }
 }, 60_000);
 
-// ── Spool to disk on repeated failures ──────────────────────────────
+// ── Spool ───────────────────────────────────────────────────────────
 function appendToSpool(trades: TradeInsert[]) {
   try {
     const lines = trades.map((t) => JSON.stringify(t)).join("\n") + "\n";
     fs.appendFileSync(SPOOL_PATH, lines);
-    console.warn(`[drift] spooled ${trades.length} trades to ${SPOOL_PATH}`);
+    console.warn(`[jup] spooled ${trades.length} trades to ${SPOOL_PATH}`);
   } catch (err: any) {
-    console.error("[drift] spool write failed:", err?.message);
+    console.error("[jup] spool write failed:", err?.message);
   }
 }
 
-// ── Trade buffer flush ──────────────────────────────────────────────
+// ── Trade buffer ────────────────────────────────────────────────────
 async function flushTradeBuffer() {
   if (tradeBuffer.length === 0) return;
   const batch = tradeBuffer.splice(0, tradeBuffer.length);
@@ -111,7 +117,7 @@ async function flushTradeBuffer() {
   } catch (err: any) {
     insertFailCount++;
     console.error(
-      `[drift] trade insert failed (${insertFailCount}/${INSERT_FAIL_THRESHOLD}):`,
+      `[jup] trade insert failed (${insertFailCount}/${INSERT_FAIL_THRESHOLD}):`,
       err?.message
     );
     appendToSpool(batch);
@@ -145,45 +151,7 @@ function shouldDetect(trade: TradeInsert): boolean {
     lastMovementGate.set(gateKey, { price: trade.price, ts: now });
     return true;
   }
-
   return false;
-}
-
-// ── Backfill ────────────────────────────────────────────────────────
-async function backfillMarket(marketName: string) {
-  console.log(`[drift] backfilling ${marketName} (limit=${BACKFILL_LIMIT})`);
-  try {
-    const rawTrades = await fetchDriftTrades(marketName, {
-      limit: BACKFILL_LIMIT,
-    });
-
-    let inserted = 0;
-    const batch: TradeInsert[] = [];
-
-    for (const raw of rawTrades) {
-      const trade = driftTradeToInsert(raw);
-      if (!trade) continue;
-      if (isDuplicateTrade(trade.id)) continue;
-      batch.push(trade);
-      inserted++;
-    }
-
-    if (batch.length > 0) {
-      await insertTradeBatch(batch);
-      for (const t of batch) {
-        await updateAggregateBuffered(t);
-      }
-    }
-
-    console.log(
-      `[drift] backfilled ${inserted} trades for ${marketName}`
-    );
-  } catch (err: any) {
-    console.error(
-      `[drift] backfill failed for ${marketName}:`,
-      err?.message
-    );
-  }
 }
 
 // ── Main ────────────────────────────────────────────────────────────
@@ -192,27 +160,49 @@ let tickCount = 0;
 
 async function main() {
   console.log("═══════════════════════════════════════════════════════");
-  console.log("[drift] Drift BET ingestion starting...");
-  console.log(`[drift] log → ${LOG_PATH}`);
-  console.log(`[drift] spool → ${SPOOL_PATH}`);
+  console.log("[jup] Jupiter Prediction Market ingestion starting...");
+  console.log(`[jup] log → ${LOG_PATH}`);
+  console.log(`[jup] spool → ${SPOOL_PATH}`);
+  console.log(
+    `[jup] trade poll: ${TRADE_POLL_MS}ms, orderbook gap: ${MIN_REQUEST_GAP_MS}ms`
+  );
+  const hasKey = !!(process.env.JUP_API_KEY);
+  console.log(`[jup] API key: ${hasKey ? "loaded" : "MISSING — get one at portal.jup.ag"}`);
   console.log("═══════════════════════════════════════════════════════");
 
-  // 1. Discover markets to track
-  const marketNames = await resolveMarketsToTrack();
-  if (marketNames.length === 0) {
+  // 1. Discover markets
+  const markets = await resolveMarketsToTrack();
+  if (markets.length === 0) {
     console.warn(
-      "[drift] no markets to track — add drift: slugs to tracked_slugs or set DRIFT_AUTO_DISCOVER=1"
+      "[jup] no markets to track — add jup: slugs to tracked_slugs or set JUP_AUTO_DISCOVER=1"
     );
   } else {
     console.log(
-      `[drift] tracking ${marketNames.length} markets: ${marketNames.join(", ")}`
+      `[jup] tracking ${markets.length} markets`
     );
+    for (const m of markets.slice(0, 10)) {
+      console.log(`  → ${m.title} (${m.marketId.slice(0, 20)}...)`);
+    }
+    if (markets.length > 10) {
+      console.log(`  ... and ${markets.length - 10} more`);
+    }
   }
 
-  // 2. Connect WebSocket
-  const wsHandle: DriftWsHandle = connectDriftWS({
+  // Build tracked set for trade filtering
+  for (const m of markets) trackedMarketIds.add(m.marketId);
+
+  // 2. Create poller
+  const poller = createJupiterPoller({
+    tradePollMs: TRADE_POLL_MS,
+    minRequestGapMs: MIN_REQUEST_GAP_MS,
+
     onTrade: async (raw) => {
-      const trade = driftTradeToInsert(raw);
+      // Filter: only process trades for tracked markets
+      if (trackedMarketIds.size > 0 && !trackedMarketIds.has(raw.marketId)) {
+        return;
+      }
+
+      const trade = jupiterTradeToInsert(raw);
       if (!trade) return;
       if (isDuplicateTrade(trade.id)) return;
 
@@ -226,31 +216,31 @@ async function main() {
         scheduleFlush();
       }
 
-      // Aggregate update (buffered)
+      // Aggregate
       try {
         await updateAggregateBuffered(trade);
       } catch (err: any) {
-        console.error("[drift] aggregate error:", err?.message);
+        console.error("[jup] aggregate error:", err?.message);
       }
 
-      // Movement detection (gated)
+      // Movement detection
       if (shouldDetect(trade)) {
         try {
           await detectMovement(trade);
         } catch (err: any) {
-          console.error("[drift] detectMovement error:", err?.message);
+          console.error("[jup] detectMovement error:", err?.message);
         }
       }
 
       if (tradeCount % 50 === 0) {
         console.log(
-          `[drift] ${tradeCount} trades processed, ${tickCount} ticks`
+          `[jup] ${tradeCount} trades processed, ${tickCount} ticks`
         );
       }
     },
 
-    onOrderbook: async (raw) => {
-      const tick = driftOrderbookToMidTick(raw);
+    onOrderbook: async (marketId, book) => {
+      const tick = jupiterOrderbookToMidTick(marketId, book);
       if (!tick) return;
 
       tickCount++;
@@ -260,66 +250,74 @@ async function main() {
       } catch (err: any) {
         const msg = err?.message ?? "";
         if (!msg.includes("duplicate key")) {
-          console.error("[drift] mid-tick error:", msg);
+          console.error("[jup] mid-tick error:", msg);
         }
       }
     },
   });
 
-  // 3. Subscribe to all tracked markets
-  for (const name of marketNames) {
-    wsHandle.subscribe(name);
+  // 3. Start trade polling
+  poller.startTradePoller();
+
+  // 4. Start orderbook polling for top N markets by 24h volume
+  const orderbookMarkets = [...markets]
+    .sort((a, b) => b.volume24h - a.volume24h)
+    .slice(0, MAX_ORDERBOOK_MARKETS);
+
+  console.log(
+    `[jup] orderbook polling top ${orderbookMarkets.length} of ${markets.length} markets by volume`
+  );
+  for (const m of orderbookMarkets) {
+    poller.addOrderbookMarket(m.marketId);
   }
 
-  // 4. Backfill recent trades
-  if (BACKFILL_ON_START && marketNames.length > 0) {
-    console.log("[drift] backfilling recent trades...");
-    for (const name of marketNames) {
-      await backfillMarket(name);
-    }
-    console.log("[drift] backfill complete");
-  }
-
-  // 5. Periodic slug sync — add/remove subscriptions dynamically
+  // 5. Periodic market sync — add/remove markets dynamically
   setInterval(async () => {
     try {
-      const current = new Set(wsHandle.subscribedMarkets());
-      const desired = new Set(await resolveMarketsToTrack());
+      const desired = await resolveMarketsToTrack();
 
-      // Subscribe to new markets
-      for (const name of desired) {
-        if (!current.has(name)) {
-          wsHandle.subscribe(name);
-          if (BACKFILL_ON_START) {
-            await backfillMarket(name);
-          }
+      // Update trade tracking set (all markets)
+      trackedMarketIds.clear();
+      for (const m of desired) trackedMarketIds.add(m.marketId);
+
+      // Orderbook: only top N by volume
+      const topN = [...desired]
+        .sort((a, b) => b.volume24h - a.volume24h)
+        .slice(0, MAX_ORDERBOOK_MARKETS);
+      const desiredOB = new Set(topN.map((m) => m.marketId));
+      const currentOB = new Set(poller.orderbookMarkets());
+
+      // Add new top markets
+      for (const m of topN) {
+        if (!currentOB.has(m.marketId)) {
+          poller.addOrderbookMarket(m.marketId);
         }
       }
 
-      // Unsubscribe from removed markets
-      for (const name of current) {
-        if (!desired.has(name)) {
-          wsHandle.unsubscribe(name);
+      // Remove markets that dropped out of top N
+      for (const id of currentOB) {
+        if (!desiredOB.has(id)) {
+          poller.removeOrderbookMarket(id);
         }
       }
     } catch (err: any) {
-      console.error("[drift] slug sync error:", err?.message);
+      console.error("[jup] market sync error:", err?.message);
     }
   }, SLUG_SYNC_MS);
 
-  // 6. Periodic stats
+  // 6. Stats
   setInterval(() => {
     console.log(
-      `[drift] stats: ${tradeCount} trades, ${tickCount} ticks, ` +
+      `[jup] stats: ${tradeCount} trades, ${tickCount} ticks, ` +
         `buffer=${tradeBuffer.length}, dedup=${recentTrades.size}, ` +
-        `markets=${wsHandle.subscribedMarkets().length}`
+        `markets=${trackedMarketIds.size}`
     );
   }, 60_000);
 
   // Graceful shutdown
   const shutdown = () => {
-    console.log("[drift] shutting down...");
-    wsHandle.close();
+    console.log("[jup] shutting down...");
+    poller.close();
     void flushTradeBuffer().then(() => {
       logStream.end();
       process.exit(0);
@@ -331,6 +329,6 @@ async function main() {
 }
 
 main().catch((err) => {
-  console.error("[drift] fatal:", err);
+  console.error("[jup] fatal:", err);
   process.exit(1);
 });

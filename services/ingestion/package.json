@@ -5,7 +5,7 @@
   "main": "src/index.ts",
   "scripts": {
     "start": "npx ts-node src/index.ts",
-    "drift:ingest": "npx ts-node src/drift/index.ts"
+    "jup:ingest": "npx ts-node src/jupiter/index.ts"
   },
   "devDependencies": {
     "ts-node": "^10.9.2",
