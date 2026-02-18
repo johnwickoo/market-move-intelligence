@@ -1,6 +1,7 @@
 import { supabase } from "../../storage/src/db";
 import { buildExplanation } from "../../explanations/src/buildExplanation";
-import { fetchNewsScore, resolveSlugAndTitle } from "../../news/src/newsapi.client";
+import { resolveSlugAndTitle } from "../../news/src/newsapi.client";
+import { fetchRelevantNewsForMovement } from "../../news/src/fetchRelevantNews";
 import { computeTimeScore, parseTimeValue } from "./timeScore";
 import { attestSignal } from "../../chain/src/attestSignal";
 import type { SignalClassification } from "../../chain/src/types";
@@ -160,14 +161,27 @@ export async function scoreSignals(movement: any) {
   }
 
   /**
-   * 7) NEWS SCORE (0..1)
+   * 7) NEWS SCORE (0..1) — entity-aware, time-aligned news relevance
    */
   let newsScore = 0;
   let newsHeadlines: string[] = [];
   try {
-    const newsResult = await fetchNewsScore(movement.market_id);
+    const newsResult = await fetchRelevantNewsForMovement(
+      movement.market_id,
+      movement.window_end ?? new Date().toISOString(),
+      windowType
+    );
     newsScore = newsResult.score;
     newsHeadlines = newsResult.topHeadlines;
+    if (newsResult.entityContext.category !== "other") {
+      console.log(
+        "[signals] news entity:",
+        newsResult.entityContext.canonicalEntity,
+        `(${newsResult.entityContext.category})`,
+        `articles=${newsResult.articleCount}`,
+        `cached=${newsResult.cached}`
+      );
+    }
   } catch (err: any) {
     console.warn("[signals] news fetch failed, defaulting to 0", err?.message);
   }

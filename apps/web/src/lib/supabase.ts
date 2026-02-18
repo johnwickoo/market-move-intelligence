@@ -121,6 +121,63 @@ export function titleFromRaw(raw: any): string | null {
   return payload?.title ?? payload?.market_title ?? null;
 }
 
+/**
+ * Fallback: when slug matching fails (e.g. user entered "POLY-194107" but
+ * raw data has eventSlug "who-will-trump..."), find market_ids from
+ * recently active mid ticks. Works because the user tracks one market at a time.
+ */
+export async function resolveActiveMarketIds(
+  sinceMinutes = 10
+): Promise<Map<string, { slug: string; title: string; outcomes: Set<string> }>> {
+  const markets = new Map<
+    string,
+    { slug: string; title: string; outcomes: Set<string> }
+  >();
+  try {
+    const since = new Date(Date.now() - sinceMinutes * 60_000).toISOString();
+    const ticks = await pgFetch<RawTick[]>(
+      `market_mid_ticks?select=market_id,outcome,ts` +
+        `&ts=gt.${encodeURIComponent(since)}` +
+        `&order=ts.desc&limit=500`
+    );
+    const seenIds = new Set<string>();
+    for (const tk of ticks) {
+      if (!tk.market_id) continue;
+      if (!seenIds.has(tk.market_id)) {
+        seenIds.add(tk.market_id);
+        markets.set(tk.market_id, {
+          slug: tk.market_id,
+          title: tk.market_id,
+          outcomes: new Set<string>(),
+        });
+      }
+      const entry = markets.get(tk.market_id);
+      if (entry && tk.outcome) entry.outcomes.add(String(tk.outcome));
+    }
+
+    // Try to get better titles from recent trades
+    if (seenIds.size > 0) {
+      const trades = await pgFetch<RawTrade[]>(
+        `trades?select=market_id,outcome,raw` +
+          `&market_id=in.(${Array.from(seenIds).join(",")})` +
+          `&order=timestamp.desc&limit=100`
+      );
+      for (const t of trades) {
+        const entry = markets.get(t.market_id);
+        if (!entry) continue;
+        const slug = slugFromRaw(t.raw);
+        if (slug) entry.slug = slug;
+        const title = titleFromRaw(t.raw);
+        if (title) entry.title = title;
+        if (t.outcome) entry.outcomes.add(String(t.outcome));
+      }
+    }
+  } catch (err: any) {
+    console.error("[resolveActiveMarketIds] error:", err?.message);
+  }
+  return markets;
+}
+
 export function colorForOutcome(label: string): string {
   const normalized = label.trim().toLowerCase();
   if (normalized === "yes" || normalized === "up") return "#ff6a3d";

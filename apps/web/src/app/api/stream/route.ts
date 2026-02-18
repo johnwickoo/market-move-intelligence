@@ -10,6 +10,7 @@ import {
   titleFromRaw,
   fetchDominantOutcomes,
   fetchExplanations,
+  resolveActiveMarketIds,
 } from "../../../lib/supabase";
 
 function withMarketInExplanation(explanation: string, marketName: string): string {
@@ -71,6 +72,14 @@ export async function GET(req: Request) {
       };
       if (t.outcome) entry.outcomes.add(String(t.outcome));
       markets.set(t.market_id, entry);
+    }
+
+    // Fallback: if slug matching found nothing, resolve from recent activity
+    if (markets.size === 0) {
+      const active = await resolveActiveMarketIds(10);
+      for (const [id, meta] of active) {
+        markets.set(id, meta);
+      }
     }
   }
 
@@ -138,9 +147,36 @@ export async function GET(req: Request) {
     ? new Map<string, string>()
     : await fetchDominantOutcomes(marketIds);
 
+  // Detect binary markets (Yes/No, Up/Down, or any 2-outcome market)
+  // and resolve which outcome to pin to via dominant_outcomes table.
+  const BINARY_PAIRS = [["Yes", "No"], ["Up", "Down"]];
+  const binaryMarketPrimary = new Map<string, string>();
+  for (const [id, meta] of markets) {
+    const oc = meta.outcomes;
+    if (oc.size <= 2) {
+      const arr = [...oc];
+      // Check known binary pairs
+      const pair = BINARY_PAIRS.find(
+        ([a, b]) => arr.includes(a) && arr.includes(b)
+      );
+      if (pair) {
+        // Use dominant from DB (ingestion pins to index-0), or fall back to first of pair
+        binaryMarketPrimary.set(id, dominantByMarket.get(id) ?? pair[0]);
+      } else if (oc.size === 0) {
+        // No outcomes known yet — use dominant or default to "Yes"
+        binaryMarketPrimary.set(id, dominantByMarket.get(id) ?? "Yes");
+      }
+    }
+  }
+
   const shouldIncludeOutcome = (marketId: string, outcome: string | null) => {
     if (eventMarketIdSet.has(marketId)) return true;
     if (yesOnly) return String(outcome ?? "").toLowerCase() === "yes";
+    // Binary markets: only show the primary outcome (index-0)
+    const primary = binaryMarketPrimary.get(marketId);
+    if (primary) {
+      return String(outcome ?? "") === primary;
+    }
     const dominant = dominantByMarket.get(marketId);
     if (!dominant) return true;
     return outcome === dominant;

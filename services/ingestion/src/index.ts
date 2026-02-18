@@ -53,7 +53,7 @@ if (LOG_FILE) {
   };
 }
 
-const assetMeta = new Map<string, { marketId: string; outcome: string | null }>();
+const assetMeta = new Map<string, { marketId: string; outcome: string | null; outcomeIndex: number | null }>();
 const trackedAssets = new Set<string>();
 const hydratedMarkets = new Set<string>();
 const marketAssets = new Map<string, Set<string>>();
@@ -66,6 +66,7 @@ const marketMetaCache = new Map<string, { ts: number; meta: MarketMeta }>();
 const marketResolutionById = new Map<string, { ms: number; source: string }>();
 const MARKET_META_TTL_MS = Number(process.env.MARKET_META_TTL_MS ?? 10 * 60_000);
 const RESOLUTION_SKEW_MS = Number(process.env.RESOLUTION_SKEW_MS ?? 5 * 60_000);
+const RESOLUTION_GRACE_MS = Number(process.env.RESOLUTION_GRACE_MS ?? 30 * 60_000);
 const clobWss: ClobHandle[] = [];
 let clobReconnectTimer: NodeJS.Timeout | null = null;
 const MAX_CLOB_ASSETS = Number(process.env.MAX_CLOB_ASSETS ?? 20);
@@ -407,15 +408,29 @@ function extractMarketMeta(data: any): MarketMeta {
 }
 
 function isMetaResolved(meta: MarketMeta, nowMs: number): boolean {
-  if (meta.resolvedFlag === true) return true;
-  if (meta.status) {
-    const s = meta.status.toLowerCase();
-    if (["resolved", "closed", "settled", "ended"].includes(s)) return true;
-  }
-  if (meta.resolvedAtMs != null && meta.resolvedAtMs <= nowMs + RESOLUTION_SKEW_MS) {
+  // Grace period: keep tracking for RESOLUTION_GRACE_MS after the market ends/resolves.
+  // A market is only "resolved" (for tracking purposes) once the grace period has elapsed.
+  if (meta.resolvedFlag === true) {
+    const endMs = meta.resolvedAtMs ?? meta.endTimeMs;
+    // No timestamps available — can't enforce grace period here.
+    // Return false so the caller can record Date.now() and start the grace window.
+    if (endMs == null) return false;
+    if (nowMs < endMs + RESOLUTION_GRACE_MS) return false;
     return true;
   }
-  if (meta.endTimeMs != null && meta.endTimeMs <= nowMs + RESOLUTION_SKEW_MS) {
+  if (meta.status) {
+    const s = meta.status.toLowerCase();
+    if (["resolved", "closed", "settled", "ended"].includes(s)) {
+      const endMs = meta.resolvedAtMs ?? meta.endTimeMs;
+      if (endMs == null) return false;
+      if (nowMs < endMs + RESOLUTION_GRACE_MS) return false;
+      return true;
+    }
+  }
+  if (meta.resolvedAtMs != null && nowMs >= meta.resolvedAtMs + RESOLUTION_GRACE_MS) {
+    return true;
+  }
+  if (meta.endTimeMs != null && nowMs >= meta.endTimeMs + RESOLUTION_GRACE_MS) {
     return true;
   }
   return false;
@@ -641,6 +656,11 @@ async function hydrateMarket(marketId: string, eventSlug: string | null) {
     const assets = meta?.assets ?? [];
     if (meta && isMetaResolved(meta, Date.now())) {
       const ts = meta.resolvedAtMs ?? meta.endTimeMs ?? Date.now();
+      // #region agent log
+      const now = Date.now();
+      const graceEnd = ts + RESOLUTION_GRACE_MS;
+      fetch('http://127.0.0.1:7243/ingest/a2ce0bcd-2fd9-4a62-b9b6-9bec63aa6bf3',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'services/ingestion/src/index.ts:hydrate:skipResolved',message:'hydrate skip resolved market',data:{marketId:marketId.slice(0,12),slug:slugForMeta ?? null,resolvedAtMs:meta.resolvedAtMs ?? null,endTimeMs:meta.endTimeMs ?? null,now,graceEnd,graceElapsed:now>=graceEnd},timestamp:Date.now(),hypothesisId:'C'})}).catch(()=>{});
+      // #endregion agent log
       // Don't mark the parent event slug as resolved when a single child is resolved
       if (eventSlug && !isMultiMarketChild) {
         resolvedSlugs.set(eventSlug, ts);
@@ -658,11 +678,13 @@ async function hydrateMarket(marketId: string, eventSlug: string | null) {
     hydratedMarkets.add(marketId);
     if (assets.length > 0) {
       const set = new Set<string>();
-      for (const a of assets) {
+      for (let i = 0; i < assets.length; i++) {
+        const a = assets[i];
         set.add(a.assetId);
         assetMeta.set(a.assetId, {
           marketId,
           outcome: a.outcome,
+          outcomeIndex: i,  // Polymarket: array order = outcome_index
         });
         trackedAssets.add(a.assetId);
       }
@@ -799,6 +821,29 @@ function updateSelectionForMarket(marketId: string, nowMs: number) {
 function getDominantOutcome(marketId: string, nowMs: number): string | null {
   const cached = dominantOutcomeByMarket.get(marketId);
   if (cached && nowMs - cached.ts < DOMINANT_OUTCOME_TTL_MS) return cached.outcome;
+
+  // Binary markets (2 outcomes): always pin to outcome_index=0 (the primary
+  // outcome — "Yes", "Up", etc.) to prevent chart flipping.
+  // Polymarket assigns outcome_index 0 to the positive/primary outcome.
+  const assets = marketAssets.get(marketId);
+  if (assets && assets.size > 0 && assets.size <= 2) {
+    let primaryOutcome: string | null = null;
+    let outcomeCount = 0;
+    for (const assetId of assets) {
+      const m = assetMeta.get(assetId);
+      if (m?.outcome) outcomeCount++;
+      if (m?.outcomeIndex === 0 && m.outcome) primaryOutcome = m.outcome;
+    }
+    // Binary: exactly 2 outcomes (or <=2 with a known index-0)
+    if (outcomeCount <= 2 && primaryOutcome) {
+      dominantOutcomeByMarket.set(marketId, { outcome: primaryOutcome, ts: nowMs });
+      void withRetry(
+        () => upsertDominantOutcome(marketId, primaryOutcome!, new Date(nowMs).toISOString()),
+        "upsertDominantOutcome"
+      ).catch(() => {});
+      return primaryOutcome;
+    }
+  }
 
   const byAsset = marketAssetStats.get(marketId);
   if (!byAsset) return null;
@@ -1256,9 +1301,11 @@ connectPolymarketWS({
 
     const rawAssetId = String((trade as any)?.raw?.payload?.asset ?? "");
     if (rawAssetId) {
+      const existingMeta = assetMeta.get(rawAssetId);
       assetMeta.set(rawAssetId, {
         marketId: trade.market_id,
         outcome: trade.outcome ? String(trade.outcome) : null,
+        outcomeIndex: (trade as any).outcome_index ?? existingMeta?.outcomeIndex ?? null,
       });
       if (Number.isFinite(tradeTsMs)) {
         movementRealtime.onTrade(trade.market_id, rawAssetId, tradeTsMs);
@@ -1612,6 +1659,12 @@ function removeTrackedSlug(slug: string) {
 function cleanupResolvedMarket(meta: MarketMeta | null) {
   const marketId = meta?.marketId;
   if (!marketId) return;
+  // #region agent log
+  const now = Date.now();
+  const endMs = meta?.resolvedAtMs ?? meta?.endTimeMs ?? 0;
+  const graceEnd = endMs + RESOLUTION_GRACE_MS;
+  fetch('http://127.0.0.1:7243/ingest/a2ce0bcd-2fd9-4a62-b9b6-9bec63aa6bf3',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'services/ingestion/src/index.ts:cleanupResolvedMarket',message:'cleanupResolvedMarket called',data:{marketId:marketId.slice(0,12),resolvedAtMs:meta?.resolvedAtMs ?? null,endTimeMs:meta?.endTimeMs ?? null,now,graceEnd,graceElapsed:now>=graceEnd},timestamp:Date.now(),hypothesisId:'A'})}).catch(()=>{});
+  // #endregion agent log
   const normalizedId = marketId.toLowerCase();
   const assets = marketAssets.get(marketId);
   if (assets) {
@@ -1708,8 +1761,14 @@ async function syncTrackedSlugs() {
       const s = row.slug.trim();
       if (!s) continue;
       if (resolvedSlugs.has(s)) {
-        skipped += 1;
-        continue;
+        const resolvedAt = resolvedSlugs.get(s)!;
+        // Only skip if the grace period has fully elapsed
+        if (Date.now() >= resolvedAt + RESOLUTION_GRACE_MS) {
+          skipped += 1;
+          continue;
+        }
+        // Grace period still active — re-admit the slug
+        resolvedSlugs.delete(s);
       }
       const meta = await getMarketMetaForSlug(s);
       if (meta?.marketId) {
@@ -1741,9 +1800,10 @@ async function syncTrackedSlugs() {
         meta?.marketId && marketResolutionById.has(meta.marketId)
           ? marketResolutionById.get(meta.marketId)?.ms ?? null
           : null;
+      const now = Date.now();
       const resolved =
-        meta && (isMetaResolved(meta, Date.now()) ||
-        (resolvedByMarket != null && resolvedByMarket <= Date.now() + RESOLUTION_SKEW_MS));
+        meta && (isMetaResolved(meta, now) ||
+        (resolvedByMarket != null && now >= resolvedByMarket + RESOLUTION_GRACE_MS));
 
       if (resolved) {
         const ts =
@@ -1751,6 +1811,11 @@ async function syncTrackedSlugs() {
           meta?.endTimeMs ??
           resolvedByMarket ??
           Date.now();
+        // #region agent log
+        const nowLog = Date.now();
+        const graceEndLog = ts + RESOLUTION_GRACE_MS;
+        fetch('http://127.0.0.1:7243/ingest/a2ce0bcd-2fd9-4a62-b9b6-9bec63aa6bf3',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'services/ingestion/src/index.ts:slug-sync:skipResolved',message:'slug-sync skip resolved slug',data:{slug:s,resolvedAt:ts,now:nowLog,graceEnd:graceEndLog,graceElapsed:nowLog>=graceEndLog},timestamp:Date.now(),hypothesisId:'D'})}).catch(()=>{});
+        // #endregion agent log
         resolvedSlugs.set(s, ts);
         removeTrackedSlug(s);
         cleanupResolvedMarket(meta ?? null);
@@ -1759,6 +1824,16 @@ async function syncTrackedSlugs() {
         );
         skipped += 1;
         continue;
+      }
+
+      // Market flagged resolved but no timestamps — start grace timer from now.
+      // isMetaResolved returned false (to allow grace period), but we still
+      // record the resolution time so subsequent cycles can enforce the window.
+      if (meta && !resolvedSlugs.has(s) &&
+          (meta.resolvedFlag === true || (meta.status && ["resolved", "closed", "settled", "ended"].includes(meta.status.toLowerCase()))) &&
+          meta.resolvedAtMs == null && meta.endTimeMs == null) {
+        resolvedSlugs.set(s, now);
+        console.log(`[slug-sync] resolved (no timestamp), grace period starts now slug=${s}`);
       }
 
       if (!eventSlugSet.has(s)) {
@@ -1946,7 +2021,12 @@ async function onClobTick(msg: any) {
       const meta = assetMeta.get(t.assetId);
       const marketId = t.marketId || meta?.marketId;
       const outcome = meta?.outcome ?? null;
-      if (!marketId) continue;
+      if (!marketId) {
+        // #region agent log
+        fetch('http://127.0.0.1:7243/ingest/a2ce0bcd-2fd9-4a62-b9b6-9bec63aa6bf3',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'services/ingestion/src/index.ts:onClobTick:noMarketId',message:'CLOB tick skipped no marketId',data:{assetId:(t.assetId||'').slice(0,12)},timestamp:Date.now(),hypothesisId:'B'})}).catch(()=>{});
+        // #endregion agent log
+        continue;
+      }
 
       // Feed realtime detector for exactly one asset per market to avoid double-counting.
       // For Yes/No markets the primary is "Yes"; for Up/Down it's the first token.
@@ -1968,7 +2048,11 @@ async function onClobTick(msg: any) {
       try {
         if (t.mid == null || !Number.isFinite(t.mid)) continue;
         lastClobTickMs.set(t.assetId, t.tsMs);
-        if (!shouldStoreMid(t.assetId, t.bestBid, t.bestAsk, t.mid, t.tsMs)) continue;
+        const shouldStore = shouldStoreMid(t.assetId, t.bestBid, t.bestAsk, t.mid, t.tsMs);
+        // #region agent log
+        fetch('http://127.0.0.1:7243/ingest/a2ce0bcd-2fd9-4a62-b9b6-9bec63aa6bf3',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'services/ingestion/src/index.ts:onClobTick:shouldStore',message:'CLOB tick shouldStoreMid check',data:{assetId:(t.assetId||'').slice(0,12),marketId:marketId.slice(0,12),mid:t.mid,shouldStore},timestamp:Date.now(),hypothesisId:'E'})}).catch(()=>{});
+        // #endregion agent log
+        if (!shouldStore) continue;
         await withRetry(
           () =>
             insertMidTick({
@@ -1985,6 +2069,9 @@ async function onClobTick(msg: any) {
             }),
           "insertMidTick"
         );
+        // #region agent log
+        fetch('http://127.0.0.1:7243/ingest/a2ce0bcd-2fd9-4a62-b9b6-9bec63aa6bf3',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'services/ingestion/src/index.ts:onClobTick:inserted',message:'mid tick inserted from CLOB',data:{assetId:(t.assetId||'').slice(0,12),marketId:marketId.slice(0,12),mid:t.mid,tsMs:t.tsMs},timestamp:Date.now(),hypothesisId:'E'})}).catch(()=>{});
+        // #endregion agent log
 
         if (process.env.LOG_MID === "1") {
           const tsIso = new Date(t.tsMs).toISOString();

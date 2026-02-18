@@ -503,15 +503,26 @@ export default function Page(props: PageProps) {
   );
 
   // Pick outcome:
-  // 1) Prefer the outcome with the most recent annotation (signal/movement).
-  // 2) Otherwise fall back to the most recent price point.
-  // This keeps the focused outcome aligned with recent movement even when
-  // the backend hasn't provided a dominant outcome.
+  // For binary markets (Yes/No, Up/Down), always pin to the positive outcome
+  // to prevent chart swapping between outcomes on each new annotation.
+  // For multi-outcome markets, prefer the outcome with the most recent annotation.
   const selectedOutcomeLabel = useMemo(() => {
     const outcomes = selectedMarket?.outcomes ?? [];
     if (outcomes.length === 0) return "Yes";
     if (outcomes.length === 1) return outcomes[0]?.outcome ?? "Yes";
 
+    // Binary market detection — pin to positive/primary outcome
+    const POSITIVE_OUTCOMES = ["Yes", "Up"];
+    const labels = outcomes.map((o) => o.outcome);
+    const positiveOutcome = labels.find((l) => POSITIVE_OUTCOMES.includes(l));
+    if (
+      outcomes.length === 2 &&
+      positiveOutcome
+    ) {
+      return positiveOutcome;
+    }
+
+    // Multi-outcome: prefer outcome with the most recent annotation
     let bestByAnnotation: { outcome: string; ts: number } | null = null;
     for (const outcome of outcomes) {
       const annotations = outcome.annotations ?? [];
@@ -567,6 +578,17 @@ export default function Page(props: PageProps) {
 
   // ── SSE stream (extracted hook) ───────────────────────────────────
 
+  // Debounced signal refresh triggered by SSE movement events
+  const signalRefreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const signalRefreshFnRef = useRef<(() => void) | null>(null);
+  const onMovement = useCallback(() => {
+    if (signalRefreshTimerRef.current) return; // already scheduled
+    signalRefreshTimerRef.current = setTimeout(() => {
+      signalRefreshTimerRef.current = null;
+      signalRefreshFnRef.current?.();
+    }, 2000); // 2s debounce to batch rapid movements
+  }, []);
+
   const streamStatus = useMarketStream({
     slugs,
     marketIdKey,
@@ -576,6 +598,7 @@ export default function Page(props: PageProps) {
     pinnedAssetId: pinned.assetId,
     yesOnly: isMultiMarketStream,
     setMarkets,
+    onMovement,
   });
 
   const selectedOutcome = useMemo(
@@ -757,6 +780,9 @@ export default function Page(props: PageProps) {
       // silent — non-critical refresh
     }
   }, [slugs, pinned.marketId, pinned.assetId, inferredSinceHours, inferredBucketMinutes]);
+
+  // Keep the ref in sync so SSE movement events trigger signal refresh
+  signalRefreshFnRef.current = refreshSignals;
 
   // ── sync chart data ───────────────────────────────────────────────
 

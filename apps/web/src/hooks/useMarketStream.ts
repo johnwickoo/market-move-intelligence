@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type {
   MarketSnapshot,
   OutcomeSeries,
@@ -22,6 +22,7 @@ export function useMarketStream({
   pinnedAssetId,
   yesOnly,
   setMarkets,
+  onMovement,
 }: {
   slugs: string;
   marketIdKey: string;
@@ -31,8 +32,11 @@ export function useMarketStream({
   pinnedAssetId: string;
   yesOnly: boolean;
   setMarkets: React.Dispatch<React.SetStateAction<MarketSnapshot[]>>;
+  onMovement?: () => void;
 }): StreamStatus {
   const [status, setStatus] = useState<StreamStatus>("offline");
+  const onMovementRef = useRef(onMovement);
+  onMovementRef.current = onMovement;
 
   useEffect(() => {
     if (!slugs.trim() || !windowStart) return;
@@ -96,6 +100,26 @@ export function useMarketStream({
             marketById.set(childId, market);
           }
         }
+        // For binary markets (Yes/No, Up/Down), map complement outcomes
+        // to the primary/positive outcome to prevent chart swapping.
+        const BINARY_PAIRS: [string, string][] = [["Yes", "No"], ["Up", "Down"]];
+        const COMPLEMENT_TO_PRIMARY = new Map<string, string>();
+        for (const [primary, complement] of BINARY_PAIRS) {
+          COMPLEMENT_TO_PRIMARY.set(complement, primary);
+        }
+
+        const resolveBinaryOutcome = (
+          market: MarketSnapshot,
+          name: string | null
+        ): string | null => {
+          if (!name) return name;
+          if (market.outcomes.length !== 2) return name;
+          const labels = market.outcomes.map((o) => o.outcome);
+          const primary = COMPLEMENT_TO_PRIMARY.get(name);
+          if (primary && labels.includes(primary)) return primary;
+          return name;
+        };
+
         const ensureOutcome = (
           market: MarketSnapshot | null,
           name: string | null,
@@ -108,12 +132,14 @@ export function useMarketStream({
             );
             if (byMarketId) return byMarketId;
           }
-          if (!name) return null;
-          const existing = market.outcomes.find((o) => o.outcome === name);
+          // Resolve complement outcomes to primary for binary markets
+          const resolved = resolveBinaryOutcome(market, name);
+          if (!resolved) return null;
+          const existing = market.outcomes.find((o) => o.outcome === resolved);
           if (existing) return existing;
           const created: OutcomeSeries = {
-            outcome: name,
-            color: colorForOutcome(name),
+            outcome: resolved,
+            color: colorForOutcome(resolved),
             series: [],
             volumes: [],
             annotations: [],
@@ -328,6 +354,7 @@ export function useMarketStream({
     source.addEventListener("movement", (event) => {
       try {
         pendingMoves.push(JSON.parse(event.data));
+        onMovementRef.current?.();
       } catch {
         // ignore
       }

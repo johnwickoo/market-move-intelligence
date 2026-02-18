@@ -12,6 +12,7 @@ import {
   colorForIndex,
   fetchDominantOutcomes,
   fetchExplanations,
+  resolveActiveMarketIds,
 } from "../../../lib/supabase";
 
 const DEFAULT_BUCKET_MINUTES = 1;
@@ -241,6 +242,15 @@ export async function GET(req: Request) {
       if (t.outcome) entry.outcomes.add(String(t.outcome));
       markets.set(t.market_id, entry);
     }
+
+    // Fallback: if slug matching found nothing (e.g. user entered "POLY-194107"
+    // but raw data has eventSlug "who-will-trump..."), resolve from recent activity
+    if (markets.size === 0) {
+      const active = await resolveActiveMarketIds(10);
+      for (const [id, meta] of active) {
+        markets.set(id, meta);
+      }
+    }
   }
 
   // ── Group market_ids by slug to detect multi-market events ──────────
@@ -453,11 +463,22 @@ export async function GET(req: Request) {
     // ── Single market: existing logic ─────────────────────────────
     emittedSlugs.add(meta.slug);
     const dominant = dominantByMarket.get(marketId);
-    const outcomes = dominant
-      ? [dominant]
-      : meta.outcomes.size > 0
-        ? Array.from(meta.outcomes)
-        : ["Yes", "No"];
+
+    // For binary markets (Yes/No, Up/Down), always show the primary outcome
+    // (index-0). The complement is redundant (1 - primary). This prevents
+    // chart flipping when the dominant outcome oscillates based on trade volume.
+    const BINARY_PAIRS = [["Yes", "No"], ["Up", "Down"]];
+    const arr = [...meta.outcomes];
+    const binaryPair = meta.outcomes.size <= 2
+      ? BINARY_PAIRS.find(([a, b]) => arr.includes(a) && arr.includes(b))
+      : undefined;
+    const isBinary = meta.outcomes.size === 0 || !!binaryPair;
+
+    const outcomes = isBinary
+      ? [dominant ?? binaryPair?.[0] ?? "Yes"]
+      : dominant
+        ? [dominant]
+        : Array.from(meta.outcomes);
 
     console.log("[/api/markets]", {
       marketId,
