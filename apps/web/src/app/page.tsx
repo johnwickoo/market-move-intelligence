@@ -907,6 +907,11 @@ export default function Page(props: PageProps) {
           lineWidth: 2,
           priceFormat: { type: "price", precision: 3, minMove: 0.001 },
         });
+        // Anchor autoScale to the full prediction market range (0–1).
+        // These invisible lines prevent y-axis restructuring when prices
+        // collapse toward 0 or 1 during market resolution.
+        series.createPriceLine({ price: 0, color: "rgba(0,0,0,0)", lineWidth: 1, lineStyle: 0, axisLabelVisible: false });
+        series.createPriceLine({ price: 1, color: "rgba(0,0,0,0)", lineWidth: 1, lineStyle: 0, axisLabelVisible: false });
         seriesMap.set(key, series);
       } else {
         series.applyOptions({ color: outcome.color });

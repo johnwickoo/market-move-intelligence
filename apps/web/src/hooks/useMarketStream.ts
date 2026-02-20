@@ -247,6 +247,13 @@ export function useMarketStream({
               upsertDropped++;
               return;
             }
+            // Gap fill: if one or more buckets were skipped, forward-fill them
+            // with the last known price so the x-axis stays continuous.
+            if (Number.isFinite(lastMs)) {
+              for (let ms = lastMs + bucketMs; ms < Date.parse(bucketIso); ms += bucketMs) {
+                series.push({ t: new Date(ms).toISOString(), price: last.price, volume: 0 });
+              }
+            }
           }
           series.push({ t: bucketIso, price, volume: 0 });
           upsertPushedCount++;
