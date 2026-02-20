@@ -1,6 +1,5 @@
 import { supabase } from "../../storage/src/db";
 import type { TradeInsert } from "../../storage/src/types";
-import { scoreSignals } from "../../signals/src/scoreSignals";
 
 // ── Window types ──────────────────────────────────────────────────────
 // "5m" | "15m" | "1h" | "4h" are the active detection windows.
@@ -565,6 +564,16 @@ export async function detectMovement(trade: TradeInsert) {
   }
 }
 
+// Finalize delays per window type — how long to wait for momentum to settle
+// before running classification + explanation with stable data.
+const FINALIZE_DELAY_MS: Record<string, number> = {
+  "5m": 10 * 60_000,   // 10 min
+  "15m": 30 * 60_000,  // 30 min
+  "1h": 2 * 3_600_000, // 2 hours
+  "4h": 8 * 3_600_000, // 8 hours
+  "event": 15 * 60_000, // 15 min
+};
+
 async function insertMovement(
   row: MovementInsert,
   marketId: string,
@@ -572,11 +581,20 @@ async function insertMovement(
   thinLiquidity: boolean
 ): Promise<boolean> {
   // Strip the velocity field before insert — it's not a DB column.
-  // Instead embed it in reason or log it.
   const velocity = row.velocity;
   const { velocity: _v, ...dbRow } = row;
 
-  const { error: insErr } = await supabase.from("market_movements").insert(dbRow);
+  // Two-stage pipeline: insert as OPEN with a scheduled finalize time.
+  // The finalize worker will pick this up once momentum has settled,
+  // then run classification + news + explanation with stable data.
+  const delayMs = FINALIZE_DELAY_MS[row.window_type] ?? 15 * 60_000;
+  const finalizeAt = new Date(Date.now() + delayMs).toISOString();
+
+  const { error: insErr } = await supabase.from("market_movements").insert({
+    ...dbRow,
+    status: "OPEN",
+    finalize_at: finalizeAt,
+  });
   if (insErr) {
     const msg = insErr.message ?? "";
     if (msg.includes("duplicate key")) return false;
@@ -584,14 +602,13 @@ async function insertMovement(
     throw insErr;
   }
 
-  await scoreSignals({ ...dbRow, velocity });
-
   console.log(
-    `[movement] ${row.window_type}/${row.reason} market=${marketId} outcome=${outcome ?? "-"} ` +
+    `[movement] OPEN ${row.window_type}/${row.reason} market=${marketId} outcome=${outcome ?? "-"} ` +
       `drift=${row.pct_change?.toFixed(3) ?? "n/a"} range=${row.range_pct?.toFixed(3) ?? "n/a"} ` +
       `vol=${row.volume_24h.toFixed(2)} vr=${row.volume_ratio?.toFixed(2) ?? "n/a"} ` +
       `hr=${row.hourly_volume_ratio?.toFixed(2) ?? "n/a"} ` +
-      `vel=${velocity?.toFixed(4) ?? "n/a"} thin=${thinLiquidity}`
+      `vel=${velocity?.toFixed(4) ?? "n/a"} thin=${thinLiquidity} ` +
+      `finalize_at=${finalizeAt}`
   );
   return true;
 }

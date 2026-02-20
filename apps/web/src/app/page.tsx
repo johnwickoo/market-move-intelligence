@@ -7,6 +7,7 @@ import type {
   MarketSnapshot,
   OutcomeSeries,
   SeriesPoint,
+  VolumePoint,
   PinnedSelection,
 } from "../lib/types";
 import { SignalBand, LANE_HEIGHT } from "../components/SignalBand";
@@ -197,36 +198,17 @@ function buildLineData(series: SeriesPoint[]) {
   return deduped.slice(-MAX_POINTS);
 }
 
-/** Extend line data with padding at annotation boundaries so chart visible range includes signals. */
+/**
+ * Build line data for the chart. Signal bands are independently positioned
+ * by the SignalBand component using timeToCoordinate + clamping, so we do
+ * NOT need to extend the chart's visible range to cover annotation boundaries.
+ * This prevents long-window signals (e.g. 4h) from compressing the chart.
+ */
 function buildLineDataWithAnnotationPadding(
   series: SeriesPoint[],
-  annotations: Annotation[]
+  _annotations: Annotation[]
 ): Array<{ time: number; value: number }> {
-  const base = buildLineData(series);
-  if (base.length === 0 || annotations.length === 0) return base;
-
-  let minAnnSec = Infinity;
-  let maxAnnSec = -Infinity;
-  for (const ann of annotations) {
-    const startSec = Math.floor(Date.parse(ann.start_ts) / 1000);
-    const endSec = Math.floor(Date.parse(ann.end_ts) / 1000);
-    if (Number.isFinite(startSec)) minAnnSec = Math.min(minAnnSec, startSec);
-    if (Number.isFinite(endSec)) maxAnnSec = Math.max(maxAnnSec, endSec);
-  }
-  if (!Number.isFinite(minAnnSec) || !Number.isFinite(maxAnnSec)) return base;
-
-  const first = base[0];
-  const last = base[base.length - 1];
-  const result = [...base];
-  if (first && minAnnSec < first.time) {
-    result.unshift({ time: minAnnSec, value: first.value });
-    result.sort((a, b) => a.time - b.time);
-  }
-  if (last && maxAnnSec > last.time) {
-    result.push({ time: maxAnnSec, value: last.value });
-    result.sort((a, b) => a.time - b.time);
-  }
-  return result.slice(-MAX_POINTS);
+  return buildLineData(series);
 }
 
 function outcomeKey(outcome: OutcomeSeries): string {
@@ -318,6 +300,8 @@ export default function Page(props: PageProps) {
   const [lineFilterKey, setLineFilterKey] = useState<string | null>(null);
   const [signalFlash, setSignalFlash] = useState(false);
   const prevSignalCountRef = useRef(0);
+  const streamOutcomesRef = useRef<Map<string, { series: SeriesPoint[]; volumes: VolumePoint[] }> | null>(new Map());
+  const [streamUpdateCounter, setStreamUpdateCounter] = useState(0);
 
   const clearLineSeries = (
     chartOverride?: ReturnType<typeof createChart> | null
@@ -589,6 +573,47 @@ export default function Page(props: PageProps) {
     }, 2000); // 2s debounce to batch rapid movements
   }, []);
 
+  // When stream goes stale (market resolved, no more ticks), re-fetch market
+  // data. This re-resolves the slug to the next market period's market_id,
+  // which changes marketIdKey, which triggers a stream reconnect.
+  const staleRefreshRef = useRef(false);
+  const onStale = useCallback(async () => {
+    if (staleRefreshRef.current) return; // already refreshing
+    staleRefreshRef.current = true;
+    console.log("[stale] Market stale detected — re-fetching market data");
+    try {
+      const base = pinned.marketId
+        ? `/api/markets?market_id=${encodeURIComponent(pinned.marketId)}`
+        : `/api/markets?slugs=${encodeURIComponent(slugs)}`;
+      const res = await fetch(
+        `${base}&sinceHours=${inferredSinceHours}&bucketMinutes=${inferredBucketMinutes}` +
+          (pinned.assetId ? `&asset_id=${encodeURIComponent(pinned.assetId)}` : ""),
+        { cache: "no-store" }
+      );
+      if (!res.ok) return;
+      const json = await res.json();
+      const rawMarkets = Array.isArray(json.markets) ? json.markets : [];
+      const normalized = rawMarkets.map((m: MarketSnapshot) => ({
+        ...m,
+        outcomes: (m.outcomes ?? []).map((o: OutcomeSeries) => ({
+          ...o,
+          volumes: o.volumes ?? [],
+        })),
+      }));
+      if (normalized.length > 0) {
+        setMarkets(normalized);
+        const key = pinned.marketId ? `market:${pinned.marketId}` : `slugs:${slugs}`;
+        setMarketsFor(key);
+        if (json.windowStart) setWindowStart(String(json.windowStart));
+        console.log("[stale] Refreshed — new market data loaded");
+      }
+    } catch (err: any) {
+      console.error("[stale] Refresh failed:", err?.message);
+    } finally {
+      staleRefreshRef.current = false;
+    }
+  }, [slugs, pinned.marketId, pinned.assetId, inferredSinceHours, inferredBucketMinutes]);
+
   const streamStatus = useMarketStream({
     slugs,
     marketIdKey,
@@ -598,7 +623,10 @@ export default function Page(props: PageProps) {
     pinnedAssetId: pinned.assetId,
     yesOnly: isMultiMarketStream,
     setMarkets,
+    streamOutcomesRef,
+    setStreamUpdateCounter,
     onMovement,
+    onStale,
   });
 
   const selectedOutcome = useMemo(
@@ -657,6 +685,27 @@ export default function Page(props: PageProps) {
     const outcomes = selectedMarket?.outcomes ?? [];
     if (!outcomes.some((o) => outcomeKey(o) === lineFilterKey)) {
       setLineFilterKey(null);
+      return;
+    }
+    // When focused outcome has stale data but another outcome has fresh data,
+    // clear focus so we show all (fixes chart stuck when ticks go to a different child)
+    const nowMs = Date.now();
+    const focused = outcomes.find((o) => outcomeKey(o) === lineFilterKey);
+    if (!focused || outcomes.length <= 1) return;
+    const last = focused.series?.[focused.series.length - 1];
+    const focusedLastMs = last ? Date.parse(last.t) : 0;
+    if (!Number.isFinite(focusedLastMs)) return;
+    const focusedAgeMs = nowMs - focusedLastMs;
+    if (focusedAgeMs < 120_000) return; // focused has data < 2 min old, OK
+    // Focused is stale; check if another outcome has fresh data
+    for (const o of outcomes) {
+      if (outcomeKey(o) === lineFilterKey) continue;
+      const oLast = o.series?.[o.series.length - 1];
+      const oLastMs = oLast ? Date.parse(oLast.t) : 0;
+      if (Number.isFinite(oLastMs) && nowMs - oLastMs < 60_000) {
+        setLineFilterKey(null);
+        return;
+      }
     }
   }, [selectedMarket, lineFilterKey]);
 
@@ -668,6 +717,7 @@ export default function Page(props: PageProps) {
     setSignalWindows([]);
     setHoveredSignal(null);
     setLineFilterKey(null);
+    streamOutcomesRef.current?.clear();
   }, [slugs, pinned.marketId]);
 
   useEffect(() => {
@@ -818,12 +868,16 @@ export default function Page(props: PageProps) {
         series.applyOptions({ color: outcome.color });
       }
 
-      series.setData(
-        buildLineDataWithAnnotationPadding(
-          outcome.series,
-          outcome.annotations ?? []
-        )
+      const streamKey = `${selectedMarket.slug}:${outcome.outcome}`;
+      const streamData = streamOutcomesRef.current?.get(streamKey);
+      const seriesToUse = streamData?.series ?? outcome.series;
+
+      const chartData = buildLineDataWithAnnotationPadding(
+        seriesToUse,
+        outcome.annotations ?? []
       );
+      series.setData(chartData);
+
     }
 
     for (const [key, series] of seriesMap.entries()) {
@@ -831,7 +885,7 @@ export default function Page(props: PageProps) {
       chart.removeSeries(series);
       seriesMap.delete(key);
     }
-  }, [selectedMarket, lineFilterKey]);
+  }, [selectedMarket, lineFilterKey, streamUpdateCounter]);
 
   useEffect(() => {
     const volumeApi = volumeSeriesRef.current;
@@ -848,10 +902,12 @@ export default function Page(props: PageProps) {
       return;
     }
 
-    if (volumeApi) {
+    if (volumeApi && selectedMarket) {
       const bucketMap = new Map<string, { buy: number; sell: number }>();
       for (const outcome of volumeOutcomes) {
-        for (const v of outcome.volumes) {
+        const streamKey = `${selectedMarket.slug}:${outcome.outcome}`;
+        const vols = streamOutcomesRef.current?.get(streamKey)?.volumes ?? outcome.volumes;
+        for (const v of vols) {
           if (!v.t) continue;
           const entry = bucketMap.get(v.t) ?? { buy: 0, sell: 0 };
           entry.buy += Number(v.buy ?? 0);
@@ -897,15 +953,17 @@ export default function Page(props: PageProps) {
       volumeApi.setData(dedupedVol.slice(-MAX_POINTS));
     }
 
-    if (selectedOutcome) {
-      const trimmed = buildLineData(selectedOutcome.series);
+    if (selectedOutcome && selectedMarket) {
+      const streamKey = `${selectedMarket.slug}:${selectedOutcome.outcome}`;
+      const seriesForStats = streamOutcomesRef.current?.get(streamKey)?.series ?? selectedOutcome.series;
+      const trimmed = buildLineData(seriesForStats);
       if (trimmed.length > 0) {
         const values = trimmed.map((p) => p.value);
         const min = Math.min(...values);
         const max = Math.max(...values);
         const last = trimmed[trimmed.length - 1]?.value ?? 0;
-        const range = Math.max(0.0001, max - min);
-        const pct = (range / Math.max(0.0001, max)) * 100;
+        // For prediction markets (prices 0-1), show range as probability points
+        const pct = (max - min) * 100;
         setLastPrice(last);
         setRangePct(pct);
       } else {
@@ -916,7 +974,7 @@ export default function Page(props: PageProps) {
       setLastPrice(0);
       setRangePct(0);
     }
-  }, [selectedOutcome, selectedMarket, lineFilterKey]);
+  }, [selectedOutcome, selectedMarket, lineFilterKey, streamUpdateCounter]);
 
   const chartWindowLabel = `1m buckets · ${inferredSinceHours}h`;
 

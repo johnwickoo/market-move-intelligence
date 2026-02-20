@@ -38,6 +38,8 @@ function isSameTick(a: LastTick, b: LastTick) {
   );
 }
 
+const LOG_DEBUG = process.env.LOG_MID_DEBUG === "1";
+
 export async function insertMidTick(row: MidTickInsert) {
   const key = `${row.market_id}:${row.asset_id}:${row.outcome ?? ""}`;
   const current: LastTick = {
@@ -48,8 +50,20 @@ export async function insertMidTick(row: MidTickInsert) {
     spread_pct: row.spread_pct,
   };
   const prev = lastTicks.get(key);
-  if (prev && isSameTick(prev, current)) return;
+  if (prev && isSameTick(prev, current)) {
+    if (LOG_DEBUG) {
+      console.log(`[midtick:dedup] skipped (unchanged) market=${row.market_id.slice(0, 12)} mid=${row.mid} outcome=${row.outcome ?? "n/a"}`);
+    }
+    return;
+  }
   lastTicks.set(key, current);
+
+  if (LOG_DEBUG) {
+    console.log(
+      `[midtick:insert] market=${row.market_id.slice(0, 12)} outcome=${row.outcome ?? "n/a"} ` +
+      `mid=${row.mid} bid=${row.best_bid} ask=${row.best_ask} spread=${row.spread_pct?.toFixed(4) ?? "n/a"} ts=${row.ts}`
+    );
+  }
 
   const { error } = await supabase
     .from("market_mid_ticks")
@@ -57,7 +71,10 @@ export async function insertMidTick(row: MidTickInsert) {
 
   if (error) {
     const msg = error.message ?? "";
-    if (msg.includes("duplicate key")) return; // ignore duplicates
+    if (msg.includes("duplicate key")) {
+      if (LOG_DEBUG) console.log(`[midtick:dup-key] market=${row.market_id.slice(0, 12)} ts=${row.ts}`);
+      return;
+    }
     throw error;
   }
 
@@ -79,4 +96,8 @@ export async function insertMidTick(row: MidTickInsert) {
     );
 
   if (upsertErr) throw upsertErr;
+
+  if (LOG_DEBUG) {
+    console.log(`[midtick:ok] stored + upserted latest market=${row.market_id.slice(0, 12)} mid=${row.mid}`);
+  }
 }

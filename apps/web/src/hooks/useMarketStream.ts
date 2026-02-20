@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
+import { flushSync } from "react-dom";
 import type {
   MarketSnapshot,
   OutcomeSeries,
@@ -11,7 +12,7 @@ import { colorForOutcome } from "../lib/supabase";
 
 const MAX_POINTS = 5000;
 
-type StreamStatus = "offline" | "connecting" | "live" | "reconnecting" | "error";
+type StreamStatus = "offline" | "connecting" | "live" | "reconnecting" | "error" | "stale";
 
 export function useMarketStream({
   slugs,
@@ -22,7 +23,10 @@ export function useMarketStream({
   pinnedAssetId,
   yesOnly,
   setMarkets,
+  streamOutcomesRef,
+  setStreamUpdateCounter,
   onMovement,
+  onStale,
 }: {
   slugs: string;
   marketIdKey: string;
@@ -32,11 +36,16 @@ export function useMarketStream({
   pinnedAssetId: string;
   yesOnly: boolean;
   setMarkets: React.Dispatch<React.SetStateAction<MarketSnapshot[]>>;
+  streamOutcomesRef?: React.MutableRefObject<Map<string, { series: SeriesPoint[]; volumes: VolumePoint[] }> | null>;
+  setStreamUpdateCounter?: React.Dispatch<React.SetStateAction<number>>;
   onMovement?: () => void;
+  onStale?: () => void;
 }): StreamStatus {
   const [status, setStatus] = useState<StreamStatus>("offline");
   const onMovementRef = useRef(onMovement);
   onMovementRef.current = onMovement;
+  const onStaleRef = useRef(onStale);
+  onStaleRef.current = onStale;
 
   useEffect(() => {
     if (!slugs.trim() || !windowStart) return;
@@ -56,6 +65,31 @@ export function useMarketStream({
         : "");
     const source = new EventSource(streamUrl);
     setStatus("connecting");
+
+    // ── Stream diagnostics ──────────────────────────────────────────
+    let ticksReceived = 0;
+    let ticksFlushed = 0;
+    let lastTickReceivedMs = Date.now();
+    let emptyFlushes = 0;
+    let errorEvents = 0;
+    let staleFired = false; // only fire onStale once per stale period
+    const streamOpenMs = Date.now();
+    const STALE_TIMEOUT_MS = 90_000; // 90s of no ticks before declaring stale
+    const diagInterval = setInterval(() => {
+      const elapsed = ((Date.now() - streamOpenMs) / 1000).toFixed(0);
+      const sinceLast = ((Date.now() - lastTickReceivedMs) / 1000).toFixed(1);
+      console.log(
+        `[stream:diag] ${elapsed}s alive | received=${ticksReceived} flushed=${ticksFlushed}` +
+        ` emptyFlushes=${emptyFlushes} errors=${errorEvents} lastTickAgo=${sinceLast}s staleFired=${staleFired}`
+      );
+      // Detect stale market: no ticks for 90s after we've received some, fire only once
+      if (Date.now() - lastTickReceivedMs > STALE_TIMEOUT_MS && ticksReceived > 0 && !staleFired) {
+        staleFired = true;
+        console.warn(`[stream:diag] ⚠ NO TICKS for ${sinceLast}s — market likely resolved, triggering refresh`);
+        setStatus("stale");
+        onStaleRef.current?.();
+      }
+    }, 15_000);
 
     const pendingTicks: Array<{
       market_id: string;
@@ -80,9 +114,14 @@ export function useMarketStream({
         !pendingTicks.length &&
         !pendingTrades.length &&
         !pendingMoves.length
-      )
+      ) {
+        emptyFlushes++;
         return;
-      setMarkets((prev) => {
+      }
+      ticksFlushed += pendingTicks.length;
+      let committedNext: MarketSnapshot[] | null = null;
+      flushSync(() => {
+        setMarkets((prev) => {
         const next = prev.map((m) => ({
           ...m,
           outcomes: m.outcomes.map((o) => ({
@@ -174,6 +213,9 @@ export function useMarketStream({
           return new Date(bucketStart).toISOString();
         };
 
+        let upsertDropped = 0;
+        let upsertMidHits = 0;
+        let upsertPushedCount = 0;
         const upsertBucketPoint = (
           series: SeriesPoint[],
           tsMs: number,
@@ -189,13 +231,25 @@ export function useMarketStream({
           const existingIndex = series.findIndex((p) => p.t === bucketIso);
           if (existingIndex >= 0) {
             series[existingIndex].price = price;
+            upsertMidHits++;
+            if (upsertMidHits <= 3) {
+              console.log(
+                `[stream:bucket] mid-hit: idx=${existingIndex}/${series.length - 1}` +
+                ` bucket=${bucketIso.slice(11, 19)} last=${last?.t.slice(11, 19)}` +
+                ` price=${price.toFixed(4)}`
+              );
+            }
             return;
           }
           if (last) {
             const lastMs = Date.parse(last.t);
-            if (Number.isFinite(lastMs) && tsMs < lastMs) return;
+            if (Number.isFinite(lastMs) && tsMs < lastMs) {
+              upsertDropped++;
+              return;
+            }
           }
           series.push({ t: bucketIso, price, volume: 0 });
+          upsertPushedCount++;
         };
 
         const upsertVolumeBucket = (
@@ -222,12 +276,27 @@ export function useMarketStream({
           }
         };
 
-        for (const tick of pendingTicks.splice(0)) {
+        let ticksApplied = 0;
+        let ticksNoMarket = 0;
+        let ticksNoOutcome = 0;
+        let ticksOldTs = 0;
+        const allPending = pendingTicks.splice(0);
+        for (const tick of allPending) {
           const market = marketById.get(tick.market_id) ?? null;
+          if (!market) {
+            ticksNoMarket++;
+            continue;
+          }
           const outcome = ensureOutcome(market, tick.outcome, tick.market_id);
-          if (!outcome) continue;
+          if (!outcome) {
+            ticksNoOutcome++;
+            continue;
+          }
           const tsMs = Date.parse(tick.ts);
-          if (!Number.isFinite(tsMs) || tsMs < baseMs) continue;
+          if (!Number.isFinite(tsMs) || tsMs < baseMs) {
+            ticksOldTs++;
+            continue;
+          }
           if (useRawTicks) {
             const last = outcome.series[outcome.series.length - 1];
             if (last && last.t === tick.ts) {
@@ -242,9 +311,28 @@ export function useMarketStream({
           } else {
             upsertBucketPoint(outcome.series, tsMs, tick.mid);
           }
+          ticksApplied++;
           if (outcome.series.length > MAX_POINTS) {
             outcome.series.splice(0, outcome.series.length - MAX_POINTS);
           }
+        }
+
+        // Log flush diagnostics every ~5s or on drops or mid-hits
+        const shouldLogFlush = allPending.length > 0 && (
+          ticksNoMarket > 0 || ticksNoOutcome > 0 || ticksOldTs > 0 || upsertDropped > 0 || upsertMidHits > 0 ||
+          (ticksFlushed % 100 < allPending.length) // log every ~100 ticks
+        );
+        if (shouldLogFlush) {
+          const lastTick = allPending[allPending.length - 1];
+          const outcomeLens = next.flatMap((m) =>
+            (m.outcomes ?? []).map((o) => `${m.slug}:${o.outcome}=${o.series.length}`)
+          );
+          console.log(
+            `[stream:flush] pending=${allPending.length} applied=${ticksApplied} pushed=${upsertPushedCount} midHits=${upsertMidHits}` +
+            ` dropped(noMarket=${ticksNoMarket} noOutcome=${ticksNoOutcome} oldTs=${ticksOldTs} bucket=${upsertDropped})` +
+            ` outcomeSeries=[${outcomeLens.join(", ")}]` +
+            ` lastTick: mid=${lastTick?.mid?.toFixed(4)} outcome=${lastTick?.outcome} market=${lastTick?.market_id?.slice(0, 16)} ts=${lastTick?.ts?.slice(11, 23)}`
+          );
         }
 
         for (const tr of pendingTrades.splice(0)) {
@@ -311,17 +399,35 @@ export function useMarketStream({
           applyAnnotation(outcome);
         }
 
+        committedNext = next;
         return next;
       });
+      });
+      const committed = committedNext as MarketSnapshot[] | null;
+      if (committed && streamOutcomesRef?.current) {
+        for (const m of committed) {
+          for (const o of m.outcomes ?? []) {
+            const key = `${m.slug}:${o.outcome}`;
+            streamOutcomesRef.current.set(key, {
+              series: [...o.series],
+              volumes: [...o.volumes],
+            });
+          }
+        }
+        setStreamUpdateCounter?.((c) => c + 1);
+      }
     };
 
-    const interval = setInterval(flush, 500);
+    const interval = setInterval(flush, 250);
 
     source.addEventListener("open", () => setStatus("live"));
     source.addEventListener("error", () => {
+      errorEvents++;
       if (source.readyState === EventSource.CLOSED) {
+        console.error(`[stream:diag] EventSource CLOSED after ${((Date.now() - streamOpenMs) / 1000).toFixed(0)}s`);
         setStatus("error");
       } else {
+        console.warn(`[stream:diag] EventSource reconnecting (error #${errorEvents})`);
         setStatus("reconnecting");
       }
     });
@@ -336,6 +442,12 @@ export function useMarketStream({
           return;
         }
         pendingTicks.push(payload);
+        ticksReceived++;
+        lastTickReceivedMs = Date.now();
+        if (staleFired) {
+          staleFired = false;
+          setStatus("live");
+        }
       } catch {
         // ignore
       }
@@ -359,10 +471,25 @@ export function useMarketStream({
         // ignore
       }
     });
+    source.addEventListener("rotate", (event) => {
+      try {
+        const data = JSON.parse(event.data);
+        console.log(`[stream] rotate event: server re-resolved to market_ids=${JSON.stringify(data.market_ids)}`);
+        // Trigger stale handler to re-fetch historical data for new market
+        onStaleRef.current?.();
+      } catch {
+        // ignore
+      }
+    });
 
     return () => {
       clearInterval(interval);
+      clearInterval(diagInterval);
       source.close();
+      console.log(
+        `[stream:diag] cleanup: received=${ticksReceived} flushed=${ticksFlushed}` +
+        ` errors=${errorEvents} alive=${((Date.now() - streamOpenMs) / 1000).toFixed(0)}s`
+      );
     };
   }, [
     slugs,

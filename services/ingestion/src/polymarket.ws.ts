@@ -13,7 +13,8 @@ export function connectPolymarketWS(opts: {
   let staleTimer: NodeJS.Timeout | null = null;
   let lastMessageAt = Date.now();
   let backoffMs = 5_000;
-  const maxBackoffMs = 60_000;
+  const maxBackoffMs = 120_000;
+  let rateLimited = false;
   const staleMs = opts.staleMs ?? Number(process.env.WS_STALE_MS ?? 60_000);
   const staleCheckMs = opts.staleCheckMs ?? Number(process.env.WS_STALE_CHECK_MS ?? 10_000);
 
@@ -93,13 +94,25 @@ export function connectPolymarketWS(opts: {
       if (staleTimer) clearInterval(staleTimer);
       staleTimer = null;
       console.log("[ws] closed");
-      backoffMs = Math.min(backoffMs * 2, maxBackoffMs);
+      // Don't double-bump backoff — error handler already set it for 429
+      if (!rateLimited) {
+        backoffMs = Math.min(backoffMs * 2, maxBackoffMs);
+      }
+      rateLimited = false;
       scheduleReconnect("socket closed");
     });
 
-    ws.on("error", (err: Error) => {
-      console.error("[ws] error", err);
-      backoffMs = Math.min(backoffMs * 2, maxBackoffMs);
+    ws.on("error", (err: any) => {
+      const msg = String(err?.message ?? "");
+      // 429 = rate limited at HTTP upgrade level — use longer backoff
+      if (msg.includes("429")) {
+        rateLimited = true;
+        backoffMs = Math.min(Math.max(backoffMs * 2, 30_000), maxBackoffMs);
+        console.warn(`[ws] rate limited (429) — backing off ${Math.round(backoffMs / 1000)}s`);
+      } else {
+        console.error("[ws] error", err);
+        backoffMs = Math.min(backoffMs * 2, maxBackoffMs);
+      }
     });
   };
 

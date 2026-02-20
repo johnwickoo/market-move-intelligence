@@ -118,7 +118,7 @@ export async function GET(req: Request) {
     }
   }
 
-  const marketIds = Array.from(markets.keys());
+  let marketIds = Array.from(markets.keys());
   if (marketIds.length === 0) {
     const encoder = new TextEncoder();
     const body = encoder.encode(
@@ -187,6 +187,15 @@ export async function GET(req: Request) {
   let poll: ReturnType<typeof setInterval> | null = null;
   let stop: (() => void) | null = null;
   let closed = false;
+  let polling = false; // overlap guard
+  let pollCount = 0;
+  let totalTicksSent = 0;
+  let emptyPolls = 0;
+  let consecutiveEmptyPolls = 0;
+  let errorCount = 0;
+  let lastReResolveMs = 0;
+  const streamStartMs = Date.now();
+  const STALE_THRESHOLD = 90; // consecutive empty polls (~90s) before re-resolving
 
   const stream = new ReadableStream({
     start(controller) {
@@ -199,6 +208,10 @@ export async function GET(req: Request) {
         if (heartbeat) clearInterval(heartbeat);
         if (!closed) {
           closed = true;
+          console.log(
+            `[stream] closed after ${((Date.now() - streamStartMs) / 1000).toFixed(0)}s` +
+            ` polls=${pollCount} ticks=${totalTicksSent} empty=${emptyPolls} errors=${errorCount}`
+          );
           try {
             controller.close();
           } catch {
@@ -211,7 +224,8 @@ export async function GET(req: Request) {
         if (closed) return;
         try {
           controller.enqueue(chunk);
-        } catch {
+        } catch (err: any) {
+          console.error(`[stream] enqueue error, closing:`, err?.message);
           closed = true;
           if (stop) stop();
         }
@@ -241,6 +255,7 @@ export async function GET(req: Request) {
           );
 
           const seen = new Set<string>();
+          let burstCount = 0;
           for (const tk of latestTicks) {
             if (tk.mid == null) continue;
             if (!shouldIncludeOutcome(tk.market_id, tk.outcome)) continue;
@@ -250,6 +265,7 @@ export async function GET(req: Request) {
             if (seen.has(key)) continue;
             seen.add(key);
             lastTickIso = tk.ts > lastTickIso ? tk.ts : lastTickIso;
+            burstCount++;
             send("tick", {
               market_id: tk.market_id,
               outcome: tk.outcome,
@@ -259,29 +275,81 @@ export async function GET(req: Request) {
               bucketMinutes,
             });
           }
+          totalTicksSent += burstCount;
+          // Log what the stream is tracking for diagnosis
+          const primaryOutcomes: string[] = [];
+          for (const [id, primary] of binaryMarketPrimary) {
+            primaryOutcomes.push(`${id.slice(0, 16)}→${primary}`);
+          }
+          console.log(
+            `[stream] init: markets=[${marketIds.map((id) => id.slice(0, 16)).join(",")}]` +
+            ` binaryPrimary=[${primaryOutcomes.join(",")}]` +
+            ` burst=${burstCount}/${latestTicks.length} ticks, cursor=${lastTickIso}`
+          );
         } catch (err: any) {
+          console.error(`[stream] burst error:`, err?.message);
           send("error", { message: err?.message ?? "stream error" });
         }
       })();
 
       poll = setInterval(async () => {
-        try {
-          const midTicks = await pgFetch<RawTick[]>(
-            `market_mid_ticks?select=market_id,outcome,asset_id,ts,mid` +
-              `&market_id=in.(${marketIds.join(",")})` +
-              (assetIds.length > 0
-                ? `&asset_id=in.(${assetIds.map(encodeURIComponent).join(",")})`
-                : "") +
-              `&ts=gt.${encodeURIComponent(lastTickIso)}` +
-              `&order=ts.asc&limit=2000`
-          );
+        // Prevent overlapping polls — if previous poll is still running, skip
+        if (polling) {
+          console.warn(`[stream] poll overlap skipped (poll #${pollCount} still running)`);
+          return;
+        }
+        polling = true;
+        pollCount++;
+        const pollStartMs = Date.now();
+        const currentPoll = pollCount;
 
+        try {
+          // Use allSettled so one failed query doesn't kill the others
+          const [ticksResult, tradesResult, movesResult] = await Promise.allSettled([
+            pgFetch<RawTick[]>(
+              `market_mid_ticks?select=market_id,outcome,asset_id,ts,mid` +
+                `&market_id=in.(${marketIds.join(",")})` +
+                (assetIds.length > 0
+                  ? `&asset_id=in.(${assetIds.map(encodeURIComponent).join(",")})`
+                  : "") +
+                `&ts=gt.${encodeURIComponent(lastTickIso)}` +
+                `&order=ts.asc&limit=2000`
+            ),
+            pgFetch<RawTrade[]>(
+              `trades?select=market_id,outcome,timestamp,size,side` +
+                `&market_id=in.(${marketIds.join(",")})` +
+                `&timestamp=gt.${encodeURIComponent(lastTradeIso)}` +
+                `&order=timestamp.asc&limit=2000`
+            ),
+            pgFetch<RawMovement[]>(
+              `market_movements?select=id,market_id,outcome,window_start,window_end,window_type,reason` +
+                `&market_id=in.(${Array.from(
+                  new Set([...marketIds, ...eventMarketIds])
+                )
+                  .map(encodeURIComponent)
+                  .join(",")})` +
+                `&window_end=gt.${encodeURIComponent(lastMoveIso)}` +
+                `&order=window_end.asc&limit=200`
+            ),
+          ]);
+
+          // Process ticks (even if trades/moves failed)
+          const midTicks = ticksResult.status === "fulfilled" ? ticksResult.value : [];
+          if (ticksResult.status === "rejected") {
+            errorCount++;
+            console.error(`[stream] tick query failed poll #${currentPoll}:`, ticksResult.reason?.message);
+          }
+
+          let ticksSentThisPoll = 0;
+          let ticksFilteredOutcome = 0;
+          let ticksFilteredAsset = 0;
+          let ticksFilteredNull = 0;
           for (const tk of midTicks) {
-            if (tk.mid == null) continue;
-            if (!shouldIncludeOutcome(tk.market_id, tk.outcome)) continue;
-            if (assetIdSet && tk.asset_id && !assetIdSet.has(tk.asset_id))
-              continue;
+            if (tk.mid == null) { ticksFilteredNull++; continue; }
+            if (!shouldIncludeOutcome(tk.market_id, tk.outcome)) { ticksFilteredOutcome++; continue; }
+            if (assetIdSet && tk.asset_id && !assetIdSet.has(tk.asset_id)) { ticksFilteredAsset++; continue; }
             lastTickIso = tk.ts > lastTickIso ? tk.ts : lastTickIso;
+            ticksSentThisPoll++;
             send("tick", {
               market_id: tk.market_id,
               outcome: tk.outcome,
@@ -291,13 +359,14 @@ export async function GET(req: Request) {
               bucketMinutes,
             });
           }
+          totalTicksSent += ticksSentThisPoll;
 
-          const trades = await pgFetch<RawTrade[]>(
-            `trades?select=market_id,outcome,timestamp,size,side` +
-              `&market_id=in.(${marketIds.join(",")})` +
-              `&timestamp=gt.${encodeURIComponent(lastTradeIso)}` +
-              `&order=timestamp.asc&limit=2000`
-          );
+          // Process trades (even if ticks/moves failed)
+          const trades = tradesResult.status === "fulfilled" ? tradesResult.value : [];
+          if (tradesResult.status === "rejected") {
+            errorCount++;
+            console.error(`[stream] trade query failed poll #${currentPoll}:`, tradesResult.reason?.message);
+          }
 
           for (const tr of trades) {
             if (!shouldIncludeOutcome(tr.market_id, tr.outcome)) continue;
@@ -313,16 +382,12 @@ export async function GET(req: Request) {
             });
           }
 
-          const moves = await pgFetch<RawMovement[]>(
-            `market_movements?select=id,market_id,outcome,window_start,window_end,window_type,reason` +
-              `&market_id=in.(${Array.from(
-                new Set([...marketIds, ...eventMarketIds])
-              )
-                .map(encodeURIComponent)
-                .join(",")})` +
-              `&window_end=gt.${encodeURIComponent(lastMoveIso)}` +
-              `&order=window_end.asc&limit=200`
-          );
+          // Process movements (even if ticks/trades failed)
+          const moves = movesResult.status === "fulfilled" ? movesResult.value : [];
+          if (movesResult.status === "rejected") {
+            errorCount++;
+            console.error(`[stream] moves query failed poll #${currentPoll}:`, movesResult.reason?.message);
+          }
 
           if (moves.length > 0) {
             lastMoveIso = moves[moves.length - 1].window_end;
@@ -348,10 +413,81 @@ export async function GET(req: Request) {
               explanation,
             });
           }
+
+          const pollMs = Date.now() - pollStartMs;
+          if (ticksSentThisPoll === 0) {
+            emptyPolls++;
+            consecutiveEmptyPolls++;
+          } else {
+            consecutiveEmptyPolls = 0;
+          }
+
+          // Re-resolve market_ids from slugs when stream goes stale
+          // (no ticks for STALE_THRESHOLD consecutive polls and we have slugs to re-resolve)
+          if (
+            consecutiveEmptyPolls >= STALE_THRESHOLD &&
+            totalTicksSent > 0 &&
+            slugList.length > 0 &&
+            !marketIdsParam &&
+            Date.now() - lastReResolveMs > 90_000
+          ) {
+            lastReResolveMs = Date.now();
+            console.log(`[stream] stale: ${consecutiveEmptyPolls} empty polls, re-resolving slugs=[${slugList.join(",")}]`);
+            try {
+              const freshTrades = await pgFetch<RawTrade[]>(
+                `trades?select=market_id,outcome,timestamp,raw` +
+                  `&order=timestamp.desc&limit=2000`
+              );
+              const freshMarkets = new Map<string, { slug: string; title: string; outcomes: Set<string> }>();
+              for (const t of freshTrades) {
+                const slug = slugFromRaw(t.raw);
+                if (!slug || !slugList.includes(slug)) continue;
+                const title = titleFromRaw(t.raw) ?? slug;
+                const entry = freshMarkets.get(t.market_id) ?? { slug, title, outcomes: new Set<string>() };
+                if (t.outcome) entry.outcomes.add(String(t.outcome));
+                freshMarkets.set(t.market_id, entry);
+              }
+              if (freshMarkets.size === 0) {
+                const active = await resolveActiveMarketIds(10);
+                for (const [id, meta] of active) freshMarkets.set(id, meta);
+              }
+              const newIds = Array.from(freshMarkets.keys());
+              const oldSet = new Set(marketIds);
+              const changed = newIds.some((id) => !oldSet.has(id));
+              if (changed && newIds.length > 0) {
+                marketIds = newIds;
+                consecutiveEmptyPolls = 0;
+                // Reset cursor to pick up recent ticks from new market
+                lastTickIso = new Date(Date.now() - 2 * 60 * 1000).toISOString();
+                console.log(`[stream] re-resolved: new marketIds=[${marketIds.map((id) => id.slice(0, 16)).join(",")}]`);
+                send("rotate", { market_ids: marketIds });
+              } else {
+                console.log(`[stream] re-resolve: no change (${newIds.length} markets)`);
+              }
+            } catch (err: any) {
+              console.error(`[stream] re-resolve error:`, err?.message);
+            }
+          }
+
+          // Log diagnostic every 30 polls (~30s) or on slow polls or when ticks were filtered
+          if (currentPoll % 30 === 0 || pollMs > 800 || (ticksFilteredOutcome > 0 && currentPoll <= 5)) {
+            console.log(
+              `[stream] poll #${currentPoll} ${pollMs}ms` +
+              ` ticks: sent=${ticksSentThisPoll} fetched=${midTicks.length}` +
+              ` filtered(outcome=${ticksFilteredOutcome} asset=${ticksFilteredAsset} null=${ticksFilteredNull})` +
+              ` trades=${trades.length} moves=${moves.length}` +
+              ` cursor=${lastTickIso}` +
+              ` total=${totalTicksSent} empty=${emptyPolls} errors=${errorCount}`
+            );
+          }
         } catch (err: any) {
+          errorCount++;
+          console.error(`[stream] poll #${currentPoll} uncaught error:`, err?.message);
           send("error", { message: err?.message ?? "stream error" });
+        } finally {
+          polling = false;
         }
-      }, 2000);
+      }, 1000);
     },
     cancel() {
       if (stop) stop();

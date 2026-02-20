@@ -85,7 +85,9 @@ CREATE TABLE market_movements (
   unique_price_levels_24h INTEGER,
   avg_trade_size_24h NUMERIC,
   thin_liquidity BOOLEAN,
-  window_type TEXT
+  window_type TEXT,
+  status TEXT NOT NULL DEFAULT 'FINAL',
+  finalize_at TIMESTAMPTZ
 );
 
 CREATE TABLE movement_events (

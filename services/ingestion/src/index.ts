@@ -12,6 +12,7 @@ import { updateAggregateBuffered } from "../../aggregates/src/updateAggregate";
 import { detectMovement } from "../../movements/src/detectMovement";
 import { detectEventMovement } from "../../movements/src/detectMovementEvent";
 import { movementRealtime } from "../../movements/src/detectMovementRealtime";
+import { startFinalizeWorker } from "../../movements/src/finalizeMovements";
 import { insertMidTick } from "../../storage/src/insertMidTick";
 import { insertTradeBatch, insertTrade, upsertDominantOutcome, upsertMarketResolution } from "../../storage/src/db";
 import type { TradeInsert } from "../../storage/src/types";
@@ -656,11 +657,8 @@ async function hydrateMarket(marketId: string, eventSlug: string | null) {
     const assets = meta?.assets ?? [];
     if (meta && isMetaResolved(meta, Date.now())) {
       const ts = meta.resolvedAtMs ?? meta.endTimeMs ?? Date.now();
-      // #region agent log
       const now = Date.now();
       const graceEnd = ts + RESOLUTION_GRACE_MS;
-      fetch('http://127.0.0.1:7243/ingest/a2ce0bcd-2fd9-4a62-b9b6-9bec63aa6bf3',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'services/ingestion/src/index.ts:hydrate:skipResolved',message:'hydrate skip resolved market',data:{marketId:marketId.slice(0,12),slug:slugForMeta ?? null,resolvedAtMs:meta.resolvedAtMs ?? null,endTimeMs:meta.endTimeMs ?? null,now,graceEnd,graceElapsed:now>=graceEnd},timestamp:Date.now(),hypothesisId:'C'})}).catch(()=>{});
-      // #endregion agent log
       // Don't mark the parent event slug as resolved when a single child is resolved
       if (eventSlug && !isMultiMarketChild) {
         resolvedSlugs.set(eventSlug, ts);
@@ -721,6 +719,7 @@ function shouldStoreMid(
   const prev = lastTopByAsset.get(assetId);
   if (!prev) {
     lastTopByAsset.set(assetId, { bid, ask, mid: m, bucket });
+    if (LOG_MID_DEBUG) console.log(`[mid:gate] STORE (first) asset=${assetId.slice(0, 12)} mid=${m} bid=${bid} ask=${ask}`);
     return true;
   }
 
@@ -728,9 +727,16 @@ function shouldStoreMid(
   const bucketChanged = bucket !== prev.bucket;
 
   if (changed || bucketChanged) {
+    if (LOG_MID_DEBUG) {
+      const reason = changed ? "price-changed" : "bucket-changed";
+      console.log(
+        `[mid:gate] STORE (${reason}) asset=${assetId.slice(0, 12)} mid=${m}(was ${prev.mid}) bid=${bid}(was ${prev.bid}) ask=${ask}(was ${prev.ask})`
+      );
+    }
     lastTopByAsset.set(assetId, { bid, ask, mid: m, bucket });
     return true;
   }
+  if (LOG_MID_DEBUG) console.log(`[mid:gate] SKIP (same) asset=${assetId.slice(0, 12)} mid=${m} bucket=${bucket}`);
   return false;
 }
 
@@ -1089,7 +1095,10 @@ export function toSyntheticMid(msg: any) {
 
   const bestBid = bidOk ? (bestBidRaw as number) : null;
   const bestAsk = askOk ? (bestAskRaw as number) : null;
-  if (bestBid != null && bestAsk != null && bestBid > bestAsk) return null;
+  if (bestBid != null && bestAsk != null && bestBid > bestAsk) {
+    if (LOG_MID_DEBUG) console.log(`[mid:compute] CROSSED asset=${assetId.slice(0, 12)} bid=${bestBid} ask=${bestAsk}`);
+    return null;
+  }
 
   const mid =
     bestBid != null && bestAsk != null
@@ -1100,6 +1109,11 @@ export function toSyntheticMid(msg: any) {
   const spread = bestBid != null && bestAsk != null ? bestAsk - bestBid : null;
   const spreadPct =
     spread != null && mid != null && mid > 0 ? spread / mid : null;
+
+  if (LOG_MID_DEBUG) {
+    const src = bestBid != null && bestAsk != null ? "both" : bestBid != null ? "bid-only" : "ask-only";
+    console.log(`[mid:compute] asset=${assetId.slice(0, 12)} mid=${mid} bid=${bestBid} ask=${bestAsk} spread%=${spreadPct?.toFixed(4) ?? "n/a"} src=${src}`);
+  }
 
   // guard: ignore garbage mid when spread is crazy wide
   const maxSpread = Number.isFinite(MID_MAX_SPREAD_PCT) ? MID_MAX_SPREAD_PCT : 0.30;
@@ -1149,44 +1163,14 @@ export function toSyntheticMid(msg: any) {
 
 console.log("[ingestion] starting...");
 
-// #region agent log
-fetch('http://127.0.0.1:7243/ingest/a2ce0bcd-2fd9-4a62-b9b6-9bec63aa6bf3', {
-  method: 'POST',
-  headers: { 'Content-Type': 'application/json' },
-  body: JSON.stringify({
-    id: `log_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
-    timestamp: Date.now(),
-    location: 'services/ingestion/src/index.ts:startup',
-    message: 'ingestion startup',
-    runId: 'pre-fix',
-    hypothesisId: 'H4',
-    data: {
-      hasWsUrl: !!process.env.POLYMARKET_WS_URL,
-    },
-  }),
-}).catch(() => {});
-// #endregion agent log
+// Start the two-stage finalize worker (classify + explain once momentum settles)
+startFinalizeWorker();
 
 /**
  * 1) Activity WS: Trades
  */
 const url = process.env.POLYMARKET_WS_URL;
 if (!url) {
-  // #region agent log
-  fetch('http://127.0.0.1:7243/ingest/a2ce0bcd-2fd9-4a62-b9b6-9bec63aa6bf3', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      id: `log_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
-      timestamp: Date.now(),
-      location: 'services/ingestion/src/index.ts:missing-ws-url',
-      message: 'POLYMARKET_WS_URL missing at startup',
-      runId: 'pre-fix',
-      hypothesisId: 'H5',
-      data: {},
-    }),
-  }).catch(() => {});
-  // #endregion agent log
   throw new Error("Missing POLYMARKET_WS_URL in services/ingestion/.env");
 }
 
@@ -1278,24 +1262,6 @@ connectPolymarketWS({
     if (!trade) return;
     const tradeTsMs = Date.parse(trade.timestamp);
     if (Number.isFinite(tradeTsMs) && isDuplicateTrade(trade.id, tradeTsMs)) {
-      // #region agent log
-      fetch('http://127.0.0.1:7243/ingest/a2ce0bcd-2fd9-4a62-b9b6-9bec63aa6bf3', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          id: `log_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
-          timestamp: Date.now(),
-          location: 'services/ingestion/src/index.ts:onMessage:duplicate-skip',
-          message: 'trade skipped as duplicate',
-          runId: 'pre-fix',
-          hypothesisId: 'H6',
-          data: {
-            tradeId: trade.id,
-            tradeTsMs,
-          },
-        }),
-      }).catch(() => {});
-      // #endregion agent log
       return;
     }
 
@@ -1376,26 +1342,6 @@ connectPolymarketWS({
         }, TRADE_BUFFER_FLUSH_MS);
       }
       await withRetry(() => updateAggregateBuffered(trade), "updateAggregate");
-      // #region agent log
-      fetch('http://127.0.0.1:7243/ingest/a2ce0bcd-2fd9-4a62-b9b6-9bec63aa6bf3', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          id: `log_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
-          timestamp: Date.now(),
-          location: 'services/ingestion/src/index.ts:onMessage:processed',
-          message: 'trade processed successfully',
-          runId: 'pre-fix',
-          hypothesisId: 'H7',
-          data: {
-            tradeId: trade.id,
-            marketId: trade.market_id,
-            price: trade.price,
-            size: trade.size,
-          },
-        }),
-      }).catch(() => {});
-      // #endregion agent log
 
       const nowMs = Date.parse(trade.timestamp);
       if (Number.isFinite(nowMs)) {
@@ -1453,24 +1399,6 @@ connectPolymarketWS({
       if (m.includes("duplicate key value violates unique constraint")) return;
       if (m === "spooled") return;
       console.error("[trade] insert failed:", m);
-      // #region agent log
-      fetch('http://127.0.0.1:7243/ingest/a2ce0bcd-2fd9-4a62-b9b6-9bec63aa6bf3', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          id: `log_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
-          timestamp: Date.now(),
-          location: 'services/ingestion/src/index.ts:onMessage:error',
-          message: 'trade processing threw error',
-          runId: 'pre-fix',
-          hypothesisId: 'H8',
-          data: {
-            tradeId: trade?.id ?? null,
-            errorMessage: m,
-          },
-        }),
-      }).catch(() => {});
-      // #endregion agent log
     }
   },
 });
@@ -1659,12 +1587,9 @@ function removeTrackedSlug(slug: string) {
 function cleanupResolvedMarket(meta: MarketMeta | null) {
   const marketId = meta?.marketId;
   if (!marketId) return;
-  // #region agent log
   const now = Date.now();
   const endMs = meta?.resolvedAtMs ?? meta?.endTimeMs ?? 0;
   const graceEnd = endMs + RESOLUTION_GRACE_MS;
-  fetch('http://127.0.0.1:7243/ingest/a2ce0bcd-2fd9-4a62-b9b6-9bec63aa6bf3',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'services/ingestion/src/index.ts:cleanupResolvedMarket',message:'cleanupResolvedMarket called',data:{marketId:marketId.slice(0,12),resolvedAtMs:meta?.resolvedAtMs ?? null,endTimeMs:meta?.endTimeMs ?? null,now,graceEnd,graceElapsed:now>=graceEnd},timestamp:Date.now(),hypothesisId:'A'})}).catch(()=>{});
-  // #endregion agent log
   const normalizedId = marketId.toLowerCase();
   const assets = marketAssets.get(marketId);
   if (assets) {
@@ -1811,11 +1736,8 @@ async function syncTrackedSlugs() {
           meta?.endTimeMs ??
           resolvedByMarket ??
           Date.now();
-        // #region agent log
         const nowLog = Date.now();
         const graceEndLog = ts + RESOLUTION_GRACE_MS;
-        fetch('http://127.0.0.1:7243/ingest/a2ce0bcd-2fd9-4a62-b9b6-9bec63aa6bf3',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'services/ingestion/src/index.ts:slug-sync:skipResolved',message:'slug-sync skip resolved slug',data:{slug:s,resolvedAt:ts,now:nowLog,graceEnd:graceEndLog,graceElapsed:nowLog>=graceEndLog},timestamp:Date.now(),hypothesisId:'D'})}).catch(()=>{});
-        // #endregion agent log
         resolvedSlugs.set(s, ts);
         removeTrackedSlug(s);
         cleanupResolvedMarket(meta ?? null);
@@ -2022,9 +1944,6 @@ async function onClobTick(msg: any) {
       const marketId = t.marketId || meta?.marketId;
       const outcome = meta?.outcome ?? null;
       if (!marketId) {
-        // #region agent log
-        fetch('http://127.0.0.1:7243/ingest/a2ce0bcd-2fd9-4a62-b9b6-9bec63aa6bf3',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'services/ingestion/src/index.ts:onClobTick:noMarketId',message:'CLOB tick skipped no marketId',data:{assetId:(t.assetId||'').slice(0,12)},timestamp:Date.now(),hypothesisId:'B'})}).catch(()=>{});
-        // #endregion agent log
         continue;
       }
 
@@ -2049,9 +1968,6 @@ async function onClobTick(msg: any) {
         if (t.mid == null || !Number.isFinite(t.mid)) continue;
         lastClobTickMs.set(t.assetId, t.tsMs);
         const shouldStore = shouldStoreMid(t.assetId, t.bestBid, t.bestAsk, t.mid, t.tsMs);
-        // #region agent log
-        fetch('http://127.0.0.1:7243/ingest/a2ce0bcd-2fd9-4a62-b9b6-9bec63aa6bf3',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'services/ingestion/src/index.ts:onClobTick:shouldStore',message:'CLOB tick shouldStoreMid check',data:{assetId:(t.assetId||'').slice(0,12),marketId:marketId.slice(0,12),mid:t.mid,shouldStore},timestamp:Date.now(),hypothesisId:'E'})}).catch(()=>{});
-        // #endregion agent log
         if (!shouldStore) continue;
         await withRetry(
           () =>
@@ -2069,10 +1985,6 @@ async function onClobTick(msg: any) {
             }),
           "insertMidTick"
         );
-        // #region agent log
-        fetch('http://127.0.0.1:7243/ingest/a2ce0bcd-2fd9-4a62-b9b6-9bec63aa6bf3',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'services/ingestion/src/index.ts:onClobTick:inserted',message:'mid tick inserted from CLOB',data:{assetId:(t.assetId||'').slice(0,12),marketId:marketId.slice(0,12),mid:t.mid,tsMs:t.tsMs},timestamp:Date.now(),hypothesisId:'E'})}).catch(()=>{});
-        // #endregion agent log
-
         if (process.env.LOG_MID === "1") {
           const tsIso = new Date(t.tsMs).toISOString();
           console.log(

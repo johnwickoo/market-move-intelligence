@@ -88,12 +88,26 @@ function buildBucketSeries(
     series[idx].price = toNum(tk.mid);
   }
 
+  // Find the last bucket with a real tick (not forward-filled)
+  let lastRealIndex = -1;
+  for (let i = series.length - 1; i >= 0; i--) {
+    if (Number.isFinite(series[i].price)) {
+      lastRealIndex = i;
+      break;
+    }
+  }
+  if (lastRealIndex === -1) return [];
+
+  // Forward-fill gaps between real ticks, but only up to the last real tick.
+  // This prevents the stream's upsertBucketPoint from finding pre-allocated
+  // forward-filled buckets via findIndex, which would cause the chart's
+  // "last price" to appear stagnant.
   let lastPrice: number | null = null;
-  for (const point of series) {
-    if (Number.isFinite(point.price)) {
-      lastPrice = point.price;
+  for (let i = 0; i <= lastRealIndex; i++) {
+    if (Number.isFinite(series[i].price)) {
+      lastPrice = series[i].price;
     } else if (lastPrice != null) {
-      point.price = lastPrice;
+      series[i].price = lastPrice;
     }
   }
 
@@ -105,15 +119,27 @@ function buildBucketSeries(
     series[i].price = firstPrice;
   }
 
+  // Trim: only include buckets up to the last real tick. Do not keep trailing
+  // forward-filled buckets — the stream will push new buckets as ticks arrive,
+  // and we must not let findIndex hit pre-allocated forward-filled slots.
+  const nowBucketIndex = Math.floor(
+    (Date.now() - windowStartMs) / bucketMs
+  );
+  const trimToIndex = Math.min(
+    lastRealIndex,
+    Math.max(0, nowBucketIndex)
+  );
+  const trimmed = series.slice(0, trimToIndex + 1);
+
   for (const tr of trades) {
     const tsMs = Date.parse(tr.timestamp);
     if (!Number.isFinite(tsMs) || tsMs < windowStartMs) continue;
     const idx = Math.floor((tsMs - windowStartMs) / bucketMs);
-    if (idx < 0 || idx >= series.length) continue;
-    series[idx].volume += toNum(tr.size ?? 0);
+    if (idx < 0 || idx >= trimmed.length) continue;
+    trimmed[idx].volume += toNum(tr.size ?? 0);
   }
 
-  return series;
+  return trimmed;
 }
 
 function buildVolumeBuckets(

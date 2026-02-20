@@ -44,8 +44,15 @@ export function SignalBand({
           setStyle(null);
           return;
         }
+        // Hide if signal is completely outside the visible range
+        const rangeFrom = range.from as number;
+        const rangeTo = range.to as number;
+        if (endTime < rangeFrom || startTime > rangeTo) {
+          setStyle(null);
+          return;
+        }
         const clamp = (t: number) =>
-          Math.min(Math.max(t, range.from as number), range.to as number);
+          Math.min(Math.max(t, rangeFrom), rangeTo);
         const clampedStart = clamp(startTime as number);
         const clampedEnd = clamp(endTime as number);
         startCoord = timeScale.timeToCoordinate(

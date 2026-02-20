@@ -1,5 +1,12 @@
 import { supabase } from "../../storage/src/db";
-import { scoreSignals } from "../../signals/src/scoreSignals";
+// Two-stage: finalize delays per window type
+const FINALIZE_DELAY_MS: Record<string, number> = {
+  "5m": 10 * 60_000,
+  "15m": 30 * 60_000,
+  "1h": 2 * 3_600_000,
+  "4h": 8 * 3_600_000,
+  "event": 15 * 60_000,
+};
 import type { WindowType } from "./detectMovement";
 
 type EventMovementInput = {
@@ -373,7 +380,14 @@ export async function detectEventMovement({
       thin_liquidity: thinLiquidity,
     };
 
-    const { error } = await supabase.from("market_movements").insert(row);
+    const delayMs = FINALIZE_DELAY_MS[w.type] ?? 15 * 60_000;
+    const finalizeAt = new Date(Date.now() + delayMs).toISOString();
+
+    const { error } = await supabase.from("market_movements").insert({
+      ...row,
+      status: "OPEN",
+      finalize_at: finalizeAt,
+    });
     if (error) {
       const msg = error.message ?? "";
       if (!msg.includes("duplicate key")) throw error;
@@ -381,12 +395,12 @@ export async function detectEventMovement({
     }
 
     const topMoverId = topMover?.marketId ?? null;
-    await scoreSignals({ ...row, velocity, __topMoverMarketId: topMoverId });
     console.log(
-      `[movement-event] ${w.type}/${reason} event=${eventSlug} price=${endPrice.toFixed(4)} ` +
+      `[movement-event] OPEN ${w.type}/${reason} event=${eventSlug} price=${endPrice.toFixed(4)} ` +
         `drift=${driftPct.toFixed(3)} range=${rangePct.toFixed(3)} ` +
         `vel=${velocity.toFixed(4)} vol=${totalVolume.toFixed(2)} ratio=${volumeRatio?.toFixed(2) ?? "n/a"} ` +
-        `topMover=${topMoverId?.slice(0, 12) ?? "n/a"} children=${entries.length}`
+        `topMover=${topMoverId?.slice(0, 12) ?? "n/a"} children=${entries.length} ` +
+        `finalize_at=${finalizeAt}`
     );
   }
 }
