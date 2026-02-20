@@ -584,12 +584,92 @@ async function insertMovement(
   const velocity = row.velocity;
   const { velocity: _v, ...dbRow } = row;
 
-  // Two-stage pipeline: insert as OPEN with a scheduled finalize time.
-  // The finalize worker will pick this up once momentum has settled,
-  // then run classification + news + explanation with stable data.
   const delayMs = FINALIZE_DELAY_MS[row.window_type] ?? 15 * 60_000;
   const finalizeAt = new Date(Date.now() + delayMs).toISOString();
 
+  // ── Movement chain extension ─────────────────────────────────────────
+  // For time-windowed detections (not "event" since-last-signal windows),
+  // look for an existing OPEN movement of the same type that fired recently.
+  // If one exists, EXTEND it instead of inserting a new row:
+  //   - window_start + start_price stay frozen from the first detection (the anchor)
+  //   - window_end + end_price advance to the current tick
+  //   - pct_change reflects the total drift from anchor to now
+  //   - volume/trades accumulate across detections
+  //   - finalize_at is pushed out so the worker waits for full momentum
+  //
+  // This collapses "4 separate 5m bands on the chart" into one clean
+  // start→end signal showing the true magnitude of the move.
+  if (row.window_type !== "event") {
+    const chainCutoff = new Date(Date.now() - delayMs).toISOString(); // delayMs ≈ 2 × window
+
+    // Build outcome filter (null needs IS NULL, not = NULL)
+    const chainQ = supabase
+      .from("market_movements")
+      .select("id, start_price, min_price_24h, max_price_24h, volume_24h, trades_count_24h")
+      .eq("market_id", row.market_id)
+      .eq("window_type", row.window_type)
+      .eq("status", "OPEN")
+      .gte("window_end", chainCutoff);
+    const chainQFiltered = outcome !== null
+      ? chainQ.eq("outcome", outcome)
+      : chainQ.is("outcome", null);
+
+    const { data: existing } = await chainQFiltered
+      .order("window_start", { ascending: true })
+      .limit(1)
+      .maybeSingle();
+
+    if (existing) {
+      const origStart = existing.start_price != null ? Number(existing.start_price) : null;
+      const newEnd = dbRow.end_price;
+      const newDrift =
+        origStart != null && origStart > 0 && newEnd != null
+          ? (newEnd - origStart) / origStart
+          : dbRow.pct_change;
+
+      const prevMin = existing.min_price_24h != null ? Number(existing.min_price_24h) : Infinity;
+      const prevMax = existing.max_price_24h != null ? Number(existing.max_price_24h) : -Infinity;
+      const newMin = Math.min(prevMin, dbRow.min_price_24h ?? Infinity);
+      const newMax = Math.max(prevMax, dbRow.max_price_24h ?? -Infinity);
+      const newRangePct =
+        Number.isFinite(newMin) && Number.isFinite(newMax) && newMin > 0
+          ? (newMax - newMin) / newMin
+          : dbRow.range_pct;
+
+      const newVol = Number(existing.volume_24h ?? 0) + (dbRow.volume_24h ?? 0);
+      const newTrades = Number(existing.trades_count_24h ?? 0) + (dbRow.trades_count_24h ?? 0);
+
+      const { error: updateErr } = await supabase
+        .from("market_movements")
+        .update({
+          window_end: dbRow.window_end,
+          end_price: newEnd,
+          pct_change: newDrift,
+          min_price_24h: Number.isFinite(newMin) ? newMin : null,
+          max_price_24h: Number.isFinite(newMax) ? newMax : null,
+          range_pct: newRangePct,
+          volume_24h: newVol,
+          trades_count_24h: newTrades,
+          avg_trade_size_24h: newTrades > 0 ? newVol / newTrades : null,
+          finalize_at: finalizeAt, // push deadline out so worker waits for full move
+        })
+        .eq("id", existing.id);
+
+      if (updateErr) {
+        console.error("[movement] chain extend failed", existing.id, updateErr.message);
+        return false;
+      }
+
+      console.log(
+        `[movement] EXTEND ${row.window_type} id=${existing.id.slice(0, 24)} ` +
+        `start=${origStart?.toFixed(4) ?? "n/a"} end=${newEnd?.toFixed(4) ?? "n/a"} ` +
+        `drift=${newDrift?.toFixed(3) ?? "n/a"} vol=${newVol.toFixed(2)}`
+      );
+      return true;
+    }
+  }
+
+  // ── No active chain — insert as a new OPEN movement ─────────────────
   const { error: insErr } = await supabase.from("market_movements").insert({
     ...dbRow,
     status: "OPEN",

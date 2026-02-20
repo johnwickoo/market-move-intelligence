@@ -17,6 +17,7 @@ export type Annotation = {
   label: string;
   explanation: string;
   color: string;
+  start_price?: number | null;
 };
 
 export type OutcomeSeries = {

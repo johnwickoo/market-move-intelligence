@@ -1,6 +1,11 @@
 "use client";
 
-import { createChart, ColorType } from "lightweight-charts";
+import {
+  createChart,
+  ColorType,
+  type SeriesMarker,
+  type UTCTimestamp,
+} from "lightweight-charts";
 import { use, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type {
   Annotation,
@@ -302,6 +307,12 @@ export default function Page(props: PageProps) {
   const prevSignalCountRef = useRef(0);
   const streamOutcomesRef = useRef<Map<string, { series: SeriesPoint[]; volumes: VolumePoint[] }> | null>(new Map());
   const [streamUpdateCounter, setStreamUpdateCounter] = useState(0);
+  const [crosshairData, setCrosshairData] = useState<{
+    time: number;
+    prices: Array<{ outcome: string; price: number; color: string }>;
+  } | null>(null);
+  // Stable ref so the crosshair closure always sees the latest outcome list
+  const crosshairOutcomesRef = useRef<Array<{ key: string; outcome: string; color: string }>>([]);
 
   const clearLineSeries = (
     chartOverride?: ReturnType<typeof createChart> | null
@@ -462,7 +473,29 @@ export default function Page(props: PageProps) {
     const observer = new ResizeObserver(resize);
     observer.observe(container);
 
+    // ── Crosshair move → update floating legend ────────────────────
+    const crosshairHandler = (param: any) => {
+      if (!param.time || !param.point) {
+        setCrosshairData(null);
+        return;
+      }
+      const seriesMap = lineSeriesRef.current;
+      const items = crosshairOutcomesRef.current;
+      const prices: Array<{ outcome: string; price: number; color: string }> = [];
+      for (const item of items) {
+        const s = seriesMap.get(item.key);
+        if (!s) continue;
+        const d = param.seriesData.get(s);
+        if (d && "value" in d) {
+          prices.push({ outcome: item.outcome, price: (d as any).value, color: item.color });
+        }
+      }
+      setCrosshairData(prices.length ? { time: param.time as number, prices } : null);
+    };
+    chart.subscribeCrosshairMove(crosshairHandler);
+
     return () => {
+      chart.unsubscribeCrosshairMove(crosshairHandler);
       observer.disconnect();
       clearLineSeries(chart);
       chart.remove();
@@ -485,6 +518,16 @@ export default function Page(props: PageProps) {
     () => markets.find((m) => m.slug === slug) ?? markets[0] ?? null,
     [slug, markets]
   );
+
+  // Keep crosshairOutcomesRef in sync so the chart's crosshair callback
+  // (captured once on mount) always sees the current outcome list and colors.
+  useEffect(() => {
+    crosshairOutcomesRef.current = (selectedMarket?.outcomes ?? []).map((o) => ({
+      key: outcomeKey(o),
+      outcome: o.outcome,
+      color: o.color,
+    }));
+  }, [selectedMarket]);
 
   // Pick outcome:
   // For binary markets (Yes/No, Up/Down), always pin to the positive outcome
@@ -717,6 +760,7 @@ export default function Page(props: PageProps) {
     setSignalWindows([]);
     setHoveredSignal(null);
     setLineFilterKey(null);
+    setCrosshairData(null);
     streamOutcomesRef.current?.clear();
   }, [slugs, pinned.marketId]);
 
@@ -878,6 +922,21 @@ export default function Page(props: PageProps) {
       );
       series.setData(chartData);
 
+      // ── Signal/movement markers on the price line ────────────────
+      const seriesMarkers: SeriesMarker<UTCTimestamp>[] = [];
+      for (const ann of signalWindows) {
+        const ms = Date.parse(ann.start_ts);
+        if (!Number.isFinite(ms)) continue;
+        seriesMarkers.push({
+          time: Math.floor(ms / 1000) as UTCTimestamp,
+          position: "belowBar",
+          shape: ann.kind === "movement" ? "arrowUp" : "circle",
+          color: ann.kind === "movement" ? "#50dc8c" : "#ffaa28",
+          size: 1,
+        });
+      }
+      seriesMarkers.sort((a, b) => (a.time as number) - (b.time as number));
+      series.setMarkers(seriesMarkers);
     }
 
     for (const [key, series] of seriesMap.entries()) {
@@ -885,7 +944,7 @@ export default function Page(props: PageProps) {
       chart.removeSeries(series);
       seriesMap.delete(key);
     }
-  }, [selectedMarket, lineFilterKey, streamUpdateCounter]);
+  }, [selectedMarket, lineFilterKey, streamUpdateCounter, signalWindows]);
 
   useEffect(() => {
     const volumeApi = volumeSeriesRef.current;
@@ -958,14 +1017,50 @@ export default function Page(props: PageProps) {
       const seriesForStats = streamOutcomesRef.current?.get(streamKey)?.series ?? selectedOutcome.series;
       const trimmed = buildLineData(seriesForStats);
       if (trimmed.length > 0) {
-        const values = trimmed.map((p) => p.value);
-        const min = Math.min(...values);
-        const max = Math.max(...values);
-        const last = trimmed[trimmed.length - 1]?.value ?? 0;
-        // For prediction markets (prices 0-1), show range as probability points
-        const pct = (max - min) * 100;
-        setLastPrice(last);
-        setRangePct(pct);
+        const currentPrice = trimmed[trimmed.length - 1]?.value ?? 0;
+
+        if (signalWindows.length > 0) {
+          // Anchor to the earliest (first) detected movement
+          let earliest = signalWindows[0];
+          for (const ann of signalWindows) {
+            if (Date.parse(ann.start_ts) < Date.parse(earliest.start_ts)) {
+              earliest = ann;
+            }
+          }
+
+          // Use start_price from annotation; fall back to the series point at start_ts
+          let anchorPrice: number | null =
+            earliest.start_price != null && Number.isFinite(earliest.start_price)
+              ? (earliest.start_price as number)
+              : null;
+
+          if (anchorPrice == null) {
+            const anchorMs = Date.parse(earliest.start_ts);
+            let best: { time: number; value: number } | null = null;
+            for (const pt of trimmed) {
+              const ptMs = (pt.time as number) * 1000;
+              if (ptMs <= anchorMs && (best == null || ptMs > (best.time as number) * 1000)) {
+                best = pt;
+              }
+            }
+            anchorPrice = best?.value ?? null;
+          }
+
+          if (anchorPrice != null && anchorPrice > 0) {
+            setLastPrice(anchorPrice);
+            setRangePct(((currentPrice - anchorPrice) / anchorPrice) * 100);
+          } else {
+            // Anchor unavailable — show current price, flat range
+            setLastPrice(currentPrice);
+            setRangePct(0);
+          }
+        } else {
+          // No signals — show min→max range across the visible window
+          const values = trimmed.map((p) => p.value);
+          const pct = (Math.max(...values) - Math.min(...values)) * 100;
+          setLastPrice(currentPrice);
+          setRangePct(pct);
+        }
       } else {
         setLastPrice(0);
         setRangePct(0);
@@ -974,7 +1069,7 @@ export default function Page(props: PageProps) {
       setLastPrice(0);
       setRangePct(0);
     }
-  }, [selectedOutcome, selectedMarket, lineFilterKey, streamUpdateCounter]);
+  }, [selectedOutcome, selectedMarket, lineFilterKey, streamUpdateCounter, signalWindows]);
 
   const chartWindowLabel = `1m buckets · ${inferredSinceHours}h`;
 
@@ -1025,12 +1120,22 @@ export default function Page(props: PageProps) {
           </div>
           <div className="panel-metrics">
             <div className="metric">
-              <span>Last</span>
+              <span>{signalWindows.length > 0 ? "Anchor" : "Last"}</span>
               <strong>{lastPrice.toFixed(3)}</strong>
             </div>
             <div className="metric">
-              <span>Window range</span>
-              <strong>{rangePct.toFixed(1)}%</strong>
+              <span>{signalWindows.length > 0 ? "Drift" : "Window range"}</span>
+              <strong
+                style={
+                  signalWindows.length > 0
+                    ? { color: rangePct >= 0 ? "#50dc8c" : "#e74c3c" }
+                    : undefined
+                }
+              >
+                {signalWindows.length > 0
+                  ? `${rangePct >= 0 ? "+" : ""}${rangePct.toFixed(2)}%`
+                  : `${rangePct.toFixed(1)}%`}
+              </strong>
             </div>
             <div
               className={`signal-pill${signalFlash ? " signal-flash" : ""}`}
@@ -1125,6 +1230,23 @@ export default function Page(props: PageProps) {
                 />
               ))}
             </div>
+            {crosshairData && (
+              <div className="chart-legend">
+                <div className="legend-time">
+                  {new Date(crosshairData.time * 1000).toLocaleTimeString([], {
+                    hour: "2-digit",
+                    minute: "2-digit",
+                  })}
+                </div>
+                {crosshairData.prices.map((p) => (
+                  <div key={p.outcome} className="legend-row">
+                    <span className="legend-swatch" style={{ background: p.color }} />
+                    <span className="legend-outcome">{p.outcome}</span>
+                    <span className="legend-price">{p.price.toFixed(3)}</span>
+                  </div>
+                ))}
+              </div>
+            )}
             {hoveredSignal && (
               <div className="signal-tooltip">
                 <div className="signal-title">{hoveredSignal.label}</div>
@@ -1493,6 +1615,48 @@ export default function Page(props: PageProps) {
           font-size: 11px;
           color: var(--muted);
           text-align: right;
+        }
+        .chart-legend {
+          position: absolute;
+          left: 14px;
+          top: 14px;
+          z-index: 5;
+          background: rgba(10, 14, 24, 0.82);
+          border: 1px solid rgba(255, 255, 255, 0.08);
+          border-radius: 8px;
+          padding: 6px 10px;
+          pointer-events: none;
+          backdrop-filter: blur(4px);
+        }
+        .legend-time {
+          font-size: 10px;
+          color: var(--muted);
+          margin-bottom: 5px;
+          letter-spacing: 0.06em;
+          text-transform: uppercase;
+        }
+        .legend-row {
+          display: flex;
+          align-items: center;
+          gap: 6px;
+          font-size: 12px;
+          line-height: 1.7;
+        }
+        .legend-swatch {
+          width: 8px;
+          height: 8px;
+          border-radius: 2px;
+          flex-shrink: 0;
+        }
+        .legend-outcome {
+          flex: 1;
+          color: var(--muted);
+          font-size: 11px;
+        }
+        .legend-price {
+          font-weight: 600;
+          font-variant-numeric: tabular-nums;
+          letter-spacing: -0.01em;
         }
         @keyframes fadeUp {
           from {

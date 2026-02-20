@@ -186,7 +186,7 @@ async function fetchEventAnnotations(
 ) {
   const eventMarketId = `event:${eventSlug}`;
   const moves = await pgFetch<RawMovement[]>(
-    `market_movements?select=id,market_id,outcome,window_start,window_end,window_type,reason` +
+    `market_movements?select=id,market_id,outcome,window_start,window_end,window_type,reason,start_price` +
       `&market_id=eq.${encodeURIComponent(eventMarketId)}` +
       `&window_end=gte.${encodeURIComponent(windowStartISO)}` +
       `&order=window_end.desc&limit=50`
@@ -210,6 +210,7 @@ async function fetchEventAnnotations(
       label,
       explanation,
       color: movementColor(m.window_type, true),
+      start_price: m.start_price ?? null,
     };
   });
 }
@@ -386,7 +387,7 @@ export async function GET(req: Request) {
     const volumes = buildVolumeBuckets(trades, windowStartMs, windowEndMs, bucketMinutes);
 
     const movements = await pgFetch<RawMovement[]>(
-      `market_movements?select=id,market_id,outcome,window_start,window_end,window_type,reason` +
+      `market_movements?select=id,market_id,outcome,window_start,window_end,window_type,reason,start_price` +
         `&market_id=eq.${marketId}` +
         `&outcome=eq.${encodeURIComponent(outcome)}` +
         `&window_end=gte.${encodeURIComponent(windowStartISO)}` +
@@ -410,6 +411,7 @@ export async function GET(req: Request) {
         label,
         explanation,
         color: movementColor(m.window_type),
+        start_price: m.start_price ?? null,
       };
     });
 

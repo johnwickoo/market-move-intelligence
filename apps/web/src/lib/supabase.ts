@@ -25,6 +25,7 @@ export type RawMovement = {
   window_end: string;
   window_type: string;
   reason: string;
+  start_price?: number | null;
 };
 
 export type DominantOutcomeRow = {
