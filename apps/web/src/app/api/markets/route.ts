@@ -355,6 +355,10 @@ export async function GET(req: Request) {
     outcome: string,
     marketTitle?: string
   ) {
+    // Use DESCENDING order so the PostgREST row-cap (typically 1000) cuts the
+    // oldest, least-relevant records. buildBucketSeries / buildVolumeBuckets
+    // assign ticks to pre-allocated time buckets by index — they are completely
+    // order-independent, so descending is safe here.
     const ticks = await pgFetch<RawTick[]>(
       `market_mid_ticks?select=market_id,outcome,asset_id,ts,mid` +
         `&market_id=eq.${marketId}` +
@@ -363,7 +367,7 @@ export async function GET(req: Request) {
           ? `&asset_id=eq.${encodeURIComponent(assetIdParam)}`
           : "") +
         `&ts=gte.${encodeURIComponent(windowStartISO)}` +
-        `&order=ts.asc&limit=5000`
+        `&order=ts.desc&limit=5000`
     );
 
     const trades = await pgFetch<RawTrade[]>(
@@ -371,7 +375,7 @@ export async function GET(req: Request) {
         `&market_id=eq.${marketId}` +
         `&outcome=eq.${encodeURIComponent(outcome)}` +
         `&timestamp=gte.${encodeURIComponent(windowStartISO)}` +
-        `&order=timestamp.asc&limit=5000`
+        `&order=timestamp.desc&limit=5000`
     );
 
     const series = raw

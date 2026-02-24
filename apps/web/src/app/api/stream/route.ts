@@ -322,7 +322,7 @@ export async function GET(req: Request) {
                 `&order=timestamp.asc&limit=2000`
             ),
             pgFetch<RawMovement[]>(
-              `market_movements?select=id,market_id,outcome,window_start,window_end,window_type,reason` +
+              `market_movements?select=id,market_id,outcome,window_start,window_end,window_type,reason,start_price` +
                 `&market_id=in.(${Array.from(
                   new Set([...marketIds, ...eventMarketIds])
                 )

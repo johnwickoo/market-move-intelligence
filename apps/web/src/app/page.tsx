@@ -194,12 +194,6 @@ function buildLineData(series: SeriesPoint[]) {
     }
   }
 
-  const nowSec = Math.floor(Date.now() / 1000);
-  const lastPoint = deduped[deduped.length - 1];
-  if (lastPoint && nowSec - lastPoint.time > 10) {
-    deduped.push({ time: nowSec, value: lastPoint.value });
-  }
-
   return deduped.slice(-MAX_POINTS);
 }
 
@@ -307,6 +301,8 @@ export default function Page(props: PageProps) {
   const prevSignalCountRef = useRef(0);
   const streamOutcomesRef = useRef<Map<string, { series: SeriesPoint[]; volumes: VolumePoint[] }> | null>(new Map());
   const [streamUpdateCounter, setStreamUpdateCounter] = useState(0);
+  // Track the last rendered market_id so we can call fitContent() on market change
+  const prevChartMarketIdRef = useRef<string | null>(null);
   const [crosshairData, setCrosshairData] = useState<{
     time: number;
     prices: Array<{ outcome: string; price: number; color: string }>;
@@ -644,11 +640,81 @@ export default function Page(props: PageProps) {
         })),
       }));
       if (normalized.length > 0) {
-        setMarkets(normalized);
+        // Determine which market_ids are truly new (rotation) vs same-market
+        // stale refresh. Only clear stream data for rotated markets — for
+        // same-market refreshes the stream has accumulated more granular
+        // series data than the API returns (PostgREST row cap).
+        setMarkets((prev) => {
+          const prevIds = new Set(prev.map((m) => m.market_id));
+          const newIds = new Set(normalized.map((m: MarketSnapshot) => m.market_id));
+
+          // Clear stream ref only when all markets rotated away.
+          // streamOutcomesRef keys are "slug:outcome" so we can't map them
+          // to market_ids individually — clear only when none of the old
+          // market_ids survived, indicating a full rotation.
+          const allRotated = [...prevIds].every((id) => !newIds.has(id));
+          if (allRotated) {
+            streamOutcomesRef.current?.clear();
+          }
+
+          return normalized.map((newMarket: MarketSnapshot) => {
+            const existing = prev.find((m) => m.market_id === newMarket.market_id);
+            if (!existing) return newMarket;
+            // Same market — merge: keep the richer series (stream-accumulated
+            // vs API snapshot) and merge annotations.
+            return {
+              ...newMarket,
+              outcomes: newMarket.outcomes.map((o: OutcomeSeries) => {
+                const existingOutcome = existing.outcomes.find(
+                  (eo: OutcomeSeries) => eo.outcome === o.outcome
+                );
+                if (!existingOutcome) return o;
+
+                // Keep whichever series has more data points — the stream
+                // typically has more than the API due to PostgREST row caps.
+                const mergedSeries =
+                  existingOutcome.series.length > o.series.length
+                    ? existingOutcome.series
+                    : o.series;
+
+                // Keep whichever volumes array has more data
+                const mergedVolumes =
+                  (existingOutcome.volumes?.length ?? 0) > (o.volumes?.length ?? 0)
+                    ? existingOutcome.volumes
+                    : o.volumes;
+
+                // Merge annotations by start_ts: API data may have finalized
+                // explanations; existing state may have SSE-delivered annotations.
+                const byStart = new Map<string, Annotation>();
+                for (const a of existingOutcome.annotations ?? []) {
+                  byStart.set(a.start_ts, a);
+                }
+                for (const a of o.annotations ?? []) {
+                  const prev = byStart.get(a.start_ts);
+                  if (!prev || a.explanation !== prev.explanation || a.end_ts !== prev.end_ts) {
+                    // API version wins (may have finalized explanation)
+                    byStart.set(a.start_ts, prev ? { ...prev, ...a } : a);
+                  }
+                }
+                const mergedAnnotations = [...byStart.values()];
+
+                return {
+                  ...o,
+                  series: mergedSeries,
+                  volumes: mergedVolumes,
+                  annotations: mergedAnnotations,
+                };
+              }),
+            };
+          });
+        });
         const key = pinned.marketId ? `market:${pinned.marketId}` : `slugs:${slugs}`;
         setMarketsFor(key);
         if (json.windowStart) setWindowStart(String(json.windowStart));
         console.log("[stale] Refreshed — new market data loaded");
+        // Schedule a follow-up signal refresh after a short delay to catch any
+        // movements that were finalized after this API call completed.
+        setTimeout(() => { signalRefreshFnRef.current?.(); }, 3000);
       }
     } catch (err: any) {
       console.error("[stale] Refresh failed:", err?.message);
@@ -856,16 +922,28 @@ export default function Page(props: PageProps) {
                 (fo: OutcomeSeries) => fo.outcome === o.outcome
               );
               if (!freshOutcome) return o;
-              // Merge annotations: keep existing + add any new ones
-              const existingKeys = new Set(
-                o.annotations.map((a: Annotation) => `${a.start_ts}:${a.end_ts}`)
+              // Merge annotations: match by start_ts so finalized signals
+              // (which have a different end_ts / explanation) replace the
+              // earlier OPEN placeholder instead of creating duplicates.
+              const existingByStart = new Map(
+                o.annotations.map((a: Annotation, i: number) => [a.start_ts, i])
               );
-              const newAnns = (freshOutcome.annotations ?? []).filter(
-                (a: Annotation) => !existingKeys.has(`${a.start_ts}:${a.end_ts}`)
-              );
-              return newAnns.length > 0
-                ? { ...o, annotations: [...o.annotations, ...newAnns] }
-                : o;
+              const merged = [...o.annotations];
+              let changed = false;
+              for (const fa of freshOutcome.annotations ?? []) {
+                const idx = existingByStart.get(fa.start_ts);
+                if (idx != null) {
+                  // Update in-place if end_ts or explanation changed
+                  if (merged[idx].end_ts !== fa.end_ts || merged[idx].explanation !== fa.explanation) {
+                    merged[idx] = { ...merged[idx], ...fa };
+                    changed = true;
+                  }
+                } else {
+                  merged.push(fa);
+                  changed = true;
+                }
+              }
+              return changed ? { ...o, annotations: merged } : o;
             }),
           };
         })
@@ -877,6 +955,15 @@ export default function Page(props: PageProps) {
 
   // Keep the ref in sync so SSE movement events trigger signal refresh
   signalRefreshFnRef.current = refreshSignals;
+
+  // Periodically refresh signals so finalized explanations appear on
+  // the live chart without waiting for a new movement SSE event.
+  useEffect(() => {
+    const id = setInterval(() => {
+      signalRefreshFnRef.current?.();
+    }, 60_000);
+    return () => clearInterval(id);
+  }, []);
 
   // ── sync chart data ───────────────────────────────────────────────
 
@@ -894,6 +981,7 @@ export default function Page(props: PageProps) {
       ? outcomes.filter((o) => outcomeKey(o) === lineFilterKey)
       : outcomes;
     const activeKeys = new Set<string>();
+    let totalChartPoints = 0;
 
     for (const outcome of outcomesToRender) {
       const key = outcomeKey(outcome);
@@ -925,6 +1013,7 @@ export default function Page(props: PageProps) {
         seriesToUse,
         outcome.annotations ?? []
       );
+      totalChartPoints += chartData.length;
       series.setData(chartData);
 
       // ── Signal/movement markers on the price line ────────────────
@@ -948,6 +1037,24 @@ export default function Page(props: PageProps) {
       if (activeKeys.has(key)) continue;
       chart.removeSeries(series);
       seriesMap.delete(key);
+    }
+
+    // Auto-fit the time scale when the market changes (initial load, slug change,
+    // or stale rotation). When a brand-new market period has just started it may
+    // have only 1–2 data points; calling fitContent() there collapses the chart
+    // into a tiny flat line. Instead, scroll to real-time so the sparse data is
+    // visible at the right edge without distorting the visible range.
+    const currentMarketId = selectedMarket.market_id ?? selectedMarket.slug ?? "";
+    if (currentMarketId !== prevChartMarketIdRef.current) {
+      const isInitialLoad = prevChartMarketIdRef.current === null;
+      prevChartMarketIdRef.current = currentMarketId;
+      if (isInitialLoad || totalChartPoints >= 10) {
+        chart.timeScale().fitContent();
+      } else {
+        // New market period with very little history — scroll to the latest
+        // data without collapsing the visible time range.
+        chart.timeScale().scrollToRealTime();
+      }
     }
   }, [selectedMarket, lineFilterKey, streamUpdateCounter, signalWindows]);
 

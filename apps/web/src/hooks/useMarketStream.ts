@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 import { flushSync } from "react-dom";
 import type {
+  Annotation,
   MarketSnapshot,
   OutcomeSeries,
   SeriesPoint,
@@ -82,10 +83,17 @@ export function useMarketStream({
         `[stream:diag] ${elapsed}s alive | received=${ticksReceived} flushed=${ticksFlushed}` +
         ` emptyFlushes=${emptyFlushes} errors=${errorEvents} lastTickAgo=${sinceLast}s staleFired=${staleFired}`
       );
-      // Detect stale market: no ticks for 90s after we've received some, fire only once
-      if (Date.now() - lastTickReceivedMs > STALE_TIMEOUT_MS && ticksReceived > 0 && !staleFired) {
+      // Detect stale market: no ticks for 90s after we've received some, fire only once.
+      // Also detect "dead on arrival": stream connected but never received a single
+      // tick after 2 minutes — the server may be returning no data for this market.
+      const tickGapMs = Date.now() - lastTickReceivedMs;
+      const aliveMs = Date.now() - streamOpenMs;
+      const isDead = ticksReceived === 0 && aliveMs > 120_000;
+      const isStale = ticksReceived > 0 && tickGapMs > STALE_TIMEOUT_MS;
+      if ((isStale || isDead) && !staleFired) {
         staleFired = true;
-        console.warn(`[stream:diag] ⚠ NO TICKS for ${sinceLast}s — market likely resolved, triggering refresh`);
+        const reason = isDead ? "DEAD (0 ticks received)" : `NO TICKS for ${sinceLast}s`;
+        console.warn(`[stream:diag] ⚠ ${reason} — triggering refresh`);
         setStatus("stale");
         onStaleRef.current?.();
       }
@@ -384,14 +392,26 @@ export function useMarketStream({
               : "rgba(255, 170, 40, 0.18)";
 
           const applyAnnotation = (outcome: OutcomeSeries) => {
-            outcome.annotations.push({
-              kind,
+            const ann: Annotation = {
+              kind: kind as Annotation["kind"],
               start_ts: mv.window_start,
               end_ts: mv.window_end,
               label,
               explanation: mv.explanation ?? `${label}: ${mv.reason}`,
               color,
-            });
+              start_price: mv.start_price ?? null,
+            };
+            // Replace existing annotation with the same start_ts (chain
+            // extensions keep start_ts frozen but advance end_ts). Without
+            // this, every extension pushes a duplicate overlapping band.
+            const idx = outcome.annotations.findIndex(
+              (a: Annotation) => a.start_ts === mv.window_start && a.kind === kind
+            );
+            if (idx >= 0) {
+              outcome.annotations[idx] = ann;
+            } else {
+              outcome.annotations.push(ann);
+            }
           };
 
           if (isEvent) {
@@ -493,6 +513,9 @@ export function useMarketStream({
       clearInterval(interval);
       clearInterval(diagInterval);
       source.close();
+      // Clear the stream ref so the next connection starts from a clean slate
+      // (no stale data leaks into the fresh session after a reconnect).
+      streamOutcomesRef?.current?.clear();
       console.log(
         `[stream:diag] cleanup: received=${ticksReceived} flushed=${ticksFlushed}` +
         ` errors=${errorEvents} alive=${((Date.now() - streamOpenMs) / 1000).toFixed(0)}s`

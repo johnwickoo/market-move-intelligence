@@ -206,15 +206,20 @@ export async function detectMovement(trade: TradeInsert) {
   const endISO = new Date(nowMs).toISOString();
 
   // ── Fetch ticks + trades once for the full 4h window ────────────
+  // Use DESCENDING order so the row-limit cap (PostgREST max_rows, typically
+  // 1000) cuts the oldest, least-relevant records rather than the most recent
+  // ones. Short-window analysis (5m, 15m) depends on recent data — with
+  // ascending order a busy market would return 1000 rows from hours ago and
+  // contain zero trades in the last 5 minutes.
   let tq = supabase
     .from("trades")
     .select("price,size,timestamp,outcome")
     .eq("market_id", marketId)
     .gte("timestamp", outerStartISO)
     .lte("timestamp", endISO)
-    .order("timestamp", { ascending: true });
+    .order("timestamp", { ascending: false });
   if (outcome) tq = tq.eq("outcome", outcome);
-  const { data: allTrades, error: tradesErr } = await tq;
+  const { data: allTrades, error: tradesErr } = await tq.limit(10000);
   if (tradesErr) throw tradesErr;
   if (!allTrades || allTrades.length < 2) return;
 
@@ -224,9 +229,9 @@ export async function detectMovement(trade: TradeInsert) {
     .eq("market_id", marketId)
     .gte("ts", outerStartISO)
     .lte("ts", endISO)
-    .order("ts", { ascending: true });
+    .order("ts", { ascending: false });
   if (outcome) mq = mq.eq("outcome", outcome);
-  const { data: allTicks, error: ticksErr } = await mq;
+  const { data: allTicks, error: ticksErr } = await mq.limit(10000);
   if (ticksErr) throw ticksErr;
 
   // ── Last movement anchor for "event" window ────────────────────
@@ -258,13 +263,17 @@ export async function detectMovement(trade: TradeInsert) {
     const wStartMs = nowMs - w.ms;
     const wStartISO = new Date(Math.max(wStartMs, firstSeenMs ?? 0)).toISOString();
 
-    // Filter ticks/trades to this window
-    const ticks = allTicks
+    // Filter ticks/trades to this window.
+    // allTicks/allTrades are in descending order (newest-first) from the DB
+    // query; sort ticks ascending here so ticks[0]=oldest and ticks[last]=newest
+    // for correct startMid/endMid price analysis. Trades are only used for
+    // count/volume/levels so their order does not matter.
+    const ticks = (allTicks
       ? allTicks.filter((t) => {
           const ts = Date.parse(t.ts);
           return Number.isFinite(ts) && ts >= wStartMs && ts <= nowMs;
         })
-      : [];
+      : []).sort((a, b) => Date.parse(a.ts) - Date.parse(b.ts));
     const trades = allTrades.filter((t) => {
       const ts = Date.parse(t.timestamp);
       return Number.isFinite(ts) && ts >= wStartMs && ts <= nowMs;
@@ -318,10 +327,12 @@ export async function detectMovement(trade: TradeInsert) {
 
     // ── Liquidity guard ──
     const thinBySpread = avgSpreadPct != null && avgSpreadPct >= WIDE_SPREAD;
-    const thinLiquidity =
-      thinBySpread ||
-      tradesCount < THIN_TRADE_COUNT ||
-      uniquePriceLevels < THIN_PRICE_LEVELS;
+    const thinByActivity = tradesCount < THIN_TRADE_COUNT || uniquePriceLevels < THIN_PRICE_LEVELS;
+    // Wide spread alone does not indicate thin liquidity when there is substantial
+    // trade activity. A large spread during a fast move reflects price discovery,
+    // not lack of participation. Only use spread as a thin signal when trade count
+    // is also low (< 4× the baseline thin threshold).
+    const thinLiquidity = thinByActivity || (thinBySpread && tradesCount < THIN_TRADE_COUNT * 4);
 
     // ── Price metrics ──
     const driftPct =
@@ -466,12 +477,13 @@ export async function detectMovement(trade: TradeInsert) {
       const eventStartMs = Date.parse(lastMoveEndISO);
       const eventElapsedMs = Number.isFinite(eventStartMs) ? nowMs - eventStartMs : 0;
       if (Number.isFinite(eventStartMs) && eventStartMs < nowMs && eventElapsedMs >= EVENT_MIN_ELAPSED_MS) {
-        const eventTicks = allTicks
+        // Sort ascending so eventTicks[last] is the most recent tick (eLastMid).
+        const eventTicks = (allTicks
           ? allTicks.filter((t) => {
               const ts = Date.parse(t.ts);
               return Number.isFinite(ts) && ts >= eventStartMs && ts <= nowMs;
             })
-          : [];
+          : []).sort((a, b) => Date.parse(a.ts) - Date.parse(b.ts));
         const eventTrades = allTrades.filter((t) => {
           const ts = Date.parse(t.timestamp);
           return Number.isFinite(ts) && ts >= eventStartMs && ts <= nowMs;
@@ -639,6 +651,11 @@ async function insertMovement(
       const newVol = Number(existing.volume_24h ?? 0) + (dbRow.volume_24h ?? 0);
       const newTrades = Number(existing.trades_count_24h ?? 0) + (dbRow.trades_count_24h ?? 0);
 
+      // Re-evaluate thin_liquidity as trades accumulate: a movement that started
+      // with sparse activity but grew to many trades should not stay "thin".
+      // Only keep thin=true if accumulated trade count is still below the activity cap.
+      const updatedThinLiquidity = thinLiquidity && newTrades < THIN_TRADE_COUNT * 4;
+
       const { error: updateErr } = await supabase
         .from("market_movements")
         .update({
@@ -651,6 +668,7 @@ async function insertMovement(
           volume_24h: newVol,
           trades_count_24h: newTrades,
           avg_trade_size_24h: newTrades > 0 ? newVol / newTrades : null,
+          thin_liquidity: updatedThinLiquidity,
           finalize_at: finalizeAt, // push deadline out so worker waits for full move
         })
         .eq("id", existing.id);
