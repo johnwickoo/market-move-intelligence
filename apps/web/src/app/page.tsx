@@ -710,8 +710,16 @@ export default function Page(props: PageProps) {
         });
         const key = pinned.marketId ? `market:${pinned.marketId}` : `slugs:${slugs}`;
         setMarketsFor(key);
-        if (json.windowStart) setWindowStart(String(json.windowStart));
-        console.log("[stale] Refreshed — new market data loaded");
+        // Only update windowStart if it actually changed — otherwise we
+        // trigger a stream reconnect for the same market which creates a
+        // stale→reconnect→1 burst tick→stale loop.
+        const newWindowStart = json.windowStart ? String(json.windowStart) : null;
+        if (newWindowStart && newWindowStart !== windowStart) {
+          setWindowStart(newWindowStart);
+          console.log("[stale] Refreshed — new window, stream will reconnect");
+        } else {
+          console.log("[stale] Refreshed — same window, keeping stream alive");
+        }
         // Schedule a follow-up signal refresh after a short delay to catch any
         // movements that were finalized after this API call completed.
         setTimeout(() => { signalRefreshFnRef.current?.(); }, 3000);
@@ -721,7 +729,7 @@ export default function Page(props: PageProps) {
     } finally {
       staleRefreshRef.current = false;
     }
-  }, [slugs, pinned.marketId, pinned.assetId, inferredSinceHours, inferredBucketMinutes]);
+  }, [slugs, pinned.marketId, pinned.assetId, inferredSinceHours, inferredBucketMinutes, windowStart]);
 
   const streamStatus = useMarketStream({
     slugs,

@@ -202,6 +202,9 @@ export async function GET(req: Request) {
       let lastTickIso = new Date(Date.now() - 2 * 60 * 1000).toISOString();
       let lastTradeIso = lastTickIso;
       let lastMoveIso = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+      // Track which movement IDs have been sent (with their explanation) so we
+      // can re-send when a movement gets finalized with a new explanation.
+      const sentMoveVersions = new Map<string, string>(); // id → explanation hash
 
       stop = () => {
         if (poll) clearInterval(poll);
@@ -397,8 +400,13 @@ export async function GET(req: Request) {
             moves.map((m) => m.id)
           );
 
+          const sendMovement = (mv: RawMovement, explanation: string) => {
+            if (!shouldIncludeOutcome(mv.market_id, mv.outcome)) return;
+            sentMoveVersions.set(mv.id, explanation);
+            send("movement", { ...mv, explanation });
+          };
+
           for (const mv of moves) {
-            if (!shouldIncludeOutcome(mv.market_id, mv.outcome)) continue;
             const mvLabel = mv.window_type === "event" || mv.window_type === "5m" || mv.window_type === "15m"
               ? "Movement" : "Signal";
             const rawExplanation =
@@ -408,10 +416,47 @@ export async function GET(req: Request) {
               ? mv.market_id.slice("event:".length).replace(/-/g, " ")
               : markets.get(mv.market_id)?.title ?? mv.market_id;
             const explanation = withMarketInExplanation(rawExplanation, marketName);
-            send("movement", {
-              ...mv,
-              explanation,
-            });
+            sendMovement(mv, explanation);
+          }
+
+          // Every ~15s, check for recently finalized movements whose explanation
+          // changed since we last sent them (or that we never sent because their
+          // window_end was before our cursor when they were first created).
+          if (currentPoll % 15 === 0) {
+            try {
+              const allMoveIds = Array.from(
+                new Set([...marketIds, ...eventMarketIds])
+              );
+              const recentFinal = await pgFetch<RawMovement[]>(
+                `market_movements?select=id,market_id,outcome,window_start,window_end,window_type,reason,start_price` +
+                  `&market_id=in.(${allMoveIds.map(encodeURIComponent).join(",")})` +
+                  `&status=eq.FINAL` +
+                  `&order=window_end.desc&limit=50`
+              );
+              if (recentFinal.length > 0) {
+                const finalExplanations = await fetchExplanations(
+                  recentFinal.map((m) => m.id)
+                );
+                for (const mv of recentFinal) {
+                  const mvLabel = mv.window_type === "event" || mv.window_type === "5m" || mv.window_type === "15m"
+                    ? "Movement" : "Signal";
+                  const rawExplanation =
+                    finalExplanations[mv.id] ??
+                    `${mvLabel}: ${mv.reason}`;
+                  const marketName = mv.market_id.startsWith("event:")
+                    ? mv.market_id.slice("event:".length).replace(/-/g, " ")
+                    : markets.get(mv.market_id)?.title ?? mv.market_id;
+                  const explanation = withMarketInExplanation(rawExplanation, marketName);
+                  // Only re-send if explanation changed or never sent
+                  const prev = sentMoveVersions.get(mv.id);
+                  if (prev !== explanation) {
+                    sendMovement(mv, explanation);
+                  }
+                }
+              }
+            } catch (err: any) {
+              console.error(`[stream] finalized-move check error:`, err?.message);
+            }
           }
 
           const pollMs = Date.now() - pollStartMs;

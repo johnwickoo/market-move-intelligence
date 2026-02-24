@@ -579,11 +579,11 @@ export async function detectMovement(trade: TradeInsert) {
 // Finalize delays per window type — how long to wait for momentum to settle
 // before running classification + explanation with stable data.
 const FINALIZE_DELAY_MS: Record<string, number> = {
-  "5m": 10 * 60_000,   // 10 min
-  "15m": 30 * 60_000,  // 30 min
-  "1h": 2 * 3_600_000, // 2 hours
-  "4h": 8 * 3_600_000, // 8 hours
-  "event": 15 * 60_000, // 15 min
+  "5m": 5 * 60_000,    // 5 min
+  "15m": 10 * 60_000,  // 10 min
+  "1h": 30 * 60_000,   // 30 min
+  "4h": 2 * 3_600_000, // 2 hours
+  "event": 5 * 60_000, // 5 min
 };
 
 async function insertMovement(

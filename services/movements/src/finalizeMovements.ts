@@ -181,9 +181,103 @@ async function finalizeOne(mv: OpenMovement) {
   }
 }
 
+// Minimum time (ms) an OPEN movement must exist before early finalization
+// is considered. Prevents finalizing during the initial burst.
+const EARLY_MIN_AGE_MS: Record<string, number> = {
+  "5m": 2 * 60_000,    // 2 min
+  "15m": 5 * 60_000,   // 5 min
+  "1h": 15 * 60_000,   // 15 min
+  "4h": 60 * 60_000,   // 1 hour
+  "event": 2 * 60_000, // 2 min
+};
+
+// How many recent minutes of ticks to check for stabilization
+const STABLE_WINDOW_MS = 2 * 60_000; // 2 min
+// Max price range (as fraction) in the stable window to consider settled
+const STABLE_RANGE_THRESHOLD = 0.01; // 1%
+// Min ticks required in the stable window to have enough data to judge
+const STABLE_MIN_TICKS = 3;
+
+/**
+ * Check if a movement's price has stabilized: the last 2 minutes of
+ * mid-ticks show < 1% range, meaning the move has settled.
+ */
+async function isStabilized(mv: OpenMovement): Promise<boolean> {
+  const nowMs = Date.now();
+  const windowStartMs = Date.parse(mv.window_start);
+  if (!Number.isFinite(windowStartMs)) return false;
+
+  const minAge = EARLY_MIN_AGE_MS[mv.window_type] ?? 5 * 60_000;
+  if (nowMs - windowStartMs < minAge) return false;
+
+  // Fetch recent ticks
+  const stableFrom = new Date(nowMs - STABLE_WINDOW_MS).toISOString();
+  const { data: recentTicks } = await supabase
+    .from("market_mid_ticks")
+    .select("mid,ts")
+    .eq("market_id", mv.market_id)
+    .gte("ts", stableFrom)
+    .order("ts", { ascending: false })
+    .limit(50);
+
+  const valid = (recentTicks ?? []).filter((t: any) => t.mid != null);
+
+  // No ticks at all in the last 2 minutes = market went quiet, move is done
+  if (valid.length === 0) return true;
+
+  if (valid.length < STABLE_MIN_TICKS) return false;
+
+  let minMid = Infinity;
+  let maxMid = -Infinity;
+  for (const t of valid) {
+    const m = safeNum(t.mid);
+    if (m < minMid) minMid = m;
+    if (m > maxMid) maxMid = m;
+  }
+
+  if (minMid <= 0 || !Number.isFinite(minMid)) return false;
+  const range = (maxMid - minMid) / minMid;
+
+  return range < STABLE_RANGE_THRESHOLD;
+}
+
+/**
+ * Check OPEN movements that haven't hit finalize_at yet but may have
+ * stabilized. Finalize them early to get faster explanations.
+ */
+async function checkEarlyFinalize() {
+  const now = new Date().toISOString();
+
+  const { data: pending, error } = await supabase
+    .from("market_movements")
+    .select("*")
+    .eq("status", "OPEN")
+    .gt("finalize_at", now) // not yet due
+    .order("window_start", { ascending: true })
+    .limit(BATCH_SIZE);
+
+  if (error || !pending || pending.length === 0) return;
+
+  for (const mv of pending as OpenMovement[]) {
+    try {
+      const stable = await isStabilized(mv);
+      if (!stable) continue;
+
+      console.log(
+        `[finalize] early finalize: ${mv.window_type} market=${mv.market_id.slice(0, 16)} ` +
+        `— price stabilized within ${STABLE_RANGE_THRESHOLD * 100}% over last ${STABLE_WINDOW_MS / 60_000}min`
+      );
+      await finalizeOne(mv);
+    } catch (err: any) {
+      console.error("[finalize] early finalize error", mv.id, err?.message);
+    }
+  }
+}
+
 async function pollOnce() {
   const now = new Date().toISOString();
 
+  // 1. Process movements whose timer has expired
   const { data: open, error } = await supabase
     .from("market_movements")
     .select("*")
@@ -197,24 +291,27 @@ async function pollOnce() {
     return;
   }
 
-  if (!open || open.length === 0) return;
+  if (open && open.length > 0) {
+    console.log(`[finalize] processing ${open.length} movement(s)`);
 
-  console.log(`[finalize] processing ${open.length} movement(s)`);
-
-  for (const mv of open as OpenMovement[]) {
-    try {
-      await finalizeOne(mv);
-    } catch (err: any) {
-      console.error("[finalize] error on", mv.id, err?.message);
-      // Mark FINAL to prevent infinite retry
+    for (const mv of open as OpenMovement[]) {
       try {
-        await supabase
-          .from("market_movements")
-          .update({ status: "FINAL" })
-          .eq("id", mv.id);
-      } catch { /* ignore */ }
+        await finalizeOne(mv);
+      } catch (err: any) {
+        console.error("[finalize] error on", mv.id, err?.message);
+        // Mark FINAL to prevent infinite retry
+        try {
+          await supabase
+            .from("market_movements")
+            .update({ status: "FINAL" })
+            .eq("id", mv.id);
+        } catch { /* ignore */ }
+      }
     }
   }
+
+  // 2. Check for early finalization of stabilized movements
+  await checkEarlyFinalize();
 }
 
 let running = false;

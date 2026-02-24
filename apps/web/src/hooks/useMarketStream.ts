@@ -47,6 +47,8 @@ export function useMarketStream({
   onMovementRef.current = onMovement;
   const onStaleRef = useRef(onStale);
   onStaleRef.current = onStale;
+  // Persist stale cycles across effect re-runs (stream reconnects)
+  const staleCyclesRef = useRef(0);
 
   useEffect(() => {
     if (!slugs.trim() || !windowStart) return;
@@ -74,28 +76,45 @@ export function useMarketStream({
     let emptyFlushes = 0;
     let errorEvents = 0;
     let staleFired = false; // only fire onStale once per stale period
+    // staleCyclesRef persists across effect re-runs (stream reconnects)
+    let realTicksReceived = 0; // ticks received after initial burst
+    let burstPhase = true; // true until first poll cycle delivers (or not)
     const streamOpenMs = Date.now();
-    const STALE_TIMEOUT_MS = 90_000; // 90s of no ticks before declaring stale
+    const BASE_STALE_TIMEOUT_MS = 90_000; // 90s base, increases with backoff
+    const MAX_STALE_CYCLES = 3; // stop reconnecting after N stale cycles
+    // After the initial burst tick, wait 5s before exiting burst phase
+    setTimeout(() => { burstPhase = false; }, 5_000);
     const diagInterval = setInterval(() => {
       const elapsed = ((Date.now() - streamOpenMs) / 1000).toFixed(0);
       const sinceLast = ((Date.now() - lastTickReceivedMs) / 1000).toFixed(1);
+      // Progressive backoff: double timeout each stale cycle
+      const staleTimeoutMs = BASE_STALE_TIMEOUT_MS * Math.pow(2, staleCyclesRef.current);
       console.log(
-        `[stream:diag] ${elapsed}s alive | received=${ticksReceived} flushed=${ticksFlushed}` +
-        ` emptyFlushes=${emptyFlushes} errors=${errorEvents} lastTickAgo=${sinceLast}s staleFired=${staleFired}`
+        `[stream:diag] ${elapsed}s alive | received=${ticksReceived} real=${realTicksReceived} flushed=${ticksFlushed}` +
+        ` emptyFlushes=${emptyFlushes} errors=${errorEvents} lastTickAgo=${sinceLast}s staleFired=${staleFired}` +
+        ` staleCyclesRef.current=${staleCyclesRef.current} staleTimeout=${(staleTimeoutMs / 1000).toFixed(0)}s`
       );
-      // Detect stale market: no ticks for 90s after we've received some, fire only once.
+      // Detect stale market: no ticks for staleTimeoutMs after we've received some.
       // Also detect "dead on arrival": stream connected but never received a single
       // tick after 2 minutes — the server may be returning no data for this market.
       const tickGapMs = Date.now() - lastTickReceivedMs;
       const aliveMs = Date.now() - streamOpenMs;
       const isDead = ticksReceived === 0 && aliveMs > 120_000;
-      const isStale = ticksReceived > 0 && tickGapMs > STALE_TIMEOUT_MS;
+      // Only count as "active" if we got real ticks beyond the initial burst
+      const isStale = ticksReceived > 0 && tickGapMs > staleTimeoutMs;
       if ((isStale || isDead) && !staleFired) {
         staleFired = true;
+        staleCyclesRef.current++;
         const reason = isDead ? "DEAD (0 ticks received)" : `NO TICKS for ${sinceLast}s`;
-        console.warn(`[stream:diag] ⚠ ${reason} — triggering refresh`);
-        setStatus("stale");
-        onStaleRef.current?.();
+        if (staleCyclesRef.current > MAX_STALE_CYCLES) {
+          // Market is genuinely inactive — stop reconnecting
+          console.warn(`[stream:diag] ⚠ ${reason} — market inactive (${staleCyclesRef.current} stale cycles, not reconnecting)`);
+          setStatus("stale");
+        } else {
+          console.warn(`[stream:diag] ⚠ ${reason} — triggering refresh (cycle ${staleCyclesRef.current}/${MAX_STALE_CYCLES})`);
+          setStatus("stale");
+          onStaleRef.current?.();
+        }
       }
     }, 15_000);
 
@@ -470,10 +489,15 @@ export function useMarketStream({
         }
         pendingTicks.push(payload);
         ticksReceived++;
+        if (!burstPhase) realTicksReceived++;
         lastTickReceivedMs = Date.now();
         if (staleFired) {
           staleFired = false;
           setStatus("live");
+        }
+        // Real ticks (not burst) indicate the market is active — reset backoff
+        if (!burstPhase && staleCyclesRef.current > 0) {
+          staleCyclesRef.current = 0;
         }
       } catch {
         // ignore
