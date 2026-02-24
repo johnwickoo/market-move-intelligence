@@ -291,6 +291,7 @@ export default function Page(props: PageProps) {
   const chartContainerRef = useRef<HTMLDivElement | null>(null);
   const chartRef = useRef<ReturnType<typeof createChart> | null>(null);
   const lineSeriesRef = useRef<Map<string, any>>(new Map());
+  const glowSeriesRef = useRef<Map<string, any>>(new Map());
   const volumeSeriesRef = useRef<any>(null);
   const [signalWindows, setSignalWindows] = useState<Annotation[]>([]);
   const [hoveredSignal, setHoveredSignal] = useState<Annotation | null>(null);
@@ -309,11 +310,25 @@ export default function Page(props: PageProps) {
   } | null>(null);
   // Stable ref so the crosshair closure always sees the latest outcome list
   const crosshairOutcomesRef = useRef<Array<{ key: string; outcome: string; color: string }>>([]);
+  // Stable ref so the crosshair closure can detect movement windows
+  const signalWindowsRef = useRef<Annotation[]>([]);
+  signalWindowsRef.current = signalWindows;
+  // Track whether hoveredSignal was set by crosshair vs band hover
+  const hoveredByCrosshairRef = useRef(false);
 
   const clearLineSeries = (
     chartOverride?: ReturnType<typeof createChart> | null
   ) => {
     const chart = chartOverride ?? chartRef.current;
+    // Clear glow overlays first
+    const glowMap = glowSeriesRef.current;
+    if (chart) {
+      for (const series of glowMap.values()) {
+        try { chart.removeSeries(series); } catch { /* already removed */ }
+      }
+    }
+    glowMap.clear();
+    // Clear main line series
     const seriesMap = lineSeriesRef.current;
     if (chart) {
       for (const series of seriesMap.values()) {
@@ -473,6 +488,10 @@ export default function Page(props: PageProps) {
     const crosshairHandler = (param: any) => {
       if (!param.time || !param.point) {
         setCrosshairData(null);
+        if (hoveredByCrosshairRef.current) {
+          hoveredByCrosshairRef.current = false;
+          setHoveredSignal(null);
+        }
         return;
       }
       const seriesMap = lineSeriesRef.current;
@@ -487,6 +506,27 @@ export default function Page(props: PageProps) {
         }
       }
       setCrosshairData(prices.length ? { time: param.time as number, prices } : null);
+
+      // Detect if crosshair is within a movement/signal window → show tooltip
+      const timeSec = param.time as number;
+      const windows = signalWindowsRef.current;
+      let matchedSignal: Annotation | null = null;
+      for (const ann of windows) {
+        const startSec = Math.floor(Date.parse(ann.start_ts) / 1000);
+        const endSec = Math.floor(Date.parse(ann.end_ts) / 1000);
+        if (timeSec >= startSec && timeSec <= endSec) {
+          matchedSignal = ann;
+          break; // show the first match (most specific)
+        }
+      }
+      if (matchedSignal) {
+        hoveredByCrosshairRef.current = true;
+        setHoveredSignal(matchedSignal);
+      } else if (hoveredByCrosshairRef.current) {
+        // Only clear if we set it (don't interfere with band hover)
+        hoveredByCrosshairRef.current = false;
+        setHoveredSignal(null);
+      }
     };
     chart.subscribeCrosshairMove(crosshairHandler);
 
@@ -989,6 +1029,7 @@ export default function Page(props: PageProps) {
       ? outcomes.filter((o) => outcomeKey(o) === lineFilterKey)
       : outcomes;
     const activeKeys = new Set<string>();
+    const activeGlowKeys = new Set<string>();
     let totalChartPoints = 0;
 
     for (const outcome of outcomesToRender) {
@@ -1039,6 +1080,49 @@ export default function Page(props: PageProps) {
       }
       seriesMarkers.sort((a, b) => (a.time as number) - (b.time as number));
       series.setMarkers(seriesMarkers);
+
+      // ── Movement glow overlays on the price line ────────────────
+      for (const ann of outcome.annotations ?? []) {
+        const startSec = Math.floor(Date.parse(ann.start_ts) / 1000);
+        const endSec = Math.floor(Date.parse(ann.end_ts) / 1000);
+        if (!Number.isFinite(startSec) || !Number.isFinite(endSec)) continue;
+
+        const glowKey = `${key}:${ann.start_ts}:${ann.end_ts}`;
+        activeGlowKeys.add(glowKey);
+
+        const glowData = chartData.filter(
+          (d) => d.time >= startSec && d.time <= endSec
+        );
+        if (glowData.length < 2) continue;
+
+        const isMovement = ann.kind === "movement";
+        const glowColor = isMovement
+          ? "rgba(80, 220, 140, 0.35)"
+          : "rgba(255, 170, 40, 0.25)";
+
+        let glowSeries = glowSeriesRef.current.get(glowKey);
+        if (!glowSeries) {
+          glowSeries = chart.addLineSeries({
+            color: glowColor,
+            lineWidth: 4,
+            crosshairMarkerVisible: false,
+            lastValueVisible: false,
+            priceLineVisible: false,
+            priceFormat: { type: "price", precision: 3, minMove: 0.001 },
+          });
+          glowSeriesRef.current.set(glowKey, glowSeries);
+        } else {
+          glowSeries.applyOptions({ color: glowColor });
+        }
+        glowSeries.setData(glowData);
+      }
+    }
+
+    // Clean up stale glow series
+    for (const [glowKey, glowSeries] of glowSeriesRef.current.entries()) {
+      if (activeGlowKeys.has(glowKey)) continue;
+      try { chart.removeSeries(glowSeries); } catch { /* already removed */ }
+      glowSeriesRef.current.delete(glowKey);
     }
 
     for (const [key, series] of seriesMap.entries()) {
@@ -1694,13 +1778,13 @@ export default function Page(props: PageProps) {
         }
         .signal-band {
           position: absolute;
-          border-radius: 10px;
-          opacity: 0.7;
+          border-radius: 6px;
+          opacity: 0.4;
           cursor: pointer;
           transition: opacity 0.15s;
         }
         .signal-band:hover {
-          opacity: 1;
+          opacity: 0.8;
         }
         .signal-tooltip {
           position: absolute;

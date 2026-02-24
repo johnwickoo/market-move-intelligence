@@ -86,7 +86,12 @@ async function recomputeMetrics(mv: OpenMovement) {
   if (validTicks.length < 2) return null;
 
   // Recompute price metrics
-  const firstMid = safeNum(validTicks[0].mid);
+  // Use the movement's original start_price as anchor if available — this is
+  // the frozen anchor from the first detection (chain extension preserves it).
+  // Only fall back to the first tick if no anchor was stored.
+  const firstMid = mv.start_price != null && Number.isFinite(mv.start_price)
+    ? mv.start_price
+    : safeNum(validTicks[0].mid);
   const lastMid = safeNum(validTicks[validTicks.length - 1].mid);
   let minMid = firstMid;
   let maxMid = firstMid;
@@ -114,12 +119,16 @@ async function recomputeMetrics(mv: OpenMovement) {
   const avgTradeSize = validTrades.length > 0 ? totalVolume / validTrades.length : null;
 
   // Velocity (price change per sqrt of minutes)
-  const elapsedMinutes = (settledEndMs - windowStartMs) / 60_000;
+  // Use the actual window duration (window_start → window_end), not the
+  // extended settle time (window_start → now). Using now would deflate
+  // velocity for movements detected hours ago.
+  const elapsedMinutes = (windowEndMs - windowStartMs) / 60_000;
   const velocity = driftPct != null && elapsedMinutes > 0
     ? Math.abs(driftPct) / Math.sqrt(elapsedMinutes)
     : 0;
 
   return {
+    start_price: firstMid,
     end_price: lastMid,
     pct_change: driftPct,
     min_price_24h: minMid,
@@ -145,6 +154,7 @@ async function finalizeOne(mv: OpenMovement) {
   // Update the movement row with settled metrics + mark FINAL
   const updateFields: Record<string, any> = { status: "FINAL" };
   if (settled) {
+    updateFields.start_price = settled.start_price;
     updateFields.end_price = settled.end_price;
     updateFields.pct_change = settled.pct_change;
     updateFields.min_price_24h = settled.min_price_24h;

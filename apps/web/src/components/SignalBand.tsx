@@ -4,7 +4,7 @@ import { createChart, UTCTimestamp } from "lightweight-charts";
 import { useEffect, useState } from "react";
 import type { Annotation } from "../lib/types";
 
-export const LANE_HEIGHT = 20; // 18px band + 2px gap
+export const LANE_HEIGHT = 12; // 10px band + 2px gap
 
 export function SignalBand({
   signal,
@@ -111,7 +111,7 @@ export function SignalBand({
         left: `${style.left}px`,
         width: `${style.width}px`,
         top: `${lane * LANE_HEIGHT}px`,
-        height: "18px",
+        height: "10px",
         background: signal.color,
       }}
       onMouseEnter={() => onHover(signal)}
