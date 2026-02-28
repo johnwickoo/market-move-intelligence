@@ -1,6 +1,3 @@
-export type StorageConfig = {
-  // TODO: define storage config
-};
 export type TradeInsert = {
   id: string;
   market_id: string;

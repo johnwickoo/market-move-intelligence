@@ -1,1 +1,0 @@
-// TODO: capital signal stub

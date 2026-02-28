@@ -1,1 +1,0 @@
-// TODO: polling ingestion stub

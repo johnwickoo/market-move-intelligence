@@ -1,1 +1,0 @@
-// TODO: movement detector stub
