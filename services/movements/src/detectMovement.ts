@@ -42,9 +42,6 @@ type MovementInsert = {
 };
 
 // ── Window definitions ────────────────────────────────────────────────
-// Each window has its own duration, price threshold, and idempotency bucket.
-// Shorter windows use tighter thresholds — a 3% move in 5m is significant,
-// while 4h needs 8%+ to filter daily noise.
 type WindowDef = {
   type: WindowType;
   ms: number;
@@ -52,12 +49,13 @@ type WindowDef = {
   thinPriceThreshold: number;
   minAbsMove: number;
   volumeThreshold: number;
-  minTicks: number;        // minimum mid ticks to evaluate
-  minTrades: number;       // minimum trades to evaluate
-  bucketDivisorMs: number; // idempotency bucket size
-  cooldownMs: number;      // per-key anti-spam cooldown
+  minTicks: number;
+  minTrades: number;
+  bucketDivisorMs: number;
+  cooldownMs: number;
 };
 
+// Ordered smallest → largest for compound graduation.
 const WINDOWS: WindowDef[] = [
   {
     type: "5m",
@@ -68,7 +66,7 @@ const WINDOWS: WindowDef[] = [
     volumeThreshold: Number(process.env.MOVEMENT_5M_VOLUME_THRESHOLD ?? 2.0),
     minTicks: 2,
     minTrades: 2,
-    bucketDivisorMs: 5 * 60_000,   // 1 signal per 5min bucket
+    bucketDivisorMs: 5 * 60_000,
     cooldownMs: Number(process.env.MOVEMENT_5M_COOLDOWN_MS ?? 60_000),
   },
   {
@@ -109,6 +107,14 @@ const WINDOWS: WindowDef[] = [
   },
 ];
 
+const WINDOW_ORDER: WindowType[] = WINDOWS.map((w) => w.type);
+function windowIndex(t: WindowType): number {
+  return WINDOW_ORDER.indexOf(t);
+}
+function windowDef(t: WindowType): WindowDef | undefined {
+  return WINDOWS.find((w) => w.type === t);
+}
+
 // ── Shared config ────────────────────────────────────────────────────
 const MIN_PRICE_FOR_ALERT = Number(process.env.MOVEMENT_MIN_PRICE_FOR_ALERT ?? 0.05);
 const CONFIRM_MINUTES = Number(process.env.MOVEMENT_CONFIRM_MINUTES ?? 5);
@@ -117,22 +123,71 @@ const THIN_TRADE_COUNT = 15;
 const THIN_PRICE_LEVELS = 8;
 const WIDE_SPREAD = 0.05;
 
-// Velocity significance: |price_delta| / sqrt(minutes)
-// A 5% move in 5min = 0.05/sqrt(5) = 0.022
-// An 8% move in 4h  = 0.08/sqrt(240) = 0.005
 const VELOCITY_THRESHOLD = Number(process.env.MOVEMENT_VELOCITY_THRESHOLD ?? 0.008);
-
-// Minimum drift required for volume-only signals. Prevents noise from
-// high-volume events where price barely moves (e.g., 6x volume but 0.5% drift).
 const MIN_DRIFT_FOR_VOLUME = Number(process.env.MOVEMENT_MIN_DRIFT_FOR_VOLUME ?? 0.02);
 
-// Global per-market cooldown: max 1 signal per market+outcome across ALL
-// window types. Prevents 5m+15m+1h+4h from all firing for the same move.
-const GLOBAL_COOLDOWN_MS = Number(process.env.MOVEMENT_GLOBAL_COOLDOWN_MS ?? 180_000);
-const lastEmitMs = new Map<string, number>();
+// Pre-move anchor lookback: how far before the window start to find the
+// "resting" price before the move began. Default 5 minutes.
+const ANCHOR_LOOKBACK_MS = Number(process.env.MOVEMENT_ANCHOR_LOOKBACK_MS ?? 5 * 60_000);
 
 // Minimum elapsed time for "event" window (since-last-signal anchoring).
 const EVENT_MIN_ELAPSED_MS = Number(process.env.MOVEMENT_EVENT_MIN_ELAPSED_MS ?? 10 * 60_000);
+
+// ── Compound movement tracker ────────────────────────────────────────
+// Instead of 4 independent windows, track one active compound movement
+// per market+outcome. The movement starts at the smallest triggered window
+// and graduates upward as momentum continues.
+type ActiveCompound = {
+  windowType: WindowType;     // current graduated window
+  anchorPrice: number;        // pre-move price (frozen)
+  anchorTs: number;           // timestamp of anchor price
+  dbId: string;               // movement row ID in DB
+  firstDetectMs: number;      // when first threshold crossed
+  lastUpdateMs: number;       // last time we extended/graduated
+  marketId: string;           // for stale cleanup validation
+};
+const activeCompound = new Map<string, ActiveCompound>();
+
+// Stale compound cleanup: evict entries that haven't been updated in 2× their window duration.
+const STALE_CLEANUP_INTERVAL_MS = 60_000;
+let lastStaleCleanupMs = 0;
+
+function cleanupStaleCompounds(nowMs: number) {
+  if (nowMs - lastStaleCleanupMs < STALE_CLEANUP_INTERVAL_MS) return;
+  lastStaleCleanupMs = nowMs;
+
+  for (const [key, compound] of activeCompound) {
+    const wDef = windowDef(compound.windowType);
+    const staleCutoff = wDef ? wDef.ms * 2 : 30 * 60_000;
+    if (nowMs - compound.lastUpdateMs > staleCutoff) {
+      activeCompound.delete(key);
+    }
+  }
+
+  // Also clean stale entries from anti-spam maps (1 hour TTL)
+  const mapTtl = 60 * 60_000;
+  for (const [key, ts] of lastEmitMs) {
+    if (nowMs - ts > mapTtl) lastEmitMs.delete(key);
+  }
+  for (const [key, ts] of lastCheckedMs) {
+    if (nowMs - ts > mapTtl) lastCheckedMs.delete(key);
+  }
+}
+
+/** Clear all in-memory state for a market (call when slug is untracked). */
+export function clearMarketState(marketId: string) {
+  for (const key of [...activeCompound.keys()]) {
+    if (key.startsWith(marketId + ":")) activeCompound.delete(key);
+  }
+  for (const key of [...lastEmitMs.keys()]) {
+    if (key.startsWith(marketId + ":")) lastEmitMs.delete(key);
+  }
+  for (const key of [...lastCheckedMs.keys()]) {
+    if (key.startsWith(marketId + ":")) lastCheckedMs.delete(key);
+  }
+}
+
+const lastEmitMs = new Map<string, number>();
 
 function toNum(x: any): number {
   const n = typeof x === "number" ? x : Number(x);
@@ -155,11 +210,265 @@ function shouldSkipCompute(key: string, nowMs: number, cooldownMs: number): bool
 }
 
 // ── Velocity calculation ─────────────────────────────────────────────
-// Normalizes price change by sqrt(time) — standard diffusion scaling.
-// This makes a 3% move in 5 minutes score higher than an 8% move in 4 hours.
 function computeVelocity(absDrift: number, windowMinutes: number): number {
   if (windowMinutes <= 0) return 0;
   return absDrift / Math.sqrt(windowMinutes);
+}
+
+// ── Window evaluation result ─────────────────────────────────────────
+type WindowEval = {
+  w: WindowDef;
+  ticks: any[];
+  trades: any[];
+  startMid: number | null;
+  endMid: number | null;
+  minMid: number | null;
+  maxMid: number | null;
+  avgSpreadPct: number | null;
+  driftPct: number | null;
+  rangePct: number | null;
+  absMove: number | null;
+  volume: number;
+  tradesCount: number;
+  uniquePriceLevels: number;
+  avgTradeSize: number | null;
+  maxHourVol: number;
+  volumeRatio: number | null;
+  hourlyRatio: number | null;
+  thinLiquidity: boolean;
+  velocity: number | null;
+  priceHit: boolean;
+  priceConfirmed: boolean;
+  volHit: boolean;
+  velocityHit: boolean;
+  wStartMs: number;
+};
+
+/** Find the pre-move anchor price by looking back ANCHOR_LOOKBACK_MS before windowStart. */
+function findPreMoveAnchor(
+  allTicks: any[],
+  windowStartMs: number,
+  firstSeenMs: number | null,
+): { price: number; ts: number } | null {
+  const lookbackMs = windowStartMs - ANCHOR_LOOKBACK_MS;
+  const floor = firstSeenMs != null ? Math.max(lookbackMs, firstSeenMs) : lookbackMs;
+
+  // allTicks are descending (newest-first). Find ticks in [floor, windowStartMs].
+  let bestTick: { mid: number; ts: number } | null = null;
+  let bestDist = Infinity;
+
+  for (const tk of allTicks) {
+    if (tk.mid == null) continue;
+    const ts = Date.parse(tk.ts);
+    if (!Number.isFinite(ts)) continue;
+    if (ts > windowStartMs || ts < floor) continue;
+
+    // Find the tick closest to the lookback target (5 min before window start)
+    const dist = Math.abs(ts - lookbackMs);
+    if (dist < bestDist) {
+      bestDist = dist;
+      bestTick = { mid: safeNum(tk.mid), ts };
+    }
+  }
+
+  if (bestTick && bestTick.mid >= MIN_PRICE_FOR_ALERT) {
+    return { price: bestTick.mid, ts: bestTick.ts };
+  }
+  return null;
+}
+
+/** Evaluate a single window's metrics against its thresholds. */
+function evaluateWindow(
+  w: WindowDef,
+  allTicks: any[],
+  allTrades: any[],
+  nowMs: number,
+  baselineHourly: number | null,
+): WindowEval | null {
+  const wStartMs = nowMs - w.ms;
+  const ticks = (allTicks
+    ? allTicks.filter((t) => {
+        const ts = Date.parse(t.ts);
+        return Number.isFinite(ts) && ts >= wStartMs && ts <= nowMs;
+      })
+    : []).sort((a, b) => Date.parse(a.ts) - Date.parse(b.ts));
+  const trades = allTrades.filter((t) => {
+    const ts = Date.parse(t.timestamp);
+    return Number.isFinite(ts) && ts >= wStartMs && ts <= nowMs;
+  });
+
+  if (ticks.length < w.minTicks && trades.length < w.minTrades) return null;
+  const hasTicks = ticks.length >= 2;
+
+  if (hasTicks) {
+    const lastMid = safeNum(ticks[ticks.length - 1].mid);
+    if (lastMid < MIN_PRICE_FOR_ALERT) return null;
+  }
+
+  // Price analysis
+  let startMid: number | null = null;
+  let endMid: number | null = null;
+  let minMid: number | null = null;
+  let maxMid: number | null = null;
+  let avgSpreadPct: number | null = null;
+
+  if (hasTicks) {
+    startMid = ticks[0].mid == null ? null : safeNum(ticks[0].mid);
+    endMid = ticks[ticks.length - 1].mid == null ? null : safeNum(ticks[ticks.length - 1].mid);
+    let spreadSum = 0;
+    let spreadN = 0;
+    for (const tk of ticks) {
+      if (tk.mid == null) continue;
+      const m = safeNum(tk.mid);
+      minMid = minMid == null ? m : Math.min(minMid, m);
+      maxMid = maxMid == null ? m : Math.max(maxMid, m);
+      if (tk.spread_pct != null) {
+        spreadSum += safeNum(tk.spread_pct);
+        spreadN += 1;
+      }
+    }
+    avgSpreadPct = spreadN > 0 ? spreadSum / spreadN : null;
+  }
+
+  // Trade stats
+  const tradesCount = trades.length;
+  const volume = trades.reduce((sum, t) => sum + safeNum(t.size ?? 0), 0);
+  const avgTradeSize = tradesCount > 0 ? volume / tradesCount : null;
+  const priceLevelsSet = new Set<number>();
+  for (const t of trades) {
+    if (t.price == null) continue;
+    priceLevelsSet.add(Number(safeNum(t.price).toFixed(2)));
+  }
+  const uniquePriceLevels = priceLevelsSet.size;
+
+  // Liquidity guard
+  const thinBySpread = avgSpreadPct != null && avgSpreadPct >= WIDE_SPREAD;
+  const thinByActivity = tradesCount < THIN_TRADE_COUNT || uniquePriceLevels < THIN_PRICE_LEVELS;
+  const thinLiquidity = thinByActivity || (thinBySpread && tradesCount < THIN_TRADE_COUNT * 4);
+
+  // Price metrics
+  const driftPct =
+    startMid != null && endMid != null && startMid > 0
+      ? (endMid - startMid) / startMid
+      : null;
+  const rangePct =
+    minMid != null && maxMid != null && minMid > 0
+      ? (maxMid - minMid) / minMid
+      : null;
+  const absMove =
+    minMid != null && maxMid != null ? Math.abs(maxMid - minMid) : null;
+
+  const priceEligible = minMid != null && minMid >= MIN_PRICE_FOR_ALERT;
+  const threshold = thinLiquidity ? w.thinPriceThreshold : w.priceThreshold;
+  const driftHit = driftPct != null && Math.abs(driftPct) >= threshold;
+  const absHit = absMove != null && absMove >= w.minAbsMove;
+  const priceHit = hasTicks && priceEligible && absHit && driftHit;
+
+  // Volume metrics
+  const windowHours = w.ms / (60 * 60_000);
+  const scaledBaseline = baselineHourly != null ? baselineHourly * windowHours : null;
+  const volumeRatio =
+    scaledBaseline != null && scaledBaseline > 0 ? volume / scaledBaseline : null;
+
+  const hourMs = 60 * 60_000;
+  const hourlySums = new Map<number, number>();
+  for (const t of trades) {
+    const ts = Date.parse(t.timestamp);
+    if (!Number.isFinite(ts)) continue;
+    const b = Math.floor((ts - wStartMs) / hourMs);
+    hourlySums.set(b, (hourlySums.get(b) ?? 0) + safeNum(t.size ?? 0));
+  }
+  let maxHourVol = 0;
+  for (const v of hourlySums.values()) maxHourVol = Math.max(maxHourVol, v);
+  const hourlyRatio =
+    baselineHourly != null && baselineHourly > 0 ? maxHourVol / baselineHourly : null;
+
+  const volHit =
+    (volumeRatio != null && volumeRatio >= w.volumeThreshold) ||
+    (hourlyRatio != null && hourlyRatio >= w.volumeThreshold);
+
+  // Velocity
+  const windowMinutes = w.ms / 60_000;
+  const velocity =
+    driftPct != null ? computeVelocity(Math.abs(driftPct), windowMinutes) : null;
+  const velocityHit = velocity != null && velocity >= VELOCITY_THRESHOLD;
+
+  // Confirmation for short windows without volume
+  let priceConfirmed = priceHit;
+  if (priceHit && !volHit && !velocityHit && hasTicks && startMid != null && endMid != null) {
+    const confirmMs = Math.max(1, CONFIRM_MINUTES) * 60_000;
+    const confirmStartMs = nowMs - confirmMs;
+    let wCount = 0;
+    let wMin: number | null = null;
+    let wMax: number | null = null;
+    for (const tk of ticks) {
+      const ts = Date.parse(tk.ts);
+      if (!Number.isFinite(ts) || ts < confirmStartMs) continue;
+      if (tk.mid == null) continue;
+      const m = safeNum(tk.mid);
+      wMin = wMin == null ? m : Math.min(wMin, m);
+      wMax = wMax == null ? m : Math.max(wMax, m);
+      wCount += 1;
+    }
+    const confirmThresh = threshold * 0.5;
+    if (wCount >= CONFIRM_MIN_TICKS && wMin != null && wMax != null) {
+      const upMove = endMid >= startMid;
+      priceConfirmed = upMove
+        ? wMin >= startMid * (1 + confirmThresh) || (wMin - startMid) >= w.minAbsMove
+        : wMax <= startMid * (1 - confirmThresh) || (startMid - wMax) >= w.minAbsMove;
+    } else {
+      priceConfirmed = false;
+    }
+  }
+
+  return {
+    w,
+    ticks,
+    trades,
+    startMid,
+    endMid,
+    minMid,
+    maxMid,
+    avgSpreadPct,
+    driftPct,
+    rangePct,
+    absMove,
+    volume,
+    tradesCount,
+    uniquePriceLevels,
+    avgTradeSize,
+    maxHourVol,
+    volumeRatio,
+    hourlyRatio,
+    thinLiquidity,
+    velocity,
+    priceHit,
+    priceConfirmed,
+    volHit,
+    velocityHit,
+    wStartMs,
+  };
+}
+
+/** Check if a window evaluation passes the firing criteria. */
+function windowFires(ev: WindowEval): boolean {
+  if (!ev.priceConfirmed && !ev.volHit && !ev.velocityHit) return false;
+  // Volume-only signals require meaningful price movement.
+  if (ev.volHit && !ev.priceConfirmed && !ev.velocityHit) {
+    const absDrift = ev.driftPct != null ? Math.abs(ev.driftPct) : 0;
+    if (absDrift < MIN_DRIFT_FOR_VOLUME) return false;
+  }
+  return true;
+}
+
+function classifyReason(ev: WindowEval): MovementInsert["reason"] {
+  return ev.velocityHit && ev.priceConfirmed
+    ? "VELOCITY"
+    : ev.priceConfirmed && ev.volHit
+      ? "BOTH"
+      : ev.priceConfirmed
+        ? "PRICE"
+        : "VOLUME";
 }
 
 // ── Main entry point ─────────────────────────────────────────────────
@@ -168,6 +477,9 @@ export async function detectMovement(trade: TradeInsert) {
   const outcome = (trade as any).outcome ? String((trade as any).outcome) : null;
   const nowMs = Date.parse(trade.timestamp);
   if (!Number.isFinite(nowMs)) return;
+
+  // Periodic cleanup of stale compound entries and anti-spam maps
+  cleanupStaleCompounds(nowMs);
 
   // Fetch aggregate stats once (shared across windows)
   const { data: agg, error: aggErr } = await supabase
@@ -196,21 +508,15 @@ export async function detectMovement(trade: TradeInsert) {
   const baselineDaily = totalVol == null || !baselineOk ? null : totalVol / observedDays;
   const baselineHourly = baselineDaily == null ? null : baselineDaily / 24;
 
-  // Find the longest window we need data for (4h)
+  // Fetch data for the full 4h window + anchor lookback
   const maxWindowMs = Math.max(...WINDOWS.map((w) => w.ms));
-  const outerStartMs = nowMs - maxWindowMs;
+  const outerStartMs = nowMs - maxWindowMs - ANCHOR_LOOKBACK_MS;
   let outerStartISO = new Date(outerStartMs).toISOString();
   if (firstSeenMs != null && firstSeenMs > outerStartMs) {
     outerStartISO = new Date(firstSeenMs).toISOString();
   }
   const endISO = new Date(nowMs).toISOString();
 
-  // ── Fetch ticks + trades once for the full 4h window ────────────
-  // Use DESCENDING order so the row-limit cap (PostgREST max_rows, typically
-  // 1000) cuts the oldest, least-relevant records rather than the most recent
-  // ones. Short-window analysis (5m, 15m) depends on recent data — with
-  // ascending order a busy market would return 1000 rows from hours ago and
-  // contain zero trades in the last 5 minutes.
   let tq = supabase
     .from("trades")
     .select("price,size,timestamp,outcome")
@@ -255,229 +561,204 @@ export async function detectMovement(trade: TradeInsert) {
     }
   }
 
-  // ── Evaluate each window ───────────────────────────────────────
-  for (const w of WINDOWS) {
-    const computeKey = `${marketId}:${outcome ?? "NA"}:${w.type}`;
-    if (shouldSkipCompute(computeKey, nowMs, w.cooldownMs)) continue;
+  // ── Compound detection ─────────────────────────────────────────
+  const compoundKey = `${marketId}:${outcome ?? "NA"}`;
+  const active = activeCompound.get(compoundKey);
 
-    const wStartMs = nowMs - w.ms;
-    const wStartISO = new Date(Math.max(wStartMs, firstSeenMs ?? 0)).toISOString();
+  if (!active) {
+    // No active compound — evaluate windows smallest-first, fire on first hit.
+    for (const w of WINDOWS) {
+      const computeKey = `${compoundKey}:${w.type}`;
+      if (shouldSkipCompute(computeKey, nowMs, w.cooldownMs)) continue;
 
-    // Filter ticks/trades to this window.
-    // allTicks/allTrades are in descending order (newest-first) from the DB
-    // query; sort ticks ascending here so ticks[0]=oldest and ticks[last]=newest
-    // for correct startMid/endMid price analysis. Trades are only used for
-    // count/volume/levels so their order does not matter.
-    const ticks = (allTicks
-      ? allTicks.filter((t) => {
-          const ts = Date.parse(t.ts);
-          return Number.isFinite(ts) && ts >= wStartMs && ts <= nowMs;
-        })
-      : []).sort((a, b) => Date.parse(a.ts) - Date.parse(b.ts));
-    const trades = allTrades.filter((t) => {
-      const ts = Date.parse(t.timestamp);
-      return Number.isFinite(ts) && ts >= wStartMs && ts <= nowMs;
-    });
+      const ev = evaluateWindow(w, allTicks ?? [], allTrades, nowMs, baselineHourly);
+      if (!ev || !windowFires(ev)) continue;
 
-    if (ticks.length < w.minTicks && trades.length < w.minTrades) continue;
-    const hasTicks = ticks.length >= 2;
+      // Find pre-move anchor price (5min before window start)
+      const preAnchor = findPreMoveAnchor(allTicks ?? [], ev.wStartMs, firstSeenMs);
+      const anchorPrice = preAnchor?.price ?? ev.startMid;
+      const anchorTs = preAnchor?.ts ?? ev.wStartMs;
 
-    // Skip outcomes priced below the alert floor — prevents noise from
-    // penny-priced child markets in multi-outcome events.
-    if (hasTicks) {
-      const lastMid = safeNum(ticks[ticks.length - 1].mid);
-      if (lastMid < MIN_PRICE_FOR_ALERT) continue;
+      // Recompute drift from pre-move anchor to current end price
+      const anchoredDrift =
+        anchorPrice != null && anchorPrice > 0 && ev.endMid != null
+          ? (ev.endMid - anchorPrice) / anchorPrice
+          : ev.driftPct;
+
+      const reason = classifyReason(ev);
+      const bucketId = Math.floor(nowMs / w.bucketDivisorMs);
+      const movementId = `${compoundKey}:${w.type}:${bucketId}`;
+      const wStartISO = new Date(Math.max(anchorTs, firstSeenMs ?? 0)).toISOString();
+
+      const row: MovementInsert = {
+        id: movementId,
+        market_id: marketId,
+        outcome,
+        window_type: w.type,
+        window_start: wStartISO,
+        window_end: endISO,
+        start_price: anchorPrice,
+        end_price: ev.endMid,
+        pct_change: anchoredDrift,
+        volume_24h: ev.volume,
+        baseline_daily_volume: baselineDaily,
+        volume_ratio: ev.volumeRatio,
+        reason,
+        min_price_24h: ev.minMid,
+        max_price_24h: ev.maxMid,
+        range_pct: ev.rangePct,
+        max_hour_volume: ev.maxHourVol,
+        hourly_volume_ratio: ev.hourlyRatio,
+        trades_count_24h: ev.tradesCount,
+        unique_price_levels_24h: ev.uniquePriceLevels,
+        avg_trade_size_24h: ev.avgTradeSize,
+        thin_liquidity: ev.thinLiquidity,
+        velocity: ev.velocity,
+      };
+
+      const inserted = await insertMovement(row, marketId, outcome, ev.thinLiquidity);
+      if (inserted) {
+        lastEmitMs.set(compoundKey, nowMs);
+        activeCompound.set(compoundKey, {
+          windowType: w.type,
+          anchorPrice: anchorPrice!,
+          anchorTs,
+          dbId: movementId,
+          firstDetectMs: nowMs,
+          lastUpdateMs: nowMs,
+          marketId,
+        });
+      }
+      break; // Only fire the smallest triggering window
+    }
+  } else {
+    // Active compound exists — try to graduate or extend.
+    const curIdx = windowIndex(active.windowType);
+    const curDef = windowDef(active.windowType);
+    if (!curDef) {
+      activeCompound.delete(compoundKey);
+      return;
     }
 
-    // ── Price analysis from mid ticks ──
-    let startMid: number | null = null;
-    let endMid: number | null = null;
-    let minMid: number | null = null;
-    let maxMid: number | null = null;
-    let avgSpreadPct: number | null = null;
+    // Check if movement has gone stale (no activity in 2× window duration)
+    if (nowMs - active.lastUpdateMs > curDef.ms * 2) {
+      activeCompound.delete(compoundKey);
+      // Fall through — next call will start fresh
+      return;
+    }
 
-    if (hasTicks) {
-      startMid = ticks[0].mid == null ? null : safeNum(ticks[0].mid);
-      endMid = ticks[ticks.length - 1].mid == null ? null : safeNum(ticks[ticks.length - 1].mid);
-      let spreadSum = 0;
-      let spreadN = 0;
-      for (const tk of ticks) {
-        if (tk.mid == null) continue;
-        const m = safeNum(tk.mid);
-        minMid = minMid == null ? m : Math.min(minMid, m);
-        maxMid = maxMid == null ? m : Math.max(maxMid, m);
-        if (tk.spread_pct != null) {
-          spreadSum += safeNum(tk.spread_pct);
-          spreadN += 1;
+    // Try graduation to the next window up
+    let graduated = false;
+    const nextIdx = curIdx + 1;
+    if (nextIdx < WINDOWS.length) {
+      const nextW = WINDOWS[nextIdx];
+      const elapsedSinceFirst = nowMs - active.firstDetectMs;
+
+      // Only graduate if enough time has elapsed for the next window
+      if (elapsedSinceFirst >= nextW.ms * 0.5) {
+        const ev = evaluateWindow(nextW, allTicks ?? [], allTrades, nowMs, baselineHourly);
+        if (ev) {
+          // Check threshold against the compound's frozen anchor price
+          const anchoredDrift =
+            active.anchorPrice > 0 && ev.endMid != null
+              ? (ev.endMid - active.anchorPrice) / active.anchorPrice
+              : ev.driftPct;
+          const threshold = ev.thinLiquidity ? nextW.thinPriceThreshold : nextW.priceThreshold;
+          const anchoredDriftHit = anchoredDrift != null && Math.abs(anchoredDrift) >= threshold;
+          const anchoredAbsMove =
+            ev.endMid != null ? Math.abs(ev.endMid - active.anchorPrice) : null;
+          const anchoredAbsHit = anchoredAbsMove != null && anchoredAbsMove >= nextW.minAbsMove;
+
+          if (anchoredDriftHit && anchoredAbsHit && ev.ticks.length >= nextW.minTicks) {
+            // Graduate the movement
+            const delayMs = FINALIZE_DELAY_MS[nextW.type] ?? 15 * 60_000;
+            const finalizeAt = new Date(Date.now() + delayMs).toISOString();
+
+            const newMin = ev.minMid != null ? Math.min(active.anchorPrice, ev.minMid) : active.anchorPrice;
+            const newMax = ev.maxMid != null ? Math.max(active.anchorPrice, ev.maxMid) : active.anchorPrice;
+            const newRangePct =
+              Number.isFinite(newMin) && Number.isFinite(newMax) && newMin > 0
+                ? (newMax - newMin) / newMin
+                : ev.rangePct;
+
+            const { error: gradErr } = await supabase
+              .from("market_movements")
+              .update({
+                window_type: nextW.type,
+                window_end: endISO,
+                end_price: ev.endMid,
+                pct_change: anchoredDrift,
+                min_price_24h: Number.isFinite(newMin) ? newMin : null,
+                max_price_24h: Number.isFinite(newMax) ? newMax : null,
+                range_pct: newRangePct,
+                volume_24h: ev.volume,
+                trades_count_24h: ev.tradesCount,
+                avg_trade_size_24h: ev.avgTradeSize,
+                thin_liquidity: ev.thinLiquidity,
+                finalize_at: finalizeAt,
+              })
+              .eq("id", active.dbId);
+
+            if (!gradErr) {
+              graduated = true;
+              active.windowType = nextW.type;
+              active.lastUpdateMs = nowMs;
+              console.log(
+                `[movement] GRADUATE ${WINDOW_ORDER[curIdx]}→${nextW.type} id=${active.dbId.slice(0, 24)} ` +
+                `anchor=${active.anchorPrice.toFixed(4)} end=${ev.endMid?.toFixed(4) ?? "n/a"} ` +
+                `drift=${anchoredDrift?.toFixed(3) ?? "n/a"}`
+              );
+            } else {
+              console.error("[movement] graduate failed", active.dbId, gradErr.message);
+            }
+          }
         }
       }
-      avgSpreadPct = spreadN > 0 ? spreadSum / spreadN : null;
     }
 
-    // ── Trade stats ──
-    const tradesCount = trades.length;
-    const volume = trades.reduce((sum, t) => sum + safeNum(t.size ?? 0), 0);
-    const avgTradeSize = tradesCount > 0 ? volume / tradesCount : null;
-    const priceLevelsSet = new Set<number>();
-    for (const t of trades) {
-      if (t.price == null) continue;
-      priceLevelsSet.add(Number(safeNum(t.price).toFixed(2)));
-    }
-    const uniquePriceLevels = priceLevelsSet.size;
+    // If not graduated, extend the current window (update end_price, push finalize)
+    if (!graduated) {
+      const ev = evaluateWindow(curDef, allTicks ?? [], allTrades, nowMs, baselineHourly);
+      if (ev && ev.endMid != null) {
+        const anchoredDrift =
+          active.anchorPrice > 0
+            ? (ev.endMid - active.anchorPrice) / active.anchorPrice
+            : ev.driftPct;
 
-    // ── Liquidity guard ──
-    const thinBySpread = avgSpreadPct != null && avgSpreadPct >= WIDE_SPREAD;
-    const thinByActivity = tradesCount < THIN_TRADE_COUNT || uniquePriceLevels < THIN_PRICE_LEVELS;
-    // Wide spread alone does not indicate thin liquidity when there is substantial
-    // trade activity. A large spread during a fast move reflects price discovery,
-    // not lack of participation. Only use spread as a thin signal when trade count
-    // is also low (< 4× the baseline thin threshold).
-    const thinLiquidity = thinByActivity || (thinBySpread && tradesCount < THIN_TRADE_COUNT * 4);
+        const delayMs = FINALIZE_DELAY_MS[active.windowType] ?? 15 * 60_000;
+        const finalizeAt = new Date(Date.now() + delayMs).toISOString();
 
-    // ── Price metrics ──
-    const driftPct =
-      startMid != null && endMid != null && startMid > 0
-        ? (endMid - startMid) / startMid
-        : null;
-    const rangePct =
-      minMid != null && maxMid != null && minMid > 0
-        ? (maxMid - minMid) / minMid
-        : null;
-    const absMove =
-      minMid != null && maxMid != null ? Math.abs(maxMid - minMid) : null;
+        const { error: extErr } = await supabase
+          .from("market_movements")
+          .update({
+            window_end: endISO,
+            end_price: ev.endMid,
+            pct_change: anchoredDrift,
+            min_price_24h: ev.minMid,
+            max_price_24h: ev.maxMid,
+            range_pct: ev.rangePct,
+            volume_24h: ev.volume,
+            trades_count_24h: ev.tradesCount,
+            avg_trade_size_24h: ev.avgTradeSize,
+            thin_liquidity: ev.thinLiquidity,
+            finalize_at: finalizeAt,
+          })
+          .eq("id", active.dbId);
 
-    const priceEligible = minMid != null && minMid >= MIN_PRICE_FOR_ALERT;
-    const threshold = thinLiquidity ? w.thinPriceThreshold : w.priceThreshold;
-    const driftHit = driftPct != null && Math.abs(driftPct) >= threshold;
-    const absHit = absMove != null && absMove >= w.minAbsMove;
-    // Require directional drift — range alone (oscillation without net move) is noise.
-    const priceHit = hasTicks && priceEligible && absHit && driftHit;
-
-    // ── Volume metrics ──
-    // Scale hourly volume against baseline for this window's duration
-    const windowHours = w.ms / (60 * 60_000);
-    const scaledBaseline = baselineHourly != null ? baselineHourly * windowHours : null;
-    const volumeRatio =
-      scaledBaseline != null && scaledBaseline > 0 ? volume / scaledBaseline : null;
-
-    // Hourly max within this window
-    const hourMs = 60 * 60_000;
-    const hourlySums = new Map<number, number>();
-    for (const t of trades) {
-      const ts = Date.parse(t.timestamp);
-      if (!Number.isFinite(ts)) continue;
-      const b = Math.floor((ts - wStartMs) / hourMs);
-      hourlySums.set(b, (hourlySums.get(b) ?? 0) + safeNum(t.size ?? 0));
-    }
-    let maxHourVol = 0;
-    for (const v of hourlySums.values()) maxHourVol = Math.max(maxHourVol, v);
-    const hourlyRatio =
-      baselineHourly != null && baselineHourly > 0 ? maxHourVol / baselineHourly : null;
-
-    const volHit =
-      (volumeRatio != null && volumeRatio >= w.volumeThreshold) ||
-      (hourlyRatio != null && hourlyRatio >= w.volumeThreshold);
-
-    // ── Velocity metric ──
-    const windowMinutes = w.ms / 60_000;
-    const velocity =
-      driftPct != null ? computeVelocity(Math.abs(driftPct), windowMinutes) : null;
-    const velocityHit = velocity != null && velocity >= VELOCITY_THRESHOLD;
-
-    // ── Confirmation for short windows without volume ──
-    let priceConfirmed = priceHit;
-    if (priceHit && !volHit && !velocityHit && hasTicks && startMid != null && endMid != null) {
-      const confirmMs = Math.max(1, CONFIRM_MINUTES) * 60_000;
-      const confirmStartMs = nowMs - confirmMs;
-      let wCount = 0;
-      let wMin: number | null = null;
-      let wMax: number | null = null;
-      for (const tk of ticks) {
-        const ts = Date.parse(tk.ts);
-        if (!Number.isFinite(ts) || ts < confirmStartMs) continue;
-        if (tk.mid == null) continue;
-        const m = safeNum(tk.mid);
-        wMin = wMin == null ? m : Math.min(wMin, m);
-        wMax = wMax == null ? m : Math.max(wMax, m);
-        wCount += 1;
-      }
-      const confirmThresh = threshold * 0.5;
-      if (wCount >= CONFIRM_MIN_TICKS && wMin != null && wMax != null) {
-        const upMove = endMid >= startMid;
-        priceConfirmed = upMove
-          ? wMin >= startMid * (1 + confirmThresh) || (wMin - startMid) >= w.minAbsMove
-          : wMax <= startMid * (1 - confirmThresh) || (startMid - wMax) >= w.minAbsMove;
-      } else {
-        priceConfirmed = false;
+        if (!extErr) {
+          active.lastUpdateMs = nowMs;
+        }
       }
     }
-
-    // ── Decision: emit? ──
-    if (!priceConfirmed && !volHit && !velocityHit) continue;
-
-    // Volume-only signals require meaningful price movement — suppress
-    // "high volume, flat price" noise.
-    if (volHit && !priceConfirmed && !velocityHit) {
-      const absDrift = driftPct != null ? Math.abs(driftPct) : 0;
-      if (absDrift < MIN_DRIFT_FOR_VOLUME) continue;
-    }
-
-    // Global per-market cooldown: only 1 signal per market+outcome every N ms
-    // across all window types. Prevents burst of 5m+15m+1h+4h for one move.
-    const globalKey = `${marketId}:${outcome ?? "NA"}`;
-    const lastEmit = lastEmitMs.get(globalKey) ?? 0;
-    if (nowMs - lastEmit < GLOBAL_COOLDOWN_MS) continue;
-
-    const reason: MovementInsert["reason"] =
-      velocityHit && priceConfirmed
-        ? "VELOCITY"
-        : priceConfirmed && volHit
-          ? "BOTH"
-          : priceConfirmed
-            ? "PRICE"
-            : "VOLUME";
-
-    const bucketId = Math.floor(nowMs / w.bucketDivisorMs);
-    const movementId = `${marketId}:${outcome ?? "NA"}:${w.type}:${bucketId}`;
-
-    const row: MovementInsert = {
-      id: movementId,
-      market_id: marketId,
-      outcome,
-      window_type: w.type,
-      window_start: wStartISO,
-      window_end: endISO,
-      start_price: startMid,
-      end_price: endMid,
-      pct_change: driftPct,
-      volume_24h: volume,
-      baseline_daily_volume: baselineDaily,
-      volume_ratio: volumeRatio,
-      reason,
-      min_price_24h: minMid,
-      max_price_24h: maxMid,
-      range_pct: rangePct,
-      max_hour_volume: maxHourVol,
-      hourly_volume_ratio: hourlyRatio,
-      trades_count_24h: tradesCount,
-      unique_price_levels_24h: uniquePriceLevels,
-      avg_trade_size_24h: avgTradeSize,
-      thin_liquidity: thinLiquidity,
-      velocity,
-    };
-
-    const inserted = await insertMovement(row, marketId, outcome, thinLiquidity);
-    if (inserted) lastEmitMs.set(globalKey, nowMs);
   }
 
-  // ── "event" window: since last signal ──────────────────────────
+  // ── "event" window: since last signal (unchanged) ──────────────
   if (lastMoveEndPrice != null && lastMoveEndISO != null) {
-    const eventComputeKey = `${marketId}:${outcome ?? "NA"}:event`;
+    const eventComputeKey = `${compoundKey}:event`;
     if (!shouldSkipCompute(eventComputeKey, nowMs, 60_000)) {
       const eventStartMs = Date.parse(lastMoveEndISO);
       const eventElapsedMs = Number.isFinite(eventStartMs) ? nowMs - eventStartMs : 0;
       if (Number.isFinite(eventStartMs) && eventStartMs < nowMs && eventElapsedMs >= EVENT_MIN_ELAPSED_MS) {
-        // Sort ascending so eventTicks[last] is the most recent tick (eLastMid).
         const eventTicks = (allTicks
           ? allTicks.filter((t) => {
               const ts = Date.parse(t.ts);
@@ -510,17 +791,14 @@ export async function detectMovement(trade: TradeInsert) {
           const eAbsMove =
             eMinMid != null && eMaxMid != null ? Math.abs(eMaxMid - eMinMid) : null;
 
-          // Use 1h thresholds for event window
           const eventThreshold = 0.06;
           const eventMinAbs = 0.03;
           const eDriftHit = eDriftPct != null && Math.abs(eDriftPct) >= eventThreshold;
           const eAbsHit = eAbsMove != null && eAbsMove >= eventMinAbs;
           const ePriceEligible = eMinMid != null && eMinMid >= MIN_PRICE_FOR_ALERT;
 
-          // Global cooldown also applies to event window
-          const eventGlobalKey = `${marketId}:${outcome ?? "NA"}`;
-          const eventLastEmit = lastEmitMs.get(eventGlobalKey) ?? 0;
-          const eventCooldownOk = nowMs - eventLastEmit >= GLOBAL_COOLDOWN_MS;
+          const eventLastEmit = lastEmitMs.get(compoundKey) ?? 0;
+          const eventCooldownOk = nowMs - eventLastEmit >= EVENT_MIN_ELAPSED_MS;
 
           if (ePriceEligible && eAbsHit && eDriftHit && eventCooldownOk) {
             const eVolume = eventTrades.reduce(
@@ -533,7 +811,6 @@ export async function detectMovement(trade: TradeInsert) {
               eLevels.add(Number(safeNum(t.price).toFixed(2)));
             }
 
-            // Compute velocity for the event window
             const eventMinutes = Math.max(1, (nowMs - eventStartMs) / 60_000);
             const eVelocity = eDriftPct != null
               ? computeVelocity(Math.abs(eDriftPct), eventMinutes)
@@ -541,7 +818,7 @@ export async function detectMovement(trade: TradeInsert) {
 
             const bucketId = Math.floor(nowMs / (60 * 60_000));
             const row: MovementInsert = {
-              id: `${marketId}:${outcome ?? "NA"}:event:${bucketId}`,
+              id: `${compoundKey}:event:${bucketId}`,
               market_id: marketId,
               outcome,
               window_type: "event",
@@ -568,7 +845,7 @@ export async function detectMovement(trade: TradeInsert) {
             };
 
             const eventInserted = await insertMovement(row, marketId, outcome, false);
-            if (eventInserted) lastEmitMs.set(eventGlobalKey, nowMs);
+            if (eventInserted) lastEmitMs.set(compoundKey, nowMs);
           }
         }
       }
@@ -576,14 +853,13 @@ export async function detectMovement(trade: TradeInsert) {
   }
 }
 
-// Finalize delays per window type — how long to wait for momentum to settle
-// before running classification + explanation with stable data.
+// Finalize delays per window type
 const FINALIZE_DELAY_MS: Record<string, number> = {
-  "5m": 5 * 60_000,    // 5 min
-  "15m": 10 * 60_000,  // 10 min
-  "1h": 30 * 60_000,   // 30 min
-  "4h": 2 * 3_600_000, // 2 hours
-  "event": 5 * 60_000, // 5 min
+  "5m": 5 * 60_000,
+  "15m": 10 * 60_000,
+  "1h": 30 * 60_000,
+  "4h": 2 * 3_600_000,
+  "event": 5 * 60_000,
 };
 
 async function insertMovement(
@@ -592,34 +868,23 @@ async function insertMovement(
   outcome: string | null,
   thinLiquidity: boolean
 ): Promise<boolean> {
-  // Strip the velocity field before insert — it's not a DB column.
   const velocity = row.velocity;
   const { velocity: _v, ...dbRow } = row;
 
   const delayMs = FINALIZE_DELAY_MS[row.window_type] ?? 15 * 60_000;
   const finalizeAt = new Date(Date.now() + delayMs).toISOString();
 
-  // ── Movement chain extension ─────────────────────────────────────────
-  // For time-windowed detections (not "event" since-last-signal windows),
-  // look for an existing OPEN movement of the same type that fired recently.
-  // If one exists, EXTEND it instead of inserting a new row:
-  //   - window_start + start_price stay frozen from the first detection (the anchor)
-  //   - window_end + end_price advance to the current tick
-  //   - pct_change reflects the total drift from anchor to now
-  //   - volume/trades accumulate across detections
-  //   - finalize_at is pushed out so the worker waits for full momentum
-  //
-  // This collapses "4 separate 5m bands on the chart" into one clean
-  // start→end signal showing the true magnitude of the move.
+  // ── Chain extension for compound movements ─────────────────────────
+  // Look for an existing OPEN movement for this market+outcome (any window type)
+  // to extend. With compound detection, there should be at most one active
+  // movement per market+outcome.
   if (row.window_type !== "event") {
-    const chainCutoff = new Date(Date.now() - delayMs).toISOString(); // delayMs ≈ 2 × window
+    const chainCutoff = new Date(Date.now() - Math.max(...Object.values(FINALIZE_DELAY_MS))).toISOString();
 
-    // Build outcome filter (null needs IS NULL, not = NULL)
     const chainQ = supabase
       .from("market_movements")
-      .select("id, start_price, min_price_24h, max_price_24h, volume_24h, trades_count_24h")
+      .select("id, start_price, window_type, min_price_24h, max_price_24h, volume_24h, trades_count_24h")
       .eq("market_id", row.market_id)
-      .eq("window_type", row.window_type)
       .eq("status", "OPEN")
       .gte("window_end", chainCutoff);
     const chainQFiltered = outcome !== null
@@ -650,10 +915,6 @@ async function insertMovement(
 
       const newVol = Number(existing.volume_24h ?? 0) + (dbRow.volume_24h ?? 0);
       const newTrades = Number(existing.trades_count_24h ?? 0) + (dbRow.trades_count_24h ?? 0);
-
-      // Re-evaluate thin_liquidity as trades accumulate: a movement that started
-      // with sparse activity but grew to many trades should not stay "thin".
-      // Only keep thin=true if accumulated trade count is still below the activity cap.
       const updatedThinLiquidity = thinLiquidity && newTrades < THIN_TRADE_COUNT * 4;
 
       const { error: updateErr } = await supabase
@@ -669,7 +930,7 @@ async function insertMovement(
           trades_count_24h: newTrades,
           avg_trade_size_24h: newTrades > 0 ? newVol / newTrades : null,
           thin_liquidity: updatedThinLiquidity,
-          finalize_at: finalizeAt, // push deadline out so worker waits for full move
+          finalize_at: finalizeAt,
         })
         .eq("id", existing.id);
 
@@ -687,7 +948,7 @@ async function insertMovement(
     }
   }
 
-  // ── No active chain — insert as a new OPEN movement ─────────────────
+  // ── No active chain — insert new OPEN movement ─────────────────────
   const { error: insErr } = await supabase.from("market_movements").insert({
     ...dbRow,
     status: "OPEN",

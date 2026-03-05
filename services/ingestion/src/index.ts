@@ -8,7 +8,7 @@ process.on("unhandledRejection", (reason: any) => {
 import { connectClobMarketWS, type ClobHandle } from "./polymarket.clob.ws";
 
 import { updateAggregateBuffered } from "../../aggregates/src/updateAggregate";
-import { detectMovement } from "../../movements/src/detectMovement";
+import { detectMovement, clearMarketState } from "../../movements/src/detectMovement";
 import { detectEventMovement } from "../../movements/src/detectMovementEvent";
 import { movementRealtime } from "../../movements/src/detectMovementRealtime";
 import { startFinalizeWorker } from "../../movements/src/finalizeMovements";
@@ -1370,7 +1370,10 @@ function removeTrackedSlug(slug: string) {
         break;
       }
     }
-    if (!stillUsed) trackedMarketIds.delete(marketId);
+    if (!stillUsed) {
+      trackedMarketIds.delete(marketId);
+      clearMarketState(marketId);
+    }
   }
   // Clean up multi-market event children
   const childIds = allMarketIdsBySlug.get(slug);
@@ -1379,6 +1382,7 @@ function removeTrackedSlug(slug: string) {
       trackedMarketIds.delete(cid);
       childMarketSlugById.delete(cid);
       childMarketEventSlugById.delete(cid);
+      clearMarketState(cid);
     }
     allMarketIdsBySlug.delete(slug);
   }
