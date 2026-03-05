@@ -1,6 +1,6 @@
 # Market Move Intelligence
 
-Real-time detection of price movements on Polymarket. Ingests trades and order-book data via WebSocket, detects movements across multiple time windows, classifies them by likely driver, and shows annotated signals on a live chart.
+Real-time detection of price movements on prediction markets. Ingests trades and order-book data from Polymarket (WebSocket) and Jupiter (REST polling), detects movements across multiple time windows, classifies them by likely driver, and shows annotated signals on a live chart.
 
 ## Architecture
 
@@ -8,6 +8,8 @@ Real-time detection of price movements on Polymarket. Ingests trades and order-b
 Polymarket WS (trades)  ──┐
                            ├──▶  Ingestion  ──▶  Supabase
 Polymarket WS (CLOB)    ──┘       │                 │
+Jupiter API (polling)   ────▶  Ingestion  ──────────┘
+                                  │                 │
                            ┌──────┴──────┐          │
                            ▼              ▼          │
                     Multi-Window     Realtime         │
@@ -94,14 +96,19 @@ GROQ_API_KEY=gsk_...                           # optional, enables AI explanatio
 ```bash
 npm install
 
-# Ingestion
+# Polymarket ingestion
 npx tsx services/ingestion/src/index.ts
+
+# Jupiter ingestion (optional, separate process)
+npm --workspace @market-move-intelligence/ingestion run jup:ingest
 
 # Frontend (port 3005)
 npm --workspace @market-move-intelligence/web run dev
 ```
 
-Load a Polymarket event slug in the UI. The ingestion service picks it up within 30 seconds and starts streaming data to the chart.
+Load a Polymarket event slug in the UI. The ingestion service picks it up within 30 seconds and starts streaming data to the chart. Jupiter markets are auto-discovered or tracked via `jup:`-prefixed slugs.
+
+See [GUIDE.md](GUIDE.md) for detailed setup instructions and [DOCUMENTATION.md](DOCUMENTATION.md) for full technical documentation.
 
 ## Configuration
 

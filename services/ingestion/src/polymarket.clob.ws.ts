@@ -51,12 +51,12 @@ export function connectClobMarketWS(opts: ClobMarketOpts): ClobHandle {
 
     pingInterval = setInterval(() => {
       if (ws?.readyState === WebSocket.OPEN) ws.send("PING");
-    }, 30_000);
+    }, 10_000);
 
     ws.on("open", () => {
       // Market channel subscription format
 
-      ws?.send(JSON.stringify({ assets_ids: opts.assetIds, type: "market" }));
+      ws?.send(JSON.stringify({ assets_ids: opts.assetIds, type: "market", custom_feature_enabled: true }));
       console.log("[clob] connected + subscribed", opts.assetIds.length);
       backoffMs = reconnectBaseMs;
     });

@@ -27,13 +27,16 @@ export type JupiterPollerHandle = {
 };
 
 /**
- * REST poller with built-in rate limiting.
+ * REST poller with built-in rate limiting and exponential backoff.
  *
  * Uses a single sequential queue for all API calls so we never exceed
  * the free-tier 1 RPS limit regardless of how many markets are tracked.
  *
  * Orderbook markets are polled round-robin: one market per tick,
  * interleaved with trade polls.
+ *
+ * On consecutive failures, backs off exponentially (up to 60s) and
+ * suppresses repeated error logs to reduce noise.
  */
 export function createJupiterPoller(opts: PollerOpts): JupiterPollerHandle {
   const tradePollMs = opts.tradePollMs ?? 5_000;
@@ -51,12 +54,49 @@ export function createJupiterPoller(opts: PollerOpts): JupiterPollerHandle {
   let orderbookQueue: string[] = [];
   let orderbookIdx = 0;
 
+  // ── Backoff state ───────────────────────────────────────────────
+  let tradeConsecFails = 0;
+  let tradeBackoffMs = 0;
+  let tradeLastLoggedFail = 0;
+
+  const obConsecFails = new Map<string, number>();
+  let obLastLoggedFail = 0;
+
+  const BASE_BACKOFF_MS = 3_000;
+  const MAX_BACKOFF_MS = 60_000;
+  const LOG_THROTTLE_MS = 30_000; // only log errors every 30s
+
+  function calcBackoff(fails: number): number {
+    if (fails <= 1) return 0;
+    return Math.min(BASE_BACKOFF_MS * Math.pow(2, fails - 2), MAX_BACKOFF_MS);
+  }
+
+  function sleep(ms: number): Promise<void> {
+    return new Promise((r) => setTimeout(r, ms));
+  }
+
   // ── Trade Poller ────────────────────────────────────────────────
   async function pollTrades() {
     if (destroyed) return;
+
+    // Apply backoff if we've had consecutive failures
+    if (tradeBackoffMs > 0) {
+      await sleep(tradeBackoffMs);
+      if (destroyed) return;
+    }
+
     try {
       const trades = await fetchTrades();
-      if (!trades.length) return;
+      if (!trades.length) {
+        // Empty response is OK, reset failures
+        tradeConsecFails = 0;
+        tradeBackoffMs = 0;
+        return;
+      }
+
+      // Success — reset backoff
+      tradeConsecFails = 0;
+      tradeBackoffMs = 0;
 
       trades.sort((a, b) => a.id - b.id);
 
@@ -78,7 +118,17 @@ export function createJupiterPoller(opts: PollerOpts): JupiterPollerHandle {
         );
       }
     } catch (err: any) {
-      console.error("[jup-poller] trade poll error:", err?.message);
+      tradeConsecFails++;
+      tradeBackoffMs = calcBackoff(tradeConsecFails);
+
+      const now = Date.now();
+      if (now - tradeLastLoggedFail > LOG_THROTTLE_MS) {
+        tradeLastLoggedFail = now;
+        const backoffSec = (tradeBackoffMs / 1000).toFixed(0);
+        console.warn(
+          `[jup-poller] trade poll failed (${tradeConsecFails}x, backoff ${backoffSec}s): ${err?.message}`
+        );
+      }
     }
   }
 
@@ -94,16 +144,31 @@ export function createJupiterPoller(opts: PollerOpts): JupiterPollerHandle {
     const marketId = orderbookQueue[orderbookIdx];
     orderbookIdx++;
 
+    // Check per-market backoff
+    const fails = obConsecFails.get(marketId) ?? 0;
+    const backoff = calcBackoff(fails);
+    if (backoff > 0) {
+      await sleep(backoff);
+      if (destroyed) return;
+    }
+
     try {
       const book = await fetchOrderbook(marketId);
-      if (book) {
-        await opts.onOrderbook(marketId, book);
-      }
+      // Success — reset this market's failure count
+      obConsecFails.set(marketId, 0);
+      await opts.onOrderbook(marketId, book);
     } catch (err: any) {
-      console.error(
-        `[jup-poller] orderbook(${marketId.slice(0, 16)}...) error:`,
-        err?.message
-      );
+      const newFails = (obConsecFails.get(marketId) ?? 0) + 1;
+      obConsecFails.set(marketId, newFails);
+
+      const now = Date.now();
+      if (now - obLastLoggedFail > LOG_THROTTLE_MS) {
+        obLastLoggedFail = now;
+        const backoffSec = (calcBackoff(newFails) / 1000).toFixed(0);
+        console.warn(
+          `[jup-poller] orderbook(${marketId.slice(0, 16)}...) failed (${newFails}x, backoff ${backoffSec}s): ${err?.message}`
+        );
+      }
     }
   }
 
@@ -142,6 +207,7 @@ export function createJupiterPoller(opts: PollerOpts): JupiterPollerHandle {
     removeOrderbookMarket(marketId: string) {
       if (!orderbookSet.has(marketId)) return;
       orderbookSet.delete(marketId);
+      obConsecFails.delete(marketId);
       rebuildQueue();
       console.log(
         `[jup-poller] -orderbook ${marketId.slice(0, 20)}... (${orderbookQueue.length} remaining)`
@@ -164,6 +230,7 @@ export function createJupiterPoller(opts: PollerOpts): JupiterPollerHandle {
       }
       orderbookSet.clear();
       orderbookQueue = [];
+      obConsecFails.clear();
       console.log("[jup-poller] stopped all polling");
     },
   };

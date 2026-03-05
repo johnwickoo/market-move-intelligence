@@ -186,7 +186,7 @@ async function fetchEventAnnotations(
 ) {
   const eventMarketId = `event:${eventSlug}`;
   const moves = await pgFetch<RawMovement[]>(
-    `market_movements?select=id,market_id,outcome,window_start,window_end,window_type,reason,start_price` +
+    `market_movements?select=id,market_id,outcome,window_start,window_end,window_type,reason,start_price,status` +
       `&market_id=eq.${encodeURIComponent(eventMarketId)}` +
       `&window_end=gte.${encodeURIComponent(windowStartISO)}` +
       `&order=window_end.desc&limit=50`
@@ -211,6 +211,7 @@ async function fetchEventAnnotations(
       explanation,
       color: movementColor(m.window_type, true),
       start_price: m.start_price ?? null,
+      status: m.status ?? "OPEN",
     };
   });
 }
@@ -276,6 +277,31 @@ export async function GET(req: Request) {
       const active = await resolveActiveMarketIds(10);
       for (const [id, meta] of active) {
         markets.set(id, meta);
+      }
+
+      // For jup: slugs, the user enters an event ID (e.g. "jup:POLY-102773")
+      // but the DB stores resolved market IDs (e.g. "jup:POLY-916732").
+      // Remap active jup: markets to use the user's slug and resolve title
+      // from the mid_tick raw metadata.
+      const jupSlugs = slugList.filter((s) => s.startsWith("jup:"));
+      if (jupSlugs.length > 0 && markets.size > 0) {
+        for (const [id, meta] of markets) {
+          if (!id.startsWith("jup:")) continue;
+          // If the slug is still the raw market_id, remap to the user's jup slug
+          if (meta.slug === id && jupSlugs.length === 1) {
+            meta.slug = jupSlugs[0];
+          }
+          // Try to get a better title from the newest mid_tick raw
+          if (meta.title === id || meta.title === meta.slug) {
+            const [latestTick] = await pgFetch<{ raw?: any }[]>(
+              `market_mid_ticks?select=raw` +
+                `&market_id=eq.${encodeURIComponent(id)}` +
+                `&order=ts.desc&limit=1`
+            );
+            const tickTitle = latestTick?.raw?.marketTitle ?? latestTick?.raw?.eventTitle;
+            if (tickTitle) meta.title = tickTitle;
+          }
+        }
       }
     }
   }
@@ -391,7 +417,7 @@ export async function GET(req: Request) {
     const volumes = buildVolumeBuckets(trades, windowStartMs, windowEndMs, bucketMinutes);
 
     const movements = await pgFetch<RawMovement[]>(
-      `market_movements?select=id,market_id,outcome,window_start,window_end,window_type,reason,start_price` +
+      `market_movements?select=id,market_id,outcome,window_start,window_end,window_type,reason,start_price,status` +
         `&market_id=eq.${marketId}` +
         `&outcome=eq.${encodeURIComponent(outcome)}` +
         `&window_end=gte.${encodeURIComponent(windowStartISO)}` +
@@ -416,6 +442,7 @@ export async function GET(req: Request) {
         explanation,
         color: movementColor(m.window_type),
         start_price: m.start_price ?? null,
+        status: m.status ?? "OPEN",
       };
     });
 

@@ -18,6 +18,7 @@ export type Annotation = {
   explanation: string;
   color: string;
   start_price?: number | null;
+  status?: "OPEN" | "FINAL" | string;
 };
 
 export type OutcomeSeries = {

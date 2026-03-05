@@ -5,7 +5,6 @@ process.on("unhandledRejection", (reason: any) => {
   console.error("[UNHANDLED REJECTION]", typeof reason, reason instanceof Error ? reason.stack : JSON.stringify(reason, null, 2));
 });
 
-import { connectPolymarketWS } from "./polymarket.ws";
 import { connectClobMarketWS, type ClobHandle } from "./polymarket.clob.ws";
 
 import { updateAggregateBuffered } from "../../aggregates/src/updateAggregate";
@@ -885,42 +884,48 @@ function getDominantOutcome(marketId: string, nowMs: number): string | null {
   return outcome;
 }
 
-function toTradeInsert(msg: any): TradeInsert | null {
-  if (msg?.topic !== "activity" || msg?.type !== "trades") return null;
-  const p = msg.payload;
-  if (!p) return null;
+/**
+ * Convert a CLOB market channel `last_trade_price` event into a TradeInsert.
+ * These events arrive on `wss://ws-subscriptions-clob.polymarket.com/ws/market`
+ * and have the shape: { event_type: "last_trade_price", asset_id, market, price, size, side, timestamp, transaction_hash? }
+ */
+function clobTradeToInsert(msg: any): TradeInsert | null {
+  if (msg?.event_type !== "last_trade_price") return null;
 
-  if (p.price == null || p.size == null || !p.side) return null;
+  const price = msg.price != null ? Number(msg.price) : NaN;
+  const size = msg.size != null ? Number(msg.size) : NaN;
+  if (!Number.isFinite(price) || !Number.isFinite(size) || !msg.side) return null;
 
-  const marketId = p.conditionId;
+  const marketId = String(msg.market ?? msg.market_id ?? "").trim();
   if (!marketId) return null;
 
-  const tx = p.transactionHash ? String(p.transactionHash) : "";
-  const assetId = p.asset ? String(p.asset) : "";
+  const assetId = String(msg.asset_id ?? msg.assetId ?? "").trim();
+  const tx = msg.transaction_hash ? String(msg.transaction_hash) : "";
   const id = tx ? `${tx}:${assetId}` : `${marketId}:${assetId}:${msg.timestamp}`;
 
-  // prefer msg.timestamp (ms), fallback to payload.timestamp (sec)
-  const ms =
-    typeof msg.timestamp === "number"
-      ? msg.timestamp
-      : typeof p.timestamp === "number"
-        ? p.timestamp < 10_000_000_000
-          ? p.timestamp * 1000
-          : p.timestamp
-        : Date.parse(String(p.timestamp));
-
+  // timestamp is unix ms as a string
+  const ms = typeof msg.timestamp === "string"
+    ? Number(msg.timestamp)
+    : typeof msg.timestamp === "number"
+      ? msg.timestamp < 10_000_000_000 ? msg.timestamp * 1000 : msg.timestamp
+      : NaN;
   if (!Number.isFinite(ms)) return null;
+
+  // Resolve outcome from assetMeta
+  const meta = assetMeta.get(assetId);
+  const outcome = meta?.outcome ?? "";
+  const outcomeIndex = meta?.outcomeIndex ?? null;
 
   return {
     id: String(id),
-    market_id: String(marketId),
-    price: Number(p.price),
-    size: Number(p.size),
-    side: String(p.side),
+    market_id: marketId,
+    price,
+    size,
+    side: String(msg.side),
     timestamp: new Date(ms).toISOString(),
     raw: msg,
-    outcome: String(p.outcome ?? ""),
-    outcome_index: typeof p.outcomeIndex === "number" ? p.outcomeIndex : null,
+    outcome,
+    outcome_index: outcomeIndex ?? 0,
   };
 }
 
@@ -1166,13 +1171,8 @@ console.log("[ingestion] starting...");
 // Start the two-stage finalize worker (classify + explain once momentum settles)
 startFinalizeWorker();
 
-/**
- * 1) Activity WS: Trades
- */
-const url = process.env.POLYMARKET_WS_URL;
-if (!url) {
-  throw new Error("Missing POLYMARKET_WS_URL in services/ingestion/.env");
-}
+// Trades now come from the CLOB Market Channel (last_trade_price events) via onClobTick.
+// The old RTDS activity WS (wss://ws-live-data.polymarket.com) no longer provides trade data.
 
 // When true, only the slug from Supabase tracked_slugs is used (frontend is source of truth).
 const TRACK_SINGLE_SLUG = process.env.TRACK_SINGLE_SLUG !== "0";
@@ -1202,206 +1202,6 @@ const BACKFILL_SILENCE_MS = Number(process.env.BACKFILL_SILENCE_MS ?? 120_000);
 const MAX_BACKFILL_TRADES_PER_SLUG = Number(process.env.MAX_BACKFILL_TRADES_PER_SLUG ?? 200);
 let backfillRunning = false;
 const lastTradeBySlug = new Map<string, number>();
-connectPolymarketWS({
-  url,
-  // subscribe without filters and filter locally for reliability
-  subscriptions: [
-    {
-      topic: "activity",
-      type: "trades",
-    },
-  ],
-  staleMs: Number(process.env.WS_STALE_MS ?? 60_000),
-  staleCheckMs: Number(process.env.WS_STALE_CHECK_MS ?? 10_000),
-  onMessage: async (msg) => {
-    // ── fast-path filter: drop unrelated trades before any work ──
-    const payload = (msg as any)?.payload ?? msg;
-    const rawMarketId = String(
-      payload?.conditionId ?? payload?.market_id ?? payload?.marketId ?? ""
-    ).trim().toLowerCase();
-
-    if (TRACK_SINGLE_SLUG || eventSlugSet.size > 0 || trackedMarketIds.size > 0) {
-      // Quick market-ID check first (cheapest)
-      const hasTrackedMarket = rawMarketId && trackedMarketIds.has(rawMarketId);
-      if (!hasTrackedMarket) {
-        // Fall back to slug check
-        let hasTrackedSlug = false;
-        const slugFields = [
-          payload?.eventSlug,
-          payload?.slug,
-          payload?.marketSlug,
-          payload?.market_slug,
-          payload?.event_slug,
-        ];
-        for (const s of slugFields) {
-          if (typeof s === "string" && s.trim() && eventSlugSet.has(s.trim())) {
-            hasTrackedSlug = true;
-            break;
-          }
-        }
-        if (!hasTrackedSlug) return;
-      }
-    }
-
-    noteResolutionFromMessage(msg, "ws");
-
-    // Build slug candidates for matched trades (used downstream for hydration)
-    const slugCandidates = new Set<string>();
-    for (const s of [payload?.eventSlug, payload?.slug, payload?.marketSlug, payload?.market_slug, payload?.event_slug]) {
-      if (typeof s === "string" && s.trim()) slugCandidates.add(s.trim());
-    }
-
-    if (slugCandidates.size > 0) {
-      const now = Date.now();
-      for (const s of slugCandidates) {
-        if (eventSlugSet.has(s)) lastTradeBySlug.set(s, now);
-      }
-    }
-
-    const trade = toTradeInsert(msg);
-    if (!trade) return;
-    const tradeTsMs = Date.parse(trade.timestamp);
-    if (Number.isFinite(tradeTsMs) && isDuplicateTrade(trade.id, tradeTsMs)) {
-      return;
-    }
-
-    const rawAssetId = String((trade as any)?.raw?.payload?.asset ?? "");
-    if (rawAssetId) {
-      const existingMeta = assetMeta.get(rawAssetId);
-      assetMeta.set(rawAssetId, {
-        marketId: trade.market_id,
-        outcome: trade.outcome ? String(trade.outcome) : null,
-        outcomeIndex: (trade as any).outcome_index ?? existingMeta?.outcomeIndex ?? null,
-      });
-      if (Number.isFinite(tradeTsMs)) {
-        movementRealtime.onTrade(trade.market_id, rawAssetId, tradeTsMs);
-      }
-      if (!trackedAssets.has(rawAssetId)) {
-        trackedAssets.add(rawAssetId);
-        if (!marketPrimaryAsset.has(trade.market_id)) {
-          marketPrimaryAsset.set(trade.market_id, rawAssetId);
-        }
-        scheduleClobReconnect();
-      }
-      const nowMs = Date.parse(trade.timestamp);
-      if (Number.isFinite(nowMs)) {
-        updateAssetStats(trade.market_id, rawAssetId, Number(trade.price), Number(trade.size), nowMs);
-        updateSelectionForMarket(trade.market_id, nowMs);
-
-        // Trade-price fallback: if CLOB hasn't sent data for this asset recently,
-        // generate a mid tick from the trade price so the chart has data.
-        const lastClob = lastClobTickMs.get(rawAssetId) ?? 0;
-        if (nowMs - lastClob > TRADE_MID_FALLBACK_MS) {
-          const tradePrice = Number(trade.price);
-          if (Number.isFinite(tradePrice) && tradePrice > 0) {
-            const outcome = trade.outcome ? String(trade.outcome) : null;
-            if (shouldStoreMid(rawAssetId, null, null, tradePrice, nowMs)) {
-              withRetry(
-                () =>
-                  insertMidTick({
-                    market_id: trade.market_id,
-                    outcome,
-                    asset_id: rawAssetId,
-                    ts: new Date(nowMs).toISOString(),
-                    best_bid: null,
-                    best_ask: null,
-                    mid: tradePrice,
-                    spread: null,
-                    spread_pct: null,
-                    raw: { source: "trade_fallback", price: tradePrice },
-                  }),
-                "insertMidTick:tradeFallback"
-              ).then(() => {
-                if (process.env.LOG_MID === "1") {
-                  console.log(`[mid:trade-fallback] market=${trade.market_id.slice(0, 12)} outcome=${outcome} mid=${tradePrice.toFixed(4)}`);
-                }
-              }).catch(() => {});
-            }
-          }
-        }
-      }
-    }
-
-    const hydrateSlug = slugCandidates.size > 0 ? Array.from(slugCandidates)[0] : null;
-    void hydrateMarket(trade.market_id, hydrateSlug);
-
-    try {
-      const now = Date.now();
-      if (now - insertFailWindowStart > INSERT_FAIL_WINDOW_MS) {
-        insertFailWindowStart = now;
-        insertFailCount = 0;
-      }
-
-      tradeBuffer.push(trade);
-      if (tradeBuffer.length >= TRADE_BUFFER_MAX) {
-        void flushTradeBuffer();
-      } else if (!tradeFlushTimer) {
-        tradeFlushTimer = setTimeout(() => {
-          tradeFlushTimer = null;
-          void flushTradeBuffer();
-        }, TRADE_BUFFER_FLUSH_MS);
-      }
-      await withRetry(() => updateAggregateBuffered(trade), "updateAggregate");
-
-      const nowMs = Date.parse(trade.timestamp);
-      if (Number.isFinite(nowMs)) {
-        const eventSlug = resolveEventSlugForMarket(trade.market_id, slugCandidates);
-        if (eventSlug) {
-          const childIds = allMarketIdsBySlug.get(eventSlug);
-          if (childIds && childIds.length >= 2) {
-            void withRetry(
-              () => detectEventMovement({ eventSlug, childMarketIds: childIds, nowMs }),
-              "detectEventMovement",
-              2
-            ).catch((err: any) => {
-              console.warn("[movement-event] detect failed", err?.message ?? err);
-            });
-          }
-        }
-      }
-
-      // avoid duplicate movement signals across outcomes
-      const dominantOutcome = Number.isFinite(nowMs)
-        ? getDominantOutcome(trade.market_id, nowMs)
-        : null;
-      const shouldCheckOutcome = dominantOutcome
-        ? trade.outcome === dominantOutcome
-        : trade.outcome === "Yes";
-      if (shouldCheckOutcome) {
-        const gateKey = `${trade.market_id}:${dominantOutcome ?? "Yes"}`;
-        const latest = rawAssetId ? latestSignalByAsset.get(rawAssetId) : undefined;
-        const prev = lastMovementGate.get(gateKey);
-        const enoughTime =
-          !prev || !Number.isFinite(MOVEMENT_MIN_MS) || nowMs - prev.ts >= MOVEMENT_MIN_MS;
-        const enoughMove =
-          !prev ||
-          !latest ||
-          !Number.isFinite(MOVEMENT_MIN_STEP) ||
-          Math.abs(latest.price - prev.price) >= MOVEMENT_MIN_STEP;
-
-        if (!prev || (enoughTime && enoughMove)) {
-          if (latest) lastMovementGate.set(gateKey, { price: latest.price, ts: nowMs });
-          await withRetry(() => detectMovement(trade), "detectMovement");
-        }
-      }
-
-      const tx = String((trade as any)?.raw?.payload?.transactionHash ?? "");
-      const part = LOG_TRADE_DEBUG
-        ? `${trade.outcome} ${trade.side} px=${trade.price} sz=${trade.size} tx=${tx}`
-        : `${trade.outcome} ${trade.side} px=${trade.price} sz=${trade.size}`;
-      if (LOG_TRADE_GROUPED && tx) {
-        logGroupedTrade(tx, part);
-      } else {
-        console.log(`[trade] ${part}`);
-      }
-    } catch (e: any) {
-      const m = e?.message ?? "";
-      if (m.includes("duplicate key value violates unique constraint")) return;
-      if (m === "spooled") return;
-      console.error("[trade] insert failed:", m);
-    }
-  },
-});
 
 async function backfillByConditionId(
   slug: string,
@@ -1685,6 +1485,8 @@ async function syncTrackedSlugs() {
     for (const row of rows) {
       const s = row.slug.trim();
       if (!s) continue;
+      // Skip slugs meant for other ingestion adapters (e.g. Jupiter)
+      if (s.startsWith("jup:")) continue;
       if (resolvedSlugs.has(s)) {
         const resolvedAt = resolvedSlugs.get(s)!;
         // Only skip if the grace period has fully elapsed
@@ -1928,6 +1730,152 @@ async function onClobTick(msg: any) {
     if (items.length === 0) return;
 
     for (const item of items) {
+      // ── Handle last_trade_price events as real-time trades ──
+      if (item?.event_type === "last_trade_price") {
+        const trade = clobTradeToInsert(item);
+        if (!trade) continue;
+        const tradeTsMs = Date.parse(trade.timestamp);
+        if (Number.isFinite(tradeTsMs) && isDuplicateTrade(trade.id, tradeTsMs)) continue;
+
+        const rawAssetId = String(item.asset_id ?? "");
+        if (rawAssetId) {
+          const existingMeta = assetMeta.get(rawAssetId);
+          assetMeta.set(rawAssetId, {
+            marketId: trade.market_id,
+            outcome: trade.outcome ? String(trade.outcome) : null,
+            outcomeIndex: (trade as any).outcome_index ?? existingMeta?.outcomeIndex ?? null,
+          });
+          if (Number.isFinite(tradeTsMs)) {
+            movementRealtime.onTrade(trade.market_id, rawAssetId, tradeTsMs);
+          }
+          if (!trackedAssets.has(rawAssetId)) {
+            trackedAssets.add(rawAssetId);
+            if (!marketPrimaryAsset.has(trade.market_id)) {
+              marketPrimaryAsset.set(trade.market_id, rawAssetId);
+            }
+            scheduleClobReconnect();
+          }
+          const nowMs = tradeTsMs;
+          if (Number.isFinite(nowMs)) {
+            updateAssetStats(trade.market_id, rawAssetId, Number(trade.price), Number(trade.size), nowMs);
+            updateSelectionForMarket(trade.market_id, nowMs);
+
+            // Trade-price fallback: if CLOB hasn't sent book data for this asset recently,
+            // generate a mid tick from the trade price so the chart has data.
+            const lastClob = lastClobTickMs.get(rawAssetId) ?? 0;
+            if (nowMs - lastClob > TRADE_MID_FALLBACK_MS) {
+              const tradePrice = Number(trade.price);
+              if (Number.isFinite(tradePrice) && tradePrice > 0) {
+                const outcome = trade.outcome ? String(trade.outcome) : null;
+                if (shouldStoreMid(rawAssetId, null, null, tradePrice, nowMs)) {
+                  withRetry(
+                    () =>
+                      insertMidTick({
+                        market_id: trade.market_id,
+                        outcome,
+                        asset_id: rawAssetId,
+                        ts: new Date(nowMs).toISOString(),
+                        best_bid: null,
+                        best_ask: null,
+                        mid: tradePrice,
+                        spread: null,
+                        spread_pct: null,
+                        raw: { source: "trade_fallback", price: tradePrice },
+                      }),
+                    "insertMidTick:tradeFallback"
+                  ).then(() => {
+                    if (process.env.LOG_MID === "1") {
+                      console.log(`[mid:trade-fallback] market=${trade.market_id.slice(0, 12)} outcome=${outcome} mid=${tradePrice.toFixed(4)}`);
+                    }
+                  }).catch(() => {});
+                }
+              }
+            }
+          }
+
+          // Update last trade time for backfill silence tracking
+          if (Number.isFinite(tradeTsMs)) {
+            for (const [slug, ids] of allMarketIdsBySlug) {
+              if (ids.includes(trade.market_id)) {
+                lastTradeBySlug.set(slug, tradeTsMs);
+                break;
+              }
+            }
+          }
+        }
+
+        void hydrateMarket(trade.market_id, null);
+
+        try {
+          tradeBuffer.push(trade);
+          if (tradeBuffer.length >= TRADE_BUFFER_MAX) {
+            void flushTradeBuffer();
+          } else if (!tradeFlushTimer) {
+            tradeFlushTimer = setTimeout(() => {
+              tradeFlushTimer = null;
+              void flushTradeBuffer();
+            }, TRADE_BUFFER_FLUSH_MS);
+          }
+          await withRetry(() => updateAggregateBuffered(trade), "updateAggregate");
+
+          if (Number.isFinite(tradeTsMs)) {
+            const eventSlug = resolveEventSlugForMarket(trade.market_id, new Set());
+            if (eventSlug) {
+              const childIds = allMarketIdsBySlug.get(eventSlug);
+              if (childIds && childIds.length >= 2) {
+                void withRetry(
+                  () => detectEventMovement({ eventSlug, childMarketIds: childIds, nowMs: tradeTsMs }),
+                  "detectEventMovement",
+                  2
+                ).catch((err: any) => {
+                  console.warn("[movement-event] detect failed", err?.message ?? err);
+                });
+              }
+            }
+          }
+
+          // Movement detection (avoid duplicate signals across outcomes)
+          const dominantOutcome = Number.isFinite(tradeTsMs)
+            ? getDominantOutcome(trade.market_id, tradeTsMs)
+            : null;
+          const shouldCheckOutcome = dominantOutcome
+            ? trade.outcome === dominantOutcome
+            : trade.outcome === "Yes";
+          if (shouldCheckOutcome) {
+            const gateKey = `${trade.market_id}:${dominantOutcome ?? "Yes"}`;
+            const latest = rawAssetId ? latestSignalByAsset.get(rawAssetId) : undefined;
+            const prev = lastMovementGate.get(gateKey);
+            const enoughTime =
+              !prev || !Number.isFinite(MOVEMENT_MIN_MS) || tradeTsMs - prev.ts >= MOVEMENT_MIN_MS;
+            const enoughMove =
+              !prev ||
+              !latest ||
+              !Number.isFinite(MOVEMENT_MIN_STEP) ||
+              Math.abs(latest.price - prev.price) >= MOVEMENT_MIN_STEP;
+            if (!prev || (enoughTime && enoughMove)) {
+              if (latest) lastMovementGate.set(gateKey, { price: latest.price, ts: tradeTsMs });
+              await withRetry(() => detectMovement(trade), "detectMovement");
+            }
+          }
+
+          const part = LOG_TRADE_DEBUG
+            ? `${trade.outcome} ${trade.side} px=${trade.price} sz=${trade.size} tx=${item.transaction_hash ?? ""}`
+            : `${trade.outcome} ${trade.side} px=${trade.price} sz=${trade.size}`;
+          if (LOG_TRADE_GROUPED && item.transaction_hash) {
+            logGroupedTrade(item.transaction_hash, part);
+          } else {
+            console.log(`[trade] ${part}`);
+          }
+        } catch (e: any) {
+          const m = e?.message ?? "";
+          if (m.includes("duplicate key value violates unique constraint")) continue;
+          if (m === "spooled") continue;
+          console.error("[trade] insert failed:", m);
+        }
+        continue;
+      }
+
+      // ── Handle book / price_change / best_bid_ask events as mid-price ticks ──
       const t = toSyntheticMid(item);
       if (!t) {
         const assetId = String(item?.asset_id ?? item?.assetId ?? item?.asset ?? "");

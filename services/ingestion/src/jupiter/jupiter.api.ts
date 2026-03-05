@@ -69,20 +69,15 @@ export async function fetchTrades(opts?: {
   start?: number;
   end?: number;
 }): Promise<JupiterRawTrade[]> {
-  try {
-    const params: Record<string, string> = {};
-    if (opts?.start != null) params.start = String(opts.start);
-    if (opts?.end != null) params.end = String(opts.end);
+  const params: Record<string, string> = {};
+  if (opts?.start != null) params.start = String(opts.start);
+  if (opts?.end != null) params.end = String(opts.end);
 
-    const res = await fetchJson<JupiterListResponse<JupiterRawTrade>>(
-      "/trades",
-      params
-    );
-    return res?.data ?? [];
-  } catch (err: any) {
-    console.error("[jup-api] fetchTrades failed:", err?.message);
-    return [];
-  }
+  const res = await fetchJson<JupiterListResponse<JupiterRawTrade>>(
+    "/trades",
+    params
+  );
+  return res?.data ?? [];
 }
 
 /**
@@ -90,18 +85,10 @@ export async function fetchTrades(opts?: {
  */
 export async function fetchOrderbook(
   marketId: string
-): Promise<JupiterOrderbook | null> {
-  try {
-    const raw = await fetchJson<any>(`/orderbook/${encodeURIComponent(marketId)}`);
-    if (raw && typeof raw === "object") raw.marketId = marketId;
-    return raw as JupiterOrderbook;
-  } catch (err: any) {
-    console.error(
-      `[jup-api] fetchOrderbook(${marketId}) failed:`,
-      err?.message
-    );
-    return null;
-  }
+): Promise<JupiterOrderbook> {
+  const raw = await fetchJson<any>(`/orderbook/${encodeURIComponent(marketId)}`);
+  if (raw && typeof raw === "object") raw.marketId = marketId;
+  return raw as JupiterOrderbook;
 }
 
 /**
@@ -133,8 +120,7 @@ export async function fetchEvents(opts?: {
       params
     );
     return res?.data ?? [];
-  } catch (err: any) {
-    console.error("[jup-api] fetchEvents failed:", err?.message);
+  } catch {
     return [];
   }
 }
@@ -150,12 +136,23 @@ export async function fetchEventMarkets(
       `/events/${encodeURIComponent(eventId)}/markets`
     );
     return res?.data ?? [];
-  } catch (err: any) {
-    console.error(
-      `[jup-api] fetchEventMarkets(${eventId}) failed:`,
-      err?.message
-    );
+  } catch {
     return [];
+  }
+}
+
+/**
+ * Fetch a single event by ID (includes metadata with title).
+ */
+export async function fetchEvent(
+  eventId: string
+): Promise<JupiterEvent | null> {
+  try {
+    return await fetchJson<JupiterEvent>(
+      `/events/${encodeURIComponent(eventId)}`
+    );
+  } catch {
+    return null;
   }
 }
 
@@ -169,11 +166,7 @@ export async function fetchMarket(
     return await fetchJson<JupiterMarket>(
       `/markets/${encodeURIComponent(marketId)}`
     );
-  } catch (err: any) {
-    console.error(
-      `[jup-api] fetchMarket(${marketId}) failed:`,
-      err?.message
-    );
+  } catch {
     return null;
   }
 }

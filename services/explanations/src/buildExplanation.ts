@@ -36,7 +36,13 @@ export function buildTemplateExplanation(movement: any, signal: any): string {
     durationStr = windowLabel;
   }
 
-  const priceSentence = `Price moved ${(pctChange * 100).toFixed(0)}% over ${durationStr}.`;
+  const startPrice = safeNum(movement?.start_price, 0);
+  const endPrice = safeNum(movement?.end_price, 0);
+  const priceRef =
+    startPrice > 0 && endPrice > 0
+      ? ` (${(startPrice * 100).toFixed(1)}¢ → ${(endPrice * 100).toFixed(1)}¢)`
+      : "";
+  const priceSentence = `Price moved ${(pctChange * 100).toFixed(0)}%${priceRef} over ${durationStr}.`;
 
   const windowSentence =
     windowType === "event"

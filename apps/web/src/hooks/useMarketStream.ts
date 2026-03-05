@@ -419,6 +419,7 @@ export function useMarketStream({
               explanation: mv.explanation ?? `${label}: ${mv.reason}`,
               color,
               start_price: mv.start_price ?? null,
+              status: mv.status ?? "OPEN",
             };
             // Replace existing annotation with the same start_ts (chain
             // extensions keep start_ts frozen but advance end_ts). Without

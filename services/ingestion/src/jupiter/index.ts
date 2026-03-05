@@ -44,6 +44,7 @@ let flushTimer: NodeJS.Timeout | null = null;
 let insertFailCount = 0;
 const INSERT_FAIL_THRESHOLD = 3;
 const trackedMarketIds = new Set<string>(); // raw Jupiter market IDs
+const marketMeta = new Map<string, { title: string; eventId: string }>(); // marketId → metadata
 
 const lastMovementGate = new Map<
   string,
@@ -188,8 +189,11 @@ async function main() {
     }
   }
 
-  // Build tracked set for trade filtering
-  for (const m of markets) trackedMarketIds.add(m.marketId);
+  // Build tracked set for trade filtering + metadata lookup
+  for (const m of markets) {
+    trackedMarketIds.add(m.marketId);
+    marketMeta.set(m.marketId, { title: m.title, eventId: m.eventId });
+  }
 
   // 2. Create poller
   const poller = createJupiterPoller({
@@ -198,7 +202,8 @@ async function main() {
 
     onTrade: async (raw) => {
       // Filter: only process trades for tracked markets
-      if (trackedMarketIds.size > 0 && !trackedMarketIds.has(raw.marketId)) {
+      // When no markets are tracked, skip all trades (don't ingest the firehose)
+      if (!trackedMarketIds.has(raw.marketId)) {
         return;
       }
 
@@ -240,7 +245,8 @@ async function main() {
     },
 
     onOrderbook: async (marketId, book) => {
-      const tick = jupiterOrderbookToMidTick(marketId, book);
+      const meta = marketMeta.get(marketId);
+      const tick = jupiterOrderbookToMidTick(marketId, book, meta?.title, meta?.eventId);
       if (!tick) return;
 
       tickCount++;
@@ -276,9 +282,13 @@ async function main() {
     try {
       const desired = await resolveMarketsToTrack();
 
-      // Update trade tracking set (all markets)
+      // Update trade tracking set + metadata (all markets)
       trackedMarketIds.clear();
-      for (const m of desired) trackedMarketIds.add(m.marketId);
+      marketMeta.clear();
+      for (const m of desired) {
+        trackedMarketIds.add(m.marketId);
+        marketMeta.set(m.marketId, { title: m.title, eventId: m.eventId });
+      }
 
       // Orderbook: only top N by volume
       const topN = [...desired]

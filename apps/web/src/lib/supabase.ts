@@ -26,6 +26,7 @@ export type RawMovement = {
   window_type: string;
   reason: string;
   start_price?: number | null;
+  status?: string;
 };
 
 export type DominantOutcomeRow = {
@@ -108,18 +109,31 @@ export function toNum(x: unknown): number {
 
 export function slugFromRaw(raw: any): string | null {
   const payload = raw?.payload ?? raw;
-  return (
+  // Polymarket fields
+  const poly =
     payload?.eventSlug ??
     payload?.slug ??
     payload?.marketSlug ??
     payload?.market_slug ??
-    null
-  );
+    null;
+  if (poly) return poly;
+  // Jupiter: build slug from eventId (matches tracked_slugs "jup:EVENT_ID")
+  if (payload?.eventId) return `jup:${payload.eventId}`;
+  return null;
 }
 
 export function titleFromRaw(raw: any): string | null {
   const payload = raw?.payload ?? raw;
-  return payload?.title ?? payload?.market_title ?? null;
+  // Polymarket fields
+  const poly = payload?.title ?? payload?.market_title ?? null;
+  if (poly) return poly;
+  // Jupiter: marketTitle can be just "Yes"/"No" for binary markets,
+  // so prefer eventTitle (the actual question) when marketTitle is trivial.
+  const jupEvent = payload?.eventTitle;
+  const jupMarket = payload?.marketTitle;
+  if (jupEvent) return jupEvent;
+  if (jupMarket) return jupMarket;
+  return null;
 }
 
 /**
@@ -136,8 +150,8 @@ export async function resolveActiveMarketIds(
   >();
   try {
     const since = new Date(Date.now() - sinceMinutes * 60_000).toISOString();
-    const ticks = await pgFetch<RawTick[]>(
-      `market_mid_ticks?select=market_id,outcome,ts` +
+    const ticks = await pgFetch<(RawTick & { raw?: any })[]>(
+      `market_mid_ticks?select=market_id,outcome,ts,raw` +
         `&ts=gt.${encodeURIComponent(since)}` +
         `&order=ts.desc&limit=500`
     );
@@ -146,9 +160,15 @@ export async function resolveActiveMarketIds(
       if (!tk.market_id) continue;
       if (!seenIds.has(tk.market_id)) {
         seenIds.add(tk.market_id);
+        // Use metadata from raw if available (Jupiter orderbooks embed it)
+        const tickTitle = tk.raw?.marketTitle ?? tk.market_id;
+        // Build slug from eventId so it matches tracked_slugs "jup:EVENT_ID"
+        const tickSlug = tk.raw?.eventId
+          ? `jup:${tk.raw.eventId}`
+          : tk.market_id;
         markets.set(tk.market_id, {
-          slug: tk.market_id,
-          title: tk.market_id,
+          slug: tickSlug,
+          title: tickTitle,
           outcomes: new Set<string>(),
         });
       }

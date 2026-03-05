@@ -80,6 +80,26 @@ export async function GET(req: Request) {
       for (const [id, meta] of active) {
         markets.set(id, meta);
       }
+
+      // Remap jup: market IDs to user's slug (event ID → market ID mismatch)
+      const jupSlugs = slugList.filter((s) => s.startsWith("jup:"));
+      if (jupSlugs.length > 0 && markets.size > 0) {
+        for (const [id, meta] of markets) {
+          if (!id.startsWith("jup:")) continue;
+          if (meta.slug === id && jupSlugs.length === 1) {
+            meta.slug = jupSlugs[0];
+          }
+          if (meta.title === id || meta.title === meta.slug) {
+            const [latestTick] = await pgFetch<{ raw?: any }[]>(
+              `market_mid_ticks?select=raw` +
+                `&market_id=eq.${encodeURIComponent(id)}` +
+                `&order=ts.desc&limit=1`
+            );
+            const tickTitle = latestTick?.raw?.marketTitle ?? latestTick?.raw?.eventTitle;
+            if (tickTitle) meta.title = tickTitle;
+          }
+        }
+      }
     }
   }
 
@@ -325,7 +345,7 @@ export async function GET(req: Request) {
                 `&order=timestamp.asc&limit=2000`
             ),
             pgFetch<RawMovement[]>(
-              `market_movements?select=id,market_id,outcome,window_start,window_end,window_type,reason,start_price` +
+              `market_movements?select=id,market_id,outcome,window_start,window_end,window_type,reason,start_price,status` +
                 `&market_id=in.(${Array.from(
                   new Set([...marketIds, ...eventMarketIds])
                 )
@@ -428,7 +448,7 @@ export async function GET(req: Request) {
                 new Set([...marketIds, ...eventMarketIds])
               );
               const recentFinal = await pgFetch<RawMovement[]>(
-                `market_movements?select=id,market_id,outcome,window_start,window_end,window_type,reason,start_price` +
+                `market_movements?select=id,market_id,outcome,window_start,window_end,window_type,reason,start_price,status` +
                   `&market_id=in.(${allMoveIds.map(encodeURIComponent).join(",")})` +
                   `&status=eq.FINAL` +
                   `&order=window_end.desc&limit=50`

@@ -1,5 +1,5 @@
 import { supabase } from "../../../storage/src/db";
-import { fetchEvents } from "./jupiter.api";
+import { fetchEvents, fetchEventMarkets, fetchEvent } from "./jupiter.api";
 import type { TrackedJupiterMarket } from "./jupiter.types";
 import { JUP_PREFIX } from "./jupiter.types";
 
@@ -9,6 +9,10 @@ const DISCOVER_INTERVAL_MS = Number(
 
 let lastDiscoverAt = 0;
 let cachedMarkets: TrackedJupiterMarket[] = [];
+
+// Cache successful event → market resolutions so transient network failures
+// don't clobber known-good mappings.
+const eventMarketCache = new Map<string, TrackedJupiterMarket[]>();
 
 /**
  * Discover active prediction markets from Jupiter.
@@ -107,7 +111,7 @@ export async function syncJupiterTrackedSlugs(): Promise<string[]> {
  * Always merges with tracked_slugs entries.
  */
 export async function resolveMarketsToTrack(): Promise<TrackedJupiterMarket[]> {
-  const autoDiscover = process.env.JUP_AUTO_DISCOVER !== "0";
+  const autoDiscover = process.env.JUP_AUTO_DISCOVER === "1";
   const fromSlugs = await syncJupiterTrackedSlugs();
 
   const byId = new Map<string, TrackedJupiterMarket>();
@@ -119,7 +123,57 @@ export async function resolveMarketsToTrack(): Promise<TrackedJupiterMarket[]> {
 
   // Merge slug-specified markets (may not be in discovery if not trending)
   for (const id of fromSlugs) {
-    if (!byId.has(id)) {
+    if (byId.has(id)) continue;
+
+    // Try to resolve as event ID → child markets (retry on cold start)
+    let childMarkets = await fetchEventMarkets(id);
+    if (childMarkets.length === 0 && !eventMarketCache.has(id)) {
+      // Cold start — retry up to 3 times with 3s delay
+      for (let attempt = 1; attempt <= 3 && childMarkets.length === 0; attempt++) {
+        console.log(`[jup-markets] retrying event resolution for ${id} (attempt ${attempt}/3)...`);
+        await new Promise((r) => setTimeout(r, 3_000));
+        childMarkets = await fetchEventMarkets(id);
+      }
+    }
+    if (childMarkets.length > 0) {
+      // Fetch event metadata for the human-readable title
+      // (market.metadata.title is often just "Yes"/"No" for binary markets)
+      const event = await fetchEvent(id);
+      const eventTitle = event?.metadata?.title ?? id;
+
+      // Success — cache and use
+      const resolved: TrackedJupiterMarket[] = [];
+      for (const m of childMarkets) {
+        if (m.status !== "open") continue;
+        // For binary markets (single child), use event title.
+        // For multi-outcome markets, use market title (e.g. team names).
+        const isBinary = childMarkets.filter((c) => c.status === "open").length === 1;
+        const title = isBinary
+          ? eventTitle
+          : (m.metadata?.title ?? eventTitle);
+        const entry: TrackedJupiterMarket = {
+          marketId: m.marketId,
+          eventId: id,
+          title,
+          namespacedId: `${JUP_PREFIX}${m.marketId}`,
+          status: m.status,
+          volume24h: m.pricing?.volume24h ?? 0,
+        };
+        resolved.push(entry);
+        if (!byId.has(m.marketId)) byId.set(m.marketId, entry);
+      }
+      eventMarketCache.set(id, resolved);
+      console.log(
+        `[jup-markets] resolved event ${id} → ${resolved.length} market(s): ${resolved.map((m) => m.marketId).join(", ")} (title: ${eventTitle})`
+      );
+    } else if (eventMarketCache.has(id)) {
+      // Fetch failed but we have a cached resolution — use it
+      const cached = eventMarketCache.get(id)!;
+      for (const entry of cached) {
+        if (!byId.has(entry.marketId)) byId.set(entry.marketId, entry);
+      }
+    } else {
+      // Never resolved and fetch failed/empty — treat as direct market ID
       byId.set(id, {
         marketId: id,
         eventId: "",

@@ -837,6 +837,13 @@ export default function Page(props: PageProps) {
     return { count: signalWindows.length, lastMs };
   }, [signalWindows]);
 
+  // True when at least one signal is still OPEN (not yet finalized).
+  // Controls whether the header shows "Anchor"/"Drift" vs "Last"/"Window range".
+  const hasOpenSignals = useMemo(
+    () => signalWindows.some((a) => a.status !== "FINAL"),
+    [signalWindows]
+  );
+
   useEffect(() => {
     if (!lineFilterKey) return;
     const outcomes = selectedMarket?.outcomes ?? [];
@@ -1223,10 +1230,14 @@ export default function Page(props: PageProps) {
       if (trimmed.length > 0) {
         const currentPrice = trimmed[trimmed.length - 1]?.value ?? 0;
 
-        if (signalWindows.length > 0) {
-          // Anchor to the earliest (first) detected movement
-          let earliest = signalWindows[0];
-          for (const ann of signalWindows) {
+        // Only OPEN signals anchor the drift display. FINAL signals still
+        // render as chart bands but don't pin the anchor/drift metrics.
+        const openSignals = signalWindows.filter((a) => a.status !== "FINAL");
+
+        if (openSignals.length > 0) {
+          // Anchor to the earliest OPEN movement
+          let earliest = openSignals[0];
+          for (const ann of openSignals) {
             if (Date.parse(ann.start_ts) < Date.parse(earliest.start_ts)) {
               earliest = ann;
             }
@@ -1259,7 +1270,7 @@ export default function Page(props: PageProps) {
             setRangePct(0);
           }
         } else {
-          // No signals — show min→max range across the visible window
+          // No OPEN signals — show min→max range across the visible window
           const values = trimmed.map((p) => p.value);
           const pct = (Math.max(...values) - Math.min(...values)) * 100;
           setLastPrice(currentPrice);
@@ -1324,19 +1335,19 @@ export default function Page(props: PageProps) {
           </div>
           <div className="panel-metrics">
             <div className="metric">
-              <span>{signalWindows.length > 0 ? "Anchor" : "Last"}</span>
+              <span>{hasOpenSignals ? "Anchor" : "Last"}</span>
               <strong>{lastPrice.toFixed(3)}</strong>
             </div>
             <div className="metric">
-              <span>{signalWindows.length > 0 ? "Drift" : "Window range"}</span>
+              <span>{hasOpenSignals ? "Drift" : "Window range"}</span>
               <strong
                 style={
-                  signalWindows.length > 0
+                  hasOpenSignals
                     ? { color: rangePct >= 0 ? "#50dc8c" : "#e74c3c" }
                     : undefined
                 }
               >
-                {signalWindows.length > 0
+                {hasOpenSignals
                   ? `${rangePct >= 0 ? "+" : ""}${rangePct.toFixed(2)}%`
                   : `${rangePct.toFixed(1)}%`}
               </strong>

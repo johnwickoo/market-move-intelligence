@@ -20,6 +20,7 @@ A movement detection system has flagged unusual activity. Write a 2-3 sentence e
 
 Guidelines:
 - Lead with the most likely driver of the move
+- ALWAYS mention both start and end price (e.g. "moved from 42¢ to 56¢") so the reader knows the reference point
 - Reference specific numbers (price %, volume ratios, velocity)
 - If news headlines are provided, cite the most relevant one briefly
 - If thin_liquidity is true, note the move may be exaggerated

@@ -78,7 +78,9 @@ export function jupiterTradeToInsert(raw: JupiterRawTrade): TradeInsert | null {
  */
 export function jupiterOrderbookToMidTick(
   marketId: string,
-  raw: JupiterOrderbook
+  raw: JupiterOrderbook,
+  marketTitle?: string,
+  eventId?: string
 ): MidTickInsert | null {
   if (!raw.yes?.length && !raw.no?.length) return null;
 
@@ -135,6 +137,8 @@ export function jupiterOrderbookToMidTick(
       source: "jupiter_orderbook",
       yes_top3: (raw.yes ?? []).slice(-3).reverse(),
       no_top3: (raw.no ?? []).slice(-3).reverse(),
+      ...(marketTitle ? { marketTitle } : {}),
+      ...(eventId ? { eventId } : {}),
     },
   };
 }
