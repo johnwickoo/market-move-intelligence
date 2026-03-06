@@ -104,7 +104,20 @@ export function buildTemplateExplanation(movement: any, signal: any): string {
     newsSentence = `Related news: "${truncated.join('"; "')}"`;
   }
 
-  return [priceSentence, windowSentence, velocitySentence, volumeSentence, liquiditySentence, classificationSentence, newsSentence]
+  // Spot price context for crypto markets
+  const spot = (movement as any)?.__spotContext as
+    | { coinName: string; spotPriceStart: number; spotPriceEnd: number; spotDriftPct: number }
+    | undefined;
+  let spotSentence = "";
+  if (spot) {
+    const spotDir = spot.spotDriftPct >= 0 ? "up" : "down";
+    const spotPct = Math.abs(spot.spotDriftPct * 100).toFixed(1);
+    const spotStart = spot.spotPriceStart.toLocaleString("en-US", { maximumFractionDigits: 2 });
+    const spotEnd = spot.spotPriceEnd.toLocaleString("en-US", { maximumFractionDigits: 2 });
+    spotSentence = `${spot.coinName} spot price moved ${spotDir} ${spotPct}% ($${spotStart} → $${spotEnd}) in the same window.`;
+  }
+
+  return [priceSentence, windowSentence, velocitySentence, volumeSentence, liquiditySentence, classificationSentence, spotSentence, newsSentence]
     .filter(Boolean)
     .join(" ");
 }

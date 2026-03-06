@@ -5,6 +5,7 @@ import { fetchRelevantNewsForMovement } from "../../news/src/fetchRelevantNews";
 import { computeTimeScore, parseTimeValue } from "./timeScore";
 import { attestSignal } from "../../chain/src/attestSignal";
 import type { SignalClassification } from "../../chain/src/types";
+import { fetchSpotContext, computeCryptoCorrelation, type SpotContext } from "../../crypto/src/spotContext";
 
 function clamp01(x: number) {
   return Math.max(0, Math.min(1, x));
@@ -187,7 +188,32 @@ export async function scoreSignals(movement: any) {
   }
 
   /**
-   * 8) Classification logic
+   * 8) CRYPTO SPOT CORRELATION (0..1)
+   * "Did the prediction market just track the underlying crypto price?"
+   */
+  let cryptoCorrelation = 0;
+  let spotContext: SpotContext | null = null;
+  try {
+    spotContext = await fetchSpotContext(
+      movement.market_id,
+      movement.window_start ?? movement.window_end,
+      movement.window_end ?? new Date().toISOString(),
+    );
+    if (spotContext && movement.pct_change != null) {
+      cryptoCorrelation = computeCryptoCorrelation(
+        safeNum(movement.pct_change, 0),
+        spotContext.spotDriftPct,
+      );
+    }
+  } catch (err: any) {
+    console.warn("[signals] crypto spot fetch failed, defaulting to 0", err?.message);
+  }
+
+  // Attach spot context to movement for buildExplanation
+  if (spotContext) (movement as any).__spotContext = spotContext;
+
+  /**
+   * 9) Classification logic
    *
    * Priority order:
    * 1. LIQUIDITY — don't trust the move
@@ -218,15 +244,19 @@ export async function scoreSignals(movement: any) {
     classification = "VELOCITY";
     confidence = velocityScore * 0.7 + priceScore * 0.3;
   }
-  // 4) Capital
-  else if (capitalScore >= 0.6) {
+  // 4) Capital — boost if crypto market is tracking spot price
+  else if (capitalScore >= 0.6 || (spotContext && cryptoCorrelation >= 0.7 && capitalScore >= 0.3)) {
     classification = "CAPITAL";
-    confidence = capitalScore;
+    confidence = spotContext && cryptoCorrelation >= 0.7
+      ? Math.max(capitalScore, cryptoCorrelation * 0.8)
+      : capitalScore;
   }
-  // 5) Info
+  // 5) Info — boost if crypto market diverged from spot
   else if (infoScore >= 0.5 && hasInfoDepth) {
     classification = "INFO";
-    confidence = infoScore;
+    confidence = spotContext && cryptoCorrelation < 0.3
+      ? Math.max(infoScore, 0.6)
+      : infoScore;
   }
   // 6) Price moved but ambiguous
   else if (priceScore >= 0.6) {
@@ -353,6 +383,7 @@ export async function scoreSignals(movement: any) {
     newsScore: newsScore.toFixed(3),
     timeScore: timeScore.toFixed(3),
     liquidityRisk: liquidityRisk.toFixed(3),
+    cryptoCorrelation: cryptoCorrelation.toFixed(3),
     recency: recency.toFixed(2),
   });
 

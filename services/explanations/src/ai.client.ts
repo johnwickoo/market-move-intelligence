@@ -25,6 +25,7 @@ Guidelines:
 - If news headlines are provided, cite the most relevant one briefly
 - If thin_liquidity is true, note the move may be exaggerated
 - If classification is VELOCITY, emphasize speed/impulse nature
+- If SPOT price data is provided for crypto markets, reference whether the prediction market tracked the underlying asset price or diverged from it
 - Use plain English, no markdown, no bullets, no emojis
 - Be concise: 2-3 sentences max`;
 
@@ -77,7 +78,15 @@ export function formatMovementContext(
           .join(" | ")
       : "none";
 
-  return `MARKET: ${title}
+  // Spot price context for crypto markets
+  const spot = (movement as any)?.__spotContext as
+    | { coinName: string; spotPriceStart: number; spotPriceEnd: number; spotDriftPct: number }
+    | undefined;
+  const spotLine = spot
+    ? `SPOT: ${spot.coinName} $${spot.spotPriceStart.toLocaleString("en-US", { maximumFractionDigits: 2 })} → $${spot.spotPriceEnd.toLocaleString("en-US", { maximumFractionDigits: 2 })} (Δ ${(spot.spotDriftPct * 100).toFixed(2)}%)`
+    : null;
+
+  let context = `MARKET: ${title}
 OUTCOME: ${outcome}  |  WINDOW: ${windowType} (${duration})
 
 PRICE: ${fmtPrice(movement?.start_price)} → ${fmtPrice(movement?.end_price)} (Δ ${fmtPct(movement?.pct_change)}), range ${fmtPct(movement?.range_pct)}
@@ -89,6 +98,10 @@ SCORES: capital=${safeNum(signal?.capital_score).toFixed(2)} info=${safeNum(sign
 CLASSIFICATION: ${signal?.classification ?? ""} (confidence: ${safeNum(signal?.confidence).toFixed(2)})
 
 NEWS: ${newsLine}`;
+
+  if (spotLine) context += `\n${spotLine}`;
+
+  return context;
 }
 
 async function generateExplanation(

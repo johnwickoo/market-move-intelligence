@@ -1,0 +1,9 @@
+{
+  "name": "@market-move-intelligence/crypto",
+  "version": "0.1.0",
+  "private": true,
+  "main": "src/coingecko.ts",
+  "devDependencies": {
+    "typescript": "^5.5.0"
+  }
+}

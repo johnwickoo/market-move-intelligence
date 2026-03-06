@@ -60,28 +60,35 @@ async function recomputeMetrics(mv: OpenMovement) {
   const settledEndMs = Date.now();
   const settledEndISO = new Date(settledEndMs).toISOString();
 
-  // Fetch ticks for the full settled window
-  const { data: ticks } = await supabase
+  // Fetch ticks for the full settled window (filter by outcome to avoid mixing Yes/No prices).
+  // Order DESCENDING so that if Supabase's PGRST_MAX_ROWS (default 1000) truncates results,
+  // we keep the most recent ticks (critical for accurate end_price) rather than the oldest.
+  let tickQ = supabase
     .from("market_mid_ticks")
     .select("mid,ts,best_bid,best_ask,spread_pct")
     .eq("market_id", mv.market_id)
     .gte("ts", mv.window_start)
     .lte("ts", settledEndISO)
-    .order("ts", { ascending: true })
+    .order("ts", { ascending: false })
     .limit(5000);
+  if (mv.outcome) tickQ = tickQ.eq("outcome", mv.outcome);
+  const { data: ticksDesc } = await tickQ;
 
-  // Fetch trades
-  const { data: trades } = await supabase
+  // Fetch trades (also descending for the same truncation-safety reason)
+  let tradeQ = supabase
     .from("trades")
     .select("price,size,timestamp")
     .eq("market_id", mv.market_id)
     .gte("timestamp", mv.window_start)
     .lte("timestamp", settledEndISO)
-    .order("timestamp", { ascending: true })
+    .order("timestamp", { ascending: false })
     .limit(5000);
+  if (mv.outcome) tradeQ = tradeQ.eq("outcome", mv.outcome);
+  const { data: tradesDesc } = await tradeQ;
 
-  const validTicks = (ticks ?? []).filter((t: any) => t.mid != null);
-  const validTrades = trades ?? [];
+  // Reverse to chronological order for processing
+  const validTicks = (ticksDesc ?? []).filter((t: any) => t.mid != null).reverse();
+  const validTrades = (tradesDesc ?? []).reverse();
 
   if (validTicks.length < 2) return null;
 
@@ -93,6 +100,7 @@ async function recomputeMetrics(mv: OpenMovement) {
     ? mv.start_price
     : safeNum(validTicks[0].mid);
   const lastMid = safeNum(validTicks[validTicks.length - 1].mid);
+
   let minMid = firstMid;
   let maxMid = firstMid;
   for (const tk of validTicks) {
@@ -144,6 +152,13 @@ async function recomputeMetrics(mv: OpenMovement) {
 
 async function finalizeOne(mv: OpenMovement) {
   const settled = await recomputeMetrics(mv);
+
+  if (!settled) {
+    console.warn(
+      `[finalize] recompute returned NULL for market=${mv.market_id.slice(0, 16)} ` +
+      `outcome=${mv.outcome ?? "n/a"} window=${mv.window_start}→${mv.window_end}`
+    );
+  }
 
   // Build the row for scoreSignals — use settled metrics if available, else original
   const scoringRow = {
@@ -209,8 +224,12 @@ const STABLE_RANGE_THRESHOLD = 0.01; // 1%
 const STABLE_MIN_TICKS = 3;
 
 /**
- * Check if a movement's price has stabilized: the last 2 minutes of
- * mid-ticks show < 1% range, meaning the move has settled.
+ * Check if a movement's price has stabilized: the last N minutes of
+ * mid-ticks show < threshold range, meaning the move has settled.
+ *
+ * Guards against early-finalizing mid-move pauses:
+ *   1. window_end must be stale (detection stopped extending)
+ *   2. Larger moves require longer stabilization windows
  */
 async function isStabilized(mv: OpenMovement): Promise<boolean> {
   const nowMs = Date.now();
@@ -220,22 +239,48 @@ async function isStabilized(mv: OpenMovement): Promise<boolean> {
   const minAge = EARLY_MIN_AGE_MS[mv.window_type] ?? 5 * 60_000;
   if (nowMs - windowStartMs < minAge) return false;
 
-  // Fetch recent ticks
-  const stableFrom = new Date(nowMs - STABLE_WINDOW_MS).toISOString();
-  const { data: recentTicks } = await supabase
+  // Don't early-finalize if the detection system recently extended this movement.
+  // A recent window_end means the compound tracker is still actively updating it.
+  const windowEndMs = Date.parse(mv.window_end);
+  if (Number.isFinite(windowEndMs) && nowMs - windowEndMs < STABLE_WINDOW_MS) return false;
+
+  // Don't early-finalize if less than half the finalize delay has elapsed.
+  // The delay was sized per window type — respect most of it before short-circuiting.
+  const finalizeAtMs = Date.parse(mv.finalize_at);
+  if (Number.isFinite(finalizeAtMs) && Number.isFinite(windowEndMs)) {
+    const totalDelay = finalizeAtMs - windowEndMs; // original delay from last extend
+    const elapsed = nowMs - windowEndMs;
+    if (totalDelay > 0 && elapsed < totalDelay * 0.6) return false;
+  }
+
+  // Scale stabilization window for large moves — a 20%+ move needs more
+  // evidence of settling than a 5% move to avoid catching mid-move pauses.
+  const absDrift = mv.pct_change != null ? Math.abs(mv.pct_change) : 0;
+  const stableWindowMs = absDrift > 0.15
+    ? STABLE_WINDOW_MS * 2   // 4 min for large moves (>15%)
+    : STABLE_WINDOW_MS;       // 2 min default
+  const stableMinTicks = absDrift > 0.15
+    ? STABLE_MIN_TICKS * 2   // 6 ticks for large moves
+    : STABLE_MIN_TICKS;       // 3 ticks default
+
+  // Fetch recent ticks (filter by outcome to avoid mixing Yes/No prices)
+  const stableFrom = new Date(nowMs - stableWindowMs).toISOString();
+  let stableQ = supabase
     .from("market_mid_ticks")
     .select("mid,ts")
     .eq("market_id", mv.market_id)
     .gte("ts", stableFrom)
     .order("ts", { ascending: false })
     .limit(50);
+  if (mv.outcome) stableQ = stableQ.eq("outcome", mv.outcome);
+  const { data: recentTicks } = await stableQ;
 
   const valid = (recentTicks ?? []).filter((t: any) => t.mid != null);
 
-  // No ticks at all in the last 2 minutes = market went quiet, move is done
+  // No ticks at all in the stable window = market went quiet, move is done
   if (valid.length === 0) return true;
 
-  if (valid.length < STABLE_MIN_TICKS) return false;
+  if (valid.length < stableMinTicks) return false;
 
   let minMid = Infinity;
   let maxMid = -Infinity;
@@ -273,9 +318,11 @@ async function checkEarlyFinalize() {
       const stable = await isStabilized(mv);
       if (!stable) continue;
 
+      const windowEndAge = ((Date.now() - Date.parse(mv.window_end)) / 60_000).toFixed(1);
       console.log(
-        `[finalize] early finalize: ${mv.window_type} market=${mv.market_id.slice(0, 16)} ` +
-        `— price stabilized within ${STABLE_RANGE_THRESHOLD * 100}% over last ${STABLE_WINDOW_MS / 60_000}min`
+        `[finalize] EARLY finalize: ${mv.window_type} market=${mv.market_id.slice(0, 16)} ` +
+        `drift=${safeNum(mv.pct_change).toFixed(3)} endPrice=${safeNum(mv.end_price).toFixed(4)} ` +
+        `windowEnd_age=${windowEndAge}min`
       );
       await finalizeOne(mv);
     } catch (err: any) {
@@ -302,10 +349,16 @@ async function pollOnce() {
   }
 
   if (open && open.length > 0) {
-    console.log(`[finalize] processing ${open.length} movement(s)`);
+    console.log(`[finalize] processing ${open.length} movement(s) (timer-expired)`);
 
     for (const mv of open as OpenMovement[]) {
       try {
+        const windowEndAge = ((Date.now() - Date.parse(mv.window_end)) / 60_000).toFixed(1);
+        console.log(
+          `[finalize] TIMER finalize: ${mv.window_type} market=${mv.market_id.slice(0, 16)} ` +
+          `drift=${safeNum(mv.pct_change).toFixed(3)} endPrice=${safeNum(mv.end_price).toFixed(4)} ` +
+          `windowEnd_age=${windowEndAge}min`
+        );
         await finalizeOne(mv);
       } catch (err: any) {
         console.error("[finalize] error on", mv.id, err?.message);
