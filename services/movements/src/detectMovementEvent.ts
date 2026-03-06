@@ -1,4 +1,5 @@
 import { supabase } from "../../storage/src/db";
+import { USE_TRADE_BUCKETS, fetchBucketsMultiMarket, type BucketRow } from "./bucketTradeStats";
 // Two-stage: finalize delays per window type
 const FINALIZE_DELAY_MS: Record<string, number> = {
   "5m": 10 * 60_000,
@@ -138,16 +139,25 @@ export async function detectEventMovement({
   const outerStartISO = new Date(outerStartMs).toISOString();
   const endISO = new Date(nowMs).toISOString();
 
-  // Fetch all trades and ticks once
-  const { data: allTrades, error: tradesErr } = await supabase
-    .from("trades")
-    .select("market_id,price,size,timestamp")
-    .in("market_id", childMarketIds)
-    .gte("timestamp", outerStartISO)
-    .lte("timestamp", endISO)
-    .order("timestamp", { ascending: true });
-  if (tradesErr) throw tradesErr;
-  if (!allTrades || allTrades.length < 2) return;
+  // Fetch all trades (or buckets) and ticks once
+  let allTrades: any[] = [];
+  let allBucketRows: BucketRow[] | undefined;
+
+  if (USE_TRADE_BUCKETS) {
+    allBucketRows = await fetchBucketsMultiMarket(childMarketIds, outerStartISO, endISO);
+    if (!allBucketRows || allBucketRows.length === 0) return;
+  } else {
+    const { data, error: tradesErr } = await supabase
+      .from("trades")
+      .select("market_id,price,size,timestamp")
+      .in("market_id", childMarketIds)
+      .gte("timestamp", outerStartISO)
+      .lte("timestamp", endISO)
+      .order("timestamp", { ascending: true });
+    if (tradesErr) throw tradesErr;
+    if (!data || data.length < 2) return;
+    allTrades = data;
+  }
 
   const { data: allTicks, error: ticksErr } = await supabase
     .from("market_mid_ticks")
@@ -194,38 +204,54 @@ export async function detectEventMovement({
     const wStartISO = new Date(wStartMs).toISOString();
 
     // Filter data to this window
-    const trades = allTrades.filter((t) => {
-      const ts = Date.parse(t.timestamp);
-      return Number.isFinite(ts) && ts >= wStartMs && ts <= nowMs;
-    });
     const ticks = allTicks.filter((t) => {
       const ts = Date.parse(t.ts);
       return Number.isFinite(ts) && ts >= wStartMs && ts <= nowMs;
     });
 
-    if (trades.length < 2 || ticks.length < 2) continue;
-
-    // Aggregate volume
+    // Aggregate volume from buckets or raw trades
     const volumeByMarket = new Map<string, number>();
     let totalVolume = 0;
     const hourMs = 60 * 60_000;
     const tradesByHour = new Map<number, number>();
     const volumeByHour = new Map<number, number>();
 
-    for (const t of trades) {
-      const size = toNum(t.size ?? 0);
-      totalVolume += size;
-      volumeByMarket.set(
-        t.market_id,
-        (volumeByMarket.get(t.market_id) ?? 0) + size
-      );
-      const ts = Date.parse(t.timestamp);
-      if (!Number.isFinite(ts)) continue;
-      const bucket = Math.floor((ts - wStartMs) / hourMs);
-      tradesByHour.set(bucket, (tradesByHour.get(bucket) ?? 0) + 1);
-      volumeByHour.set(bucket, (volumeByHour.get(bucket) ?? 0) + size);
+    if (allBucketRows) {
+      for (const b of allBucketRows) {
+        const ts = Date.parse(b.minute_ts);
+        if (!Number.isFinite(ts) || ts < wStartMs || ts > nowMs) continue;
+        const vol = Number(b.volume_total) || 0;
+        const tc = Number(b.trade_count) || 0;
+        totalVolume += vol;
+        volumeByMarket.set(
+          b.market_id,
+          (volumeByMarket.get(b.market_id) ?? 0) + vol
+        );
+        const bucket = Math.floor((ts - wStartMs) / hourMs);
+        tradesByHour.set(bucket, (tradesByHour.get(bucket) ?? 0) + tc);
+        volumeByHour.set(bucket, (volumeByHour.get(bucket) ?? 0) + vol);
+      }
+    } else {
+      const trades = allTrades.filter((t) => {
+        const ts = Date.parse(t.timestamp);
+        return Number.isFinite(ts) && ts >= wStartMs && ts <= nowMs;
+      });
+      for (const t of trades) {
+        const size = toNum(t.size ?? 0);
+        totalVolume += size;
+        volumeByMarket.set(
+          t.market_id,
+          (volumeByMarket.get(t.market_id) ?? 0) + size
+        );
+        const ts = Date.parse(t.timestamp);
+        if (!Number.isFinite(ts)) continue;
+        const bucket = Math.floor((ts - wStartMs) / hourMs);
+        tradesByHour.set(bucket, (tradesByHour.get(bucket) ?? 0) + 1);
+        volumeByHour.set(bucket, (volumeByHour.get(bucket) ?? 0) + size);
+      }
     }
 
+    if (ticks.length < 2) continue;
     if (totalVolume < EVENT_MIN_VOLUME) continue;
 
     let maxTradesInHour = 0;
@@ -233,6 +259,10 @@ export async function detectEventMovement({
       if (c > maxTradesInHour) maxTradesInHour = c;
     }
     if (maxTradesInHour < EVENT_MIN_TRADES_PER_BUCKET) continue;
+
+    // Total trade count across all hourly buckets
+    let totalTradesCount = 0;
+    for (const c of tradesByHour.values()) totalTradesCount += c;
 
     // Aggregate price per child market
     const perMarket = new Map<
@@ -316,7 +346,7 @@ export async function detectEventMovement({
     const hourlyRatio =
       baselineHourly != null && baselineHourly > 0 ? maxHourVol / baselineHourly : null;
 
-    const thinLiquidity = trades.length < EVENT_MIN_TRADES_PER_BUCKET * 2;
+    const thinLiquidity = totalTradesCount < EVENT_MIN_TRADES_PER_BUCKET * 2;
     const threshold = thinLiquidity ? w.thinPriceThreshold : w.priceThreshold;
 
     const priceEligible = minPrice >= MIN_PRICE_FOR_ALERT;
@@ -374,9 +404,9 @@ export async function detectEventMovement({
       range_pct: rangePct,
       max_hour_volume: maxHourVol,
       hourly_volume_ratio: hourlyRatio,
-      trades_count_24h: trades.length,
+      trades_count_24h: totalTradesCount,
       unique_price_levels_24h: null,
-      avg_trade_size_24h: trades.length > 0 ? totalVolume / trades.length : null,
+      avg_trade_size_24h: totalTradesCount > 0 ? totalVolume / totalTradesCount : null,
       thin_liquidity: thinLiquidity,
     };
 

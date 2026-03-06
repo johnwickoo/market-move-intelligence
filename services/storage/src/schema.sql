@@ -36,6 +36,7 @@ CREATE TABLE market_dominant_outcomes (
 CREATE TABLE market_resolution (
   market_id TEXT PRIMARY KEY,
   slug TEXT,
+  title TEXT,
   end_time TIMESTAMPTZ,
   resolved_at TIMESTAMPTZ,
   resolved BOOLEAN,
@@ -132,6 +133,25 @@ CREATE TABLE trades (
   outcome_index SMALLINT
 );
 
+CREATE TABLE trade_1m (
+  market_id TEXT NOT NULL,
+  outcome TEXT NOT NULL DEFAULT '',
+  minute_ts TIMESTAMPTZ NOT NULL,
+  open NUMERIC,
+  high NUMERIC,
+  low NUMERIC,
+  close NUMERIC,
+  volume_total NUMERIC NOT NULL DEFAULT 0,
+  buy_volume NUMERIC NOT NULL DEFAULT 0,
+  sell_volume NUMERIC NOT NULL DEFAULT 0,
+  trade_count INTEGER NOT NULL DEFAULT 0,
+  vwap NUMERIC,
+  unique_price_levels INTEGER NOT NULL DEFAULT 0,
+  max_trade_size NUMERIC,
+  last_trade_ts TIMESTAMPTZ,
+  PRIMARY KEY (market_id, outcome, minute_ts)
+);
+
 CREATE UNIQUE INDEX market_mid_ticks_asset_id_ts_key
   ON public.market_mid_ticks USING btree (asset_id, ts);
 
@@ -158,3 +178,6 @@ CREATE INDEX trades_timestamp_idx
 
 CREATE INDEX trades_market_outcome_timestamp_idx
   ON public.trades USING btree (market_id, outcome, "timestamp");
+
+CREATE INDEX trade_1m_market_outcome_ts_idx
+  ON public.trade_1m USING btree (market_id, outcome, minute_ts DESC);

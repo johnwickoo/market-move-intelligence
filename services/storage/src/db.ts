@@ -48,9 +48,43 @@ export async function upsertDominantOutcome(marketId: string, outcome: string, t
   if (error) throw error;
 }
 
+/**
+ * Delete raw trades older than the retention period.
+ * Safe to call periodically — deletes in batches to avoid timeouts.
+ */
+export async function purgeOldTrades(retentionDays: number): Promise<number> {
+  const cutoff = new Date(Date.now() - retentionDays * 24 * 60 * 60_000).toISOString();
+  let totalDeleted = 0;
+  const BATCH = 1000;
+
+  while (true) {
+    // Select IDs to delete (batch to avoid long locks)
+    const { data, error: selErr } = await supabase
+      .from("trades")
+      .select("id")
+      .lt("timestamp", cutoff)
+      .limit(BATCH);
+    if (selErr) throw selErr;
+    if (!data || data.length === 0) break;
+
+    const ids = data.map((r: any) => r.id);
+    const { error: delErr } = await supabase
+      .from("trades")
+      .delete()
+      .in("id", ids);
+    if (delErr) throw delErr;
+
+    totalDeleted += ids.length;
+    if (data.length < BATCH) break;
+  }
+
+  return totalDeleted;
+}
+
 export async function upsertMarketResolution(row: {
   market_id: string;
   slug?: string | null;
+  title?: string | null;
   end_time?: string | null;
   resolved_at?: string | null;
   resolved?: boolean | null;

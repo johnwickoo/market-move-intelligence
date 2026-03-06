@@ -1,5 +1,11 @@
 import { supabase } from "../../storage/src/db";
 import type { TradeInsert } from "../../storage/src/types";
+import {
+  USE_TRADE_BUCKETS,
+  fetchBuckets,
+  computeStatsFromBuckets,
+  type BucketRow,
+} from "./bucketTradeStats";
 
 // ── Window types ──────────────────────────────────────────────────────
 // "5m" | "15m" | "1h" | "4h" are the active detection windows.
@@ -284,6 +290,7 @@ function evaluateWindow(
   allTrades: any[],
   nowMs: number,
   baselineHourly: number | null,
+  precomputedBuckets?: BucketRow[],
 ): WindowEval | null {
   const wStartMs = nowMs - w.ms;
   const ticks = (allTicks
@@ -292,12 +299,49 @@ function evaluateWindow(
         return Number.isFinite(ts) && ts >= wStartMs && ts <= nowMs;
       })
     : []).sort((a, b) => Date.parse(a.ts) - Date.parse(b.ts));
-  const trades = allTrades.filter((t) => {
-    const ts = Date.parse(t.timestamp);
-    return Number.isFinite(ts) && ts >= wStartMs && ts <= nowMs;
-  });
 
-  if (ticks.length < w.minTicks && trades.length < w.minTrades) return null;
+  // Trade stats: from buckets or raw trades
+  let tradesCount: number;
+  let volume: number;
+  let avgTradeSize: number | null;
+  let uniquePriceLevels: number;
+  let maxHourVol: number;
+
+  if (precomputedBuckets) {
+    const stats = computeStatsFromBuckets(precomputedBuckets, wStartMs, nowMs);
+    tradesCount = stats.tradesCount;
+    volume = stats.volume;
+    avgTradeSize = stats.avgTradeSize;
+    uniquePriceLevels = stats.uniquePriceLevels;
+    maxHourVol = stats.maxHourVol;
+  } else {
+    const trades = allTrades.filter((t) => {
+      const ts = Date.parse(t.timestamp);
+      return Number.isFinite(ts) && ts >= wStartMs && ts <= nowMs;
+    });
+    tradesCount = trades.length;
+    volume = trades.reduce((sum, t) => sum + safeNum(t.size ?? 0), 0);
+    avgTradeSize = tradesCount > 0 ? volume / tradesCount : null;
+    const priceLevelsSet = new Set<number>();
+    for (const t of trades) {
+      if (t.price == null) continue;
+      priceLevelsSet.add(Number(safeNum(t.price).toFixed(2)));
+    }
+    uniquePriceLevels = priceLevelsSet.size;
+
+    const hourMs = 60 * 60_000;
+    const hourlySums = new Map<number, number>();
+    for (const t of trades) {
+      const ts = Date.parse(t.timestamp);
+      if (!Number.isFinite(ts)) continue;
+      const b = Math.floor((ts - wStartMs) / hourMs);
+      hourlySums.set(b, (hourlySums.get(b) ?? 0) + safeNum(t.size ?? 0));
+    }
+    maxHourVol = 0;
+    for (const v of hourlySums.values()) maxHourVol = Math.max(maxHourVol, v);
+  }
+
+  if (ticks.length < w.minTicks && tradesCount < w.minTrades) return null;
   const hasTicks = ticks.length >= 2;
 
   if (hasTicks) {
@@ -330,17 +374,6 @@ function evaluateWindow(
     avgSpreadPct = spreadN > 0 ? spreadSum / spreadN : null;
   }
 
-  // Trade stats
-  const tradesCount = trades.length;
-  const volume = trades.reduce((sum, t) => sum + safeNum(t.size ?? 0), 0);
-  const avgTradeSize = tradesCount > 0 ? volume / tradesCount : null;
-  const priceLevelsSet = new Set<number>();
-  for (const t of trades) {
-    if (t.price == null) continue;
-    priceLevelsSet.add(Number(safeNum(t.price).toFixed(2)));
-  }
-  const uniquePriceLevels = priceLevelsSet.size;
-
   // Liquidity guard
   const thinBySpread = avgSpreadPct != null && avgSpreadPct >= WIDE_SPREAD;
   const thinByActivity = tradesCount < THIN_TRADE_COUNT || uniquePriceLevels < THIN_PRICE_LEVELS;
@@ -351,9 +384,10 @@ function evaluateWindow(
     startMid != null && endMid != null && startMid > 0
       ? (endMid - startMid) / startMid
       : null;
+  // Use max as denominator to avoid inflated range when min is near zero (e.g. 1¢)
   const rangePct =
-    minMid != null && maxMid != null && minMid > 0
-      ? (maxMid - minMid) / minMid
+    minMid != null && maxMid != null && maxMid > 0
+      ? (maxMid - minMid) / maxMid
       : null;
   const absMove =
     minMid != null && maxMid != null ? Math.abs(maxMid - minMid) : null;
@@ -369,17 +403,6 @@ function evaluateWindow(
   const scaledBaseline = baselineHourly != null ? baselineHourly * windowHours : null;
   const volumeRatio =
     scaledBaseline != null && scaledBaseline > 0 ? volume / scaledBaseline : null;
-
-  const hourMs = 60 * 60_000;
-  const hourlySums = new Map<number, number>();
-  for (const t of trades) {
-    const ts = Date.parse(t.timestamp);
-    if (!Number.isFinite(ts)) continue;
-    const b = Math.floor((ts - wStartMs) / hourMs);
-    hourlySums.set(b, (hourlySums.get(b) ?? 0) + safeNum(t.size ?? 0));
-  }
-  let maxHourVol = 0;
-  for (const v of hourlySums.values()) maxHourVol = Math.max(maxHourVol, v);
   const hourlyRatio =
     baselineHourly != null && baselineHourly > 0 ? maxHourVol / baselineHourly : null;
 
@@ -424,7 +447,7 @@ function evaluateWindow(
   return {
     w,
     ticks,
-    trades,
+    trades: precomputedBuckets ? [] : allTrades,
     startMid,
     endMid,
     minMid,
@@ -517,17 +540,27 @@ export async function detectMovement(trade: TradeInsert) {
   }
   const endISO = new Date(nowMs).toISOString();
 
-  let tq = supabase
-    .from("trades")
-    .select("price,size,timestamp,outcome")
-    .eq("market_id", marketId)
-    .gte("timestamp", outerStartISO)
-    .lte("timestamp", endISO)
-    .order("timestamp", { ascending: false });
-  if (outcome) tq = tq.eq("outcome", outcome);
-  const { data: allTrades, error: tradesErr } = await tq.limit(10000);
-  if (tradesErr) throw tradesErr;
-  if (!allTrades || allTrades.length < 2) return;
+  // Fetch trade data from raw trades or 1-minute buckets
+  let allTrades: any[] = [];
+  let allBuckets: BucketRow[] | undefined;
+
+  if (USE_TRADE_BUCKETS) {
+    allBuckets = await fetchBuckets(marketId, outcome, outerStartISO, endISO, 10000);
+    if (!allBuckets || allBuckets.length === 0) return;
+  } else {
+    let tq = supabase
+      .from("trades")
+      .select("price,size,timestamp,outcome")
+      .eq("market_id", marketId)
+      .gte("timestamp", outerStartISO)
+      .lte("timestamp", endISO)
+      .order("timestamp", { ascending: false });
+    if (outcome) tq = tq.eq("outcome", outcome);
+    const { data, error: tradesErr } = await tq.limit(10000);
+    if (tradesErr) throw tradesErr;
+    if (!data || data.length < 2) return;
+    allTrades = data;
+  }
 
   let mq = supabase
     .from("market_mid_ticks")
@@ -571,7 +604,7 @@ export async function detectMovement(trade: TradeInsert) {
       const computeKey = `${compoundKey}:${w.type}`;
       if (shouldSkipCompute(computeKey, nowMs, w.cooldownMs)) continue;
 
-      const ev = evaluateWindow(w, allTicks ?? [], allTrades, nowMs, baselineHourly);
+      const ev = evaluateWindow(w, allTicks ?? [], allTrades, nowMs, baselineHourly, allBuckets);
       if (!ev || !windowFires(ev)) continue;
 
       // Find pre-move anchor price (5min before window start)
@@ -656,7 +689,7 @@ export async function detectMovement(trade: TradeInsert) {
 
       // Only graduate if enough time has elapsed for the next window
       if (elapsedSinceFirst >= nextW.ms * 0.5) {
-        const ev = evaluateWindow(nextW, allTicks ?? [], allTrades, nowMs, baselineHourly);
+        const ev = evaluateWindow(nextW, allTicks ?? [], allTrades, nowMs, baselineHourly, allBuckets);
         if (ev) {
           // Check threshold against the compound's frozen anchor price
           const anchoredDrift =
@@ -677,8 +710,8 @@ export async function detectMovement(trade: TradeInsert) {
             const newMin = ev.minMid != null ? Math.min(active.anchorPrice, ev.minMid) : active.anchorPrice;
             const newMax = ev.maxMid != null ? Math.max(active.anchorPrice, ev.maxMid) : active.anchorPrice;
             const newRangePct =
-              Number.isFinite(newMin) && Number.isFinite(newMax) && newMin > 0
-                ? (newMax - newMin) / newMin
+              Number.isFinite(newMin) && Number.isFinite(newMax) && newMax > 0
+                ? (newMax - newMin) / newMax
                 : ev.rangePct;
 
             const { error: gradErr } = await supabase
@@ -718,7 +751,7 @@ export async function detectMovement(trade: TradeInsert) {
 
     // If not graduated, extend the current window (update end_price, push finalize)
     if (!graduated) {
-      const ev = evaluateWindow(curDef, allTicks ?? [], allTrades, nowMs, baselineHourly);
+      const ev = evaluateWindow(curDef, allTicks ?? [], allTrades, nowMs, baselineHourly, allBuckets);
       if (ev && ev.endMid != null) {
         const anchoredDrift =
           active.anchorPrice > 0
@@ -765,13 +798,29 @@ export async function detectMovement(trade: TradeInsert) {
               return Number.isFinite(ts) && ts >= eventStartMs && ts <= nowMs;
             })
           : []).sort((a, b) => Date.parse(a.ts) - Date.parse(b.ts));
-        const eventTrades = allTrades.filter((t) => {
-          const ts = Date.parse(t.timestamp);
-          return Number.isFinite(ts) && ts >= eventStartMs && ts <= nowMs;
-        });
+        let eventTradeStats: { volume: number; tradesCount: number; uniquePriceLevels: number };
+        if (allBuckets) {
+          const stats = computeStatsFromBuckets(allBuckets, eventStartMs, nowMs);
+          eventTradeStats = stats;
+        } else {
+          const eventTrades = allTrades.filter((t) => {
+            const ts = Date.parse(t.timestamp);
+            return Number.isFinite(ts) && ts >= eventStartMs && ts <= nowMs;
+          });
+          const eLevels = new Set<number>();
+          for (const t of eventTrades) {
+            if (t.price == null) continue;
+            eLevels.add(Number(safeNum(t.price).toFixed(2)));
+          }
+          eventTradeStats = {
+            volume: eventTrades.reduce((sum, t) => sum + safeNum(t.size ?? 0), 0),
+            tradesCount: eventTrades.length,
+            uniquePriceLevels: eLevels.size,
+          };
+        }
 
         const eLastMid = safeNum(eventTicks[eventTicks.length - 1]?.mid);
-        if (eventTicks.length >= 2 && eventTrades.length >= 2 && eLastMid >= MIN_PRICE_FOR_ALERT) {
+        if (eventTicks.length >= 2 && eventTradeStats.tradesCount >= 2 && eLastMid >= MIN_PRICE_FOR_ALERT) {
           const eEndMid = eLastMid;
           const eStartMid = lastMoveEndPrice;
           let eMinMid: number | null = null;
@@ -801,15 +850,9 @@ export async function detectMovement(trade: TradeInsert) {
           const eventCooldownOk = nowMs - eventLastEmit >= EVENT_MIN_ELAPSED_MS;
 
           if (ePriceEligible && eAbsHit && eDriftHit && eventCooldownOk) {
-            const eVolume = eventTrades.reduce(
-              (sum, t) => sum + safeNum(t.size ?? 0),
-              0
-            );
-            const eLevels = new Set<number>();
-            for (const t of eventTrades) {
-              if (t.price == null) continue;
-              eLevels.add(Number(safeNum(t.price).toFixed(2)));
-            }
+            const eVolume = eventTradeStats.volume;
+            const eTradesCount = eventTradeStats.tradesCount;
+            const eUniqueLevels = eventTradeStats.uniquePriceLevels;
 
             const eventMinutes = Math.max(1, (nowMs - eventStartMs) / 60_000);
             const eVelocity = eDriftPct != null
@@ -836,10 +879,10 @@ export async function detectMovement(trade: TradeInsert) {
               range_pct: eRangePct,
               max_hour_volume: null,
               hourly_volume_ratio: null,
-              trades_count_24h: eventTrades.length,
-              unique_price_levels_24h: eLevels.size,
+              trades_count_24h: eTradesCount,
+              unique_price_levels_24h: eUniqueLevels,
               avg_trade_size_24h:
-                eventTrades.length > 0 ? eVolume / eventTrades.length : null,
+                eTradesCount > 0 ? eVolume / eTradesCount : null,
               thin_liquidity: false,
               velocity: eVelocity,
             };
@@ -909,8 +952,8 @@ async function insertMovement(
       const newMin = Math.min(prevMin, dbRow.min_price_24h ?? Infinity);
       const newMax = Math.max(prevMax, dbRow.max_price_24h ?? -Infinity);
       const newRangePct =
-        Number.isFinite(newMin) && Number.isFinite(newMax) && newMin > 0
-          ? (newMax - newMin) / newMin
+        Number.isFinite(newMin) && Number.isFinite(newMax) && newMax > 0
+          ? (newMax - newMin) / newMax
           : dbRow.range_pct;
 
       const newVol = Number(existing.volume_24h ?? 0) + (dbRow.volume_24h ?? 0);

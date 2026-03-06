@@ -19,13 +19,14 @@ const SYSTEM_PROMPT = `You are a quantitative analyst monitoring Polymarket pred
 A movement detection system has flagged unusual activity. Write a 2-3 sentence explanation for a trader dashboard tooltip.
 
 Guidelines:
-- Lead with the most likely driver of the move
-- ALWAYS mention both start and end price (e.g. "moved from 42¢ to 56¢") so the reader knows the reference point
-- Reference specific numbers (price %, volume ratios, velocity)
+- Lead with the price move: direction, start/end price in cents (e.g. "dropped from 42¢ to 28¢"), and time window
+- Explain the likely driver based on the CLASSIFICATION (not raw scores)
+- Only mention volume if a reliable baseline exists (ratio is provided, not "no reliable baseline")
+- Do NOT expose internal scores, raw velocity numbers, or confidence percentages
 - If news headlines are provided, cite the most relevant one briefly
 - If thin_liquidity is true, note the move may be exaggerated
-- If classification is VELOCITY, emphasize speed/impulse nature
-- If SPOT price data is provided for crypto markets, reference whether the prediction market tracked the underlying asset price or diverged from it
+- If classification is VELOCITY, say the move was unusually fast for the time window
+- If SPOT price data is provided, note whether the market tracked or diverged from the underlying
 - Use plain English, no markdown, no bullets, no emojis
 - Be concise: 2-3 sentences max`;
 
@@ -86,15 +87,28 @@ export function formatMovementContext(
     ? `SPOT: ${spot.coinName} $${spot.spotPriceStart.toLocaleString("en-US", { maximumFractionDigits: 2 })} → $${spot.spotPriceEnd.toLocaleString("en-US", { maximumFractionDigits: 2 })} (Δ ${(spot.spotDriftPct * 100).toFixed(2)}%)`
     : null;
 
+  // Format range as human-readable (range_pct is now max-based)
+  const rangePctVal = safeNum(movement?.range_pct, 0);
+  const rangeStr = rangePctVal > 0 ? fmtPct(movement?.range_pct) : "n/a";
+
+  // Classify velocity strength for the AI (don't expose raw number)
+  const vel = safeNum(movement?.velocity, 0);
+  const velLabel = vel >= 0.02 ? "very high" : vel >= 0.01 ? "high" : vel >= 0.005 ? "moderate" : "low";
+
+  // Volume context
+  const hasBaseline = movement?.volume_ratio != null && Number.isFinite(Number(movement.volume_ratio));
+  const volStr = hasBaseline
+    ? `${safeNum(movement?.volume_24h).toFixed(0)} (${fmtRatio(movement?.volume_ratio)} vs baseline)`
+    : `${safeNum(movement?.volume_24h).toFixed(0)} (no reliable baseline yet)`;
+
   let context = `MARKET: ${title}
 OUTCOME: ${outcome}  |  WINDOW: ${windowType} (${duration})
 
-PRICE: ${fmtPrice(movement?.start_price)} → ${fmtPrice(movement?.end_price)} (Δ ${fmtPct(movement?.pct_change)}), range ${fmtPct(movement?.range_pct)}
-VOLUME: ${safeNum(movement?.volume_24h).toFixed(0)} (ratio: ${fmtRatio(movement?.volume_ratio)} baseline, hourly peak: ${fmtRatio(movement?.hourly_volume_ratio)})
-VELOCITY: ${safeNum(movement?.velocity).toFixed(4)}  |  REASON: ${movement?.reason ?? ""}
+PRICE: ${fmtPrice(movement?.start_price)} → ${fmtPrice(movement?.end_price)} (Δ ${fmtPct(movement?.pct_change)}), range ${rangeStr}
+VOLUME: ${volStr}
+VELOCITY: ${velLabel}  |  REASON: ${movement?.reason ?? ""}
 LIQUIDITY: thin=${Boolean(movement?.thin_liquidity)}, trades=${safeNum(movement?.trades_count_24h)}, levels=${safeNum(movement?.unique_price_levels_24h)}
 
-SCORES: capital=${safeNum(signal?.capital_score).toFixed(2)} info=${safeNum(signal?.info_score).toFixed(2)} velocity=${safeNum(signal?.velocity_score).toFixed(2)} news=${safeNum(signal?.news_score).toFixed(2)} time=${safeNum(signal?.time_score).toFixed(2)}
 CLASSIFICATION: ${signal?.classification ?? ""} (confidence: ${safeNum(signal?.confidence).toFixed(2)})
 
 NEWS: ${newsLine}`;

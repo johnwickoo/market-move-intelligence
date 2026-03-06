@@ -288,6 +288,12 @@ export default function Page(props: PageProps) {
   const [marketsFor, setMarketsFor] = useState<string | null>(null);
   const [lastPrice, setLastPrice] = useState(0);
   const [rangePct, setRangePct] = useState(0);
+  const RANGE_WINDOWS = [
+    { label: "15m", ms: 15 * 60_000 },
+    { label: "1h", ms: 60 * 60_000 },
+    { label: "4h", ms: 4 * 60 * 60_000 },
+  ] as const;
+  const [rangeWindowIdx, setRangeWindowIdx] = useState(1); // default 1h
   const chartContainerRef = useRef<HTMLDivElement | null>(null);
   const chartRef = useRef<ReturnType<typeof createChart> | null>(null);
   const lineSeriesRef = useRef<Map<string, any>>(new Map());
@@ -1270,8 +1276,12 @@ export default function Page(props: PageProps) {
             setRangePct(0);
           }
         } else {
-          // No OPEN signals — show min→max range across the visible window
-          const values = trimmed.map((p) => p.value);
+          // No OPEN signals — show min→max range for the selected detection window
+          const nowSec = Math.floor(Date.now() / 1000);
+          const windowSec = RANGE_WINDOWS[rangeWindowIdx].ms / 1000;
+          const cutoff = nowSec - windowSec;
+          const windowPoints = trimmed.filter((p) => (p.time as number) >= cutoff);
+          const values = (windowPoints.length > 0 ? windowPoints : trimmed).map((p) => p.value);
           const pct = (Math.max(...values) - Math.min(...values)) * 100;
           setLastPrice(currentPrice);
           setRangePct(pct);
@@ -1284,7 +1294,7 @@ export default function Page(props: PageProps) {
       setLastPrice(0);
       setRangePct(0);
     }
-  }, [selectedOutcome, selectedMarket, lineFilterKey, streamUpdateCounter, signalWindows]);
+  }, [selectedOutcome, selectedMarket, lineFilterKey, streamUpdateCounter, signalWindows, rangeWindowIdx]);
 
   const chartWindowLabel = `1m buckets · ${inferredSinceHours}h`;
 
@@ -1339,7 +1349,13 @@ export default function Page(props: PageProps) {
               <strong>{lastPrice.toFixed(3)}</strong>
             </div>
             <div className="metric">
-              <span>{hasOpenSignals ? "Drift" : "Window range"}</span>
+              <span
+                style={!hasOpenSignals ? { cursor: "pointer", userSelect: "none" } : undefined}
+                onClick={!hasOpenSignals ? () => setRangeWindowIdx((i) => (i + 1) % RANGE_WINDOWS.length) : undefined}
+                title={!hasOpenSignals ? "Click to cycle window" : undefined}
+              >
+                {hasOpenSignals ? "Drift" : `Range (${RANGE_WINDOWS[rangeWindowIdx].label})`}
+              </span>
               <strong
                 style={
                   hasOpenSignals

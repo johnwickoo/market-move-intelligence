@@ -8,12 +8,14 @@ process.on("unhandledRejection", (reason: any) => {
 import { connectClobMarketWS, type ClobHandle } from "./polymarket.clob.ws";
 
 import { updateAggregateBuffered } from "../../aggregates/src/updateAggregate";
+import { accumulateTrade, startBucketFlush } from "../../aggregates/src/tradeBucket";
+import { USE_TRADE_BUCKETS } from "../../movements/src/bucketTradeStats";
 import { detectMovement, clearMarketState } from "../../movements/src/detectMovement";
 import { detectEventMovement } from "../../movements/src/detectMovementEvent";
 import { movementRealtime } from "../../movements/src/detectMovementRealtime";
 import { startFinalizeWorker } from "../../movements/src/finalizeMovements";
 import { insertMidTick } from "../../storage/src/insertMidTick";
-import { insertTradeBatch, insertTrade, upsertDominantOutcome, upsertMarketResolution } from "../../storage/src/db";
+import { insertTradeBatch, insertTrade, upsertDominantOutcome, upsertMarketResolution, purgeOldTrades } from "../../storage/src/db";
 import type { TradeInsert } from "../../storage/src/types";
 import * as fs from "fs/promises";
 import * as path from "path";
@@ -178,6 +180,7 @@ async function appendManyToSpool(trades: TradeInsert[]) {
 type MarketMeta = {
   marketId: string | null;
   slug: string | null;
+  title: string | null;
   assets: Array<{ assetId: string; outcome: string | null }>;
   resolvedAtMs: number | null;
   endTimeMs: number | null;
@@ -385,6 +388,18 @@ function extractAssetsFromMeta(data: any): Array<{ assetId: string; outcome: str
   return candidates;
 }
 
+function extractTitleFromRoots(roots: any[]): string | null {
+  const keys = ["question", "title", "market_title"];
+  for (const root of roots) {
+    if (!root || typeof root !== "object") continue;
+    for (const key of keys) {
+      const val = root[key];
+      if (typeof val === "string" && val.trim()) return val.trim();
+    }
+  }
+  return null;
+}
+
 function extractMarketMeta(data: any): MarketMeta {
   const roots = collectRoots(data);
   const resolved = extractTimeFromRoots(roots, RESOLUTION_KEYS);
@@ -392,11 +407,13 @@ function extractMarketMeta(data: any): MarketMeta {
   const { status, resolvedFlag } = extractStatusFromRoots(roots);
   const marketId = extractMarketIdFromRoots(roots);
   const slug = extractSlugFromRoots(roots);
+  const title = extractTitleFromRoots(roots);
   const assets = extractAssetsFromMeta(data);
 
   return {
     marketId,
     slug,
+    title,
     assets,
     resolvedAtMs: resolved?.ms ?? null,
     endTimeMs: end?.ms ?? null,
@@ -442,7 +459,8 @@ function persistMarketResolution(meta: MarketMeta, source: string) {
     meta.resolvedAtMs != null ||
     meta.endTimeMs != null ||
     meta.status != null ||
-    meta.resolvedFlag != null;
+    meta.resolvedFlag != null ||
+    meta.title != null;
   if (!hasSignal) return;
 
   const resolved =
@@ -462,6 +480,7 @@ function persistMarketResolution(meta: MarketMeta, source: string) {
       upsertMarketResolution({
         market_id: meta.marketId!,
         slug: meta.slug,
+        title: meta.title,
         resolved_at,
         end_time,
         resolved,
@@ -519,8 +538,9 @@ async function replaySpoolOnce() {
       }
       const trade = obj as TradeInsert;
       try {
-        await insertTrade(trade);
+        if (!USE_TRADE_BUCKETS) await insertTrade(trade);
         await updateAggregateBuffered(trade);
+        accumulateTrade(trade);
       } catch (e: any) {
         const m = e?.message ?? "";
         if (m.includes("duplicate key value violates unique constraint")) {
@@ -550,7 +570,9 @@ async function flushTradeBuffer() {
       console.log(`[trade-batch] spooled size=${batch.length} reason=circuit`);
       return;
     }
-    await withRetry(() => insertTradeBatch(batch), "insertTradeBatch", 2);
+    if (!USE_TRADE_BUCKETS) {
+      await withRetry(() => insertTradeBatch(batch), "insertTradeBatch", 2);
+    }
     insertFailCount = 0;
     console.log(`[trade-batch] success size=${batch.length}`);
   } catch (err: any) {
@@ -1171,6 +1193,21 @@ console.log("[ingestion] starting...");
 // Start the two-stage finalize worker (classify + explain once momentum settles)
 startFinalizeWorker();
 
+// Start 1-minute trade bucket flush
+startBucketFlush();
+
+// Periodic trade retention cleanup (when buckets are active, purge raw trades older than 7 days)
+const TRADE_RETENTION_DAYS = Number(process.env.TRADE_RETENTION_DAYS ?? 7);
+const TRADE_PURGE_INTERVAL_MS = 6 * 60 * 60_000; // every 6 hours
+if (USE_TRADE_BUCKETS && TRADE_RETENTION_DAYS > 0) {
+  setInterval(() => {
+    purgeOldTrades(TRADE_RETENTION_DAYS)
+      .then((n) => { if (n > 0) console.log(`[retention] purged ${n} old trades (>${TRADE_RETENTION_DAYS}d)`); })
+      .catch((err) => console.error("[retention] purge failed:", err?.message ?? err));
+  }, TRADE_PURGE_INTERVAL_MS);
+  console.log(`[retention] trade cleanup enabled (>${TRADE_RETENTION_DAYS}d, every 6h)`);
+}
+
 // Trades now come from the CLOB Market Channel (last_trade_price events) via onClobTick.
 // The old RTDS activity WS (wss://ws-live-data.polymarket.com) no longer provides trade data.
 
@@ -1231,8 +1268,9 @@ async function backfillByConditionId(
     const tradeTsMs = Date.parse(trade.timestamp);
     if (Number.isFinite(tradeTsMs) && isDuplicateTrade(trade.id, tradeTsMs)) continue;
     try {
-      await insertTrade(trade);
+      if (!USE_TRADE_BUCKETS) await insertTrade(trade);
       await updateAggregateBuffered(trade);
+      accumulateTrade(trade);
       kept += 1;
       lastTradeBySlug.set(slug, Date.parse(trade.timestamp));
     } catch (e: any) {
@@ -1301,8 +1339,9 @@ async function runBackfillOnce() {
           const tradeTsMs = Date.parse(trade.timestamp);
           if (Number.isFinite(tradeTsMs) && isDuplicateTrade(trade.id, tradeTsMs)) continue;
           try {
-            await insertTrade(trade);
+            if (!USE_TRADE_BUCKETS) await insertTrade(trade);
             await updateAggregateBuffered(trade);
+            accumulateTrade(trade);
             kept += 1;
             lastTradeBySlug.set(slug, Date.parse(trade.timestamp));
           } catch (e: any) {
@@ -1811,16 +1850,19 @@ async function onClobTick(msg: any) {
         void hydrateMarket(trade.market_id, null);
 
         try {
-          tradeBuffer.push(trade);
-          if (tradeBuffer.length >= TRADE_BUFFER_MAX) {
-            void flushTradeBuffer();
-          } else if (!tradeFlushTimer) {
-            tradeFlushTimer = setTimeout(() => {
-              tradeFlushTimer = null;
+          if (!USE_TRADE_BUCKETS) {
+            tradeBuffer.push(trade);
+            if (tradeBuffer.length >= TRADE_BUFFER_MAX) {
               void flushTradeBuffer();
-            }, TRADE_BUFFER_FLUSH_MS);
+            } else if (!tradeFlushTimer) {
+              tradeFlushTimer = setTimeout(() => {
+                tradeFlushTimer = null;
+                void flushTradeBuffer();
+              }, TRADE_BUFFER_FLUSH_MS);
+            }
           }
           await withRetry(() => updateAggregateBuffered(trade), "updateAggregate");
+          accumulateTrade(trade);
 
           if (Number.isFinite(tradeTsMs)) {
             const eventSlug = resolveEventSlugForMarket(trade.market_id, new Set());

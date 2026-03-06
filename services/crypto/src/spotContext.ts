@@ -6,7 +6,6 @@
  * prediction market movement and the underlying price movement.
  */
 
-import { supabase } from "../../storage/src/db";
 import { resolveSlugAndTitle } from "../../news/src/newsapi.client";
 import { deriveEntityContext } from "../../news/src/entity";
 import {
@@ -40,40 +39,17 @@ async function resolveCryptoEntity(
   }
 
   try {
-    // Try to resolve entity from trade raw data. The most recent trade may
-    // be from CLOB (no slug/title), so also check older backfill trades
-    // which include eventSlug in their raw JSON.
+    // Resolve entity from market_resolution (slug + title)
     let textForEntity: string | null = null;
     let slug: string | null = null;
 
-    // 1. Try latest trade (fast path)
-    const { slug: tradeSlug, title } = await resolveSlugAndTitle(marketId);
+    const { slug: resSlug, title } = await resolveSlugAndTitle(marketId);
     if (title) {
       textForEntity = title;
-      slug = tradeSlug;
-    } else if (tradeSlug) {
-      textForEntity = tradeSlug.replace(/-/g, " ");
-      slug = tradeSlug;
-    }
-
-    // 2. If no slug from latest trade, scan older trades for one with a slug
-    if (!textForEntity) {
-      const { data: olderTrades } = await supabase
-        .from("trades")
-        .select("raw")
-        .eq("market_id", marketId)
-        .order("timestamp", { ascending: true })
-        .limit(5);
-      if (olderTrades) {
-        for (const row of olderTrades) {
-          const raw = row.raw as any;
-          const p = raw?.payload ?? raw;
-          const s = p?.eventSlug ?? p?.slug ?? p?.marketSlug ?? null;
-          const t = p?.title ?? p?.market_title ?? null;
-          if (t) { textForEntity = t; slug = s; break; }
-          if (s) { textForEntity = String(s).replace(/-/g, " "); slug = s; break; }
-        }
-      }
+      slug = resSlug;
+    } else if (resSlug) {
+      textForEntity = resSlug.replace(/-/g, " ");
+      slug = resSlug;
     }
 
     if (!textForEntity) {

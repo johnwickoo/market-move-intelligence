@@ -74,21 +74,22 @@ async function recomputeMetrics(mv: OpenMovement) {
   if (mv.outcome) tickQ = tickQ.eq("outcome", mv.outcome);
   const { data: ticksDesc } = await tickQ;
 
-  // Fetch trades (also descending for the same truncation-safety reason)
-  let tradeQ = supabase
-    .from("trades")
-    .select("price,size,timestamp")
+  // Fetch total volume/trades from market_aggregates (single row, all-time totals).
+  const { data: agg } = await supabase
+    .from("market_aggregates")
+    .select("total_volume, trade_count")
     .eq("market_id", mv.market_id)
-    .gte("timestamp", mv.window_start)
-    .lte("timestamp", settledEndISO)
-    .order("timestamp", { ascending: false })
-    .limit(5000);
-  if (mv.outcome) tradeQ = tradeQ.eq("outcome", mv.outcome);
-  const { data: tradesDesc } = await tradeQ;
+    .maybeSingle();
+
+  const totalVolume = safeNum(agg?.total_volume);
+  const tradesCount = safeNum(agg?.trade_count);
+  const avgTradeSize = tradesCount > 0 ? totalVolume / tradesCount : null;
+
+  // Unique price levels from ticks (computed below after tick processing)
+  let uniquePriceLevels = 0;
 
   // Reverse to chronological order for processing
   const validTicks = (ticksDesc ?? []).filter((t: any) => t.mid != null).reverse();
-  const validTrades = (tradesDesc ?? []).reverse();
 
   if (validTicks.length < 2) return null;
 
@@ -110,21 +111,15 @@ async function recomputeMetrics(mv: OpenMovement) {
   }
 
   const driftPct = firstMid > 0 ? (lastMid - firstMid) / firstMid : null;
-  const rangePct = minMid > 0 ? (maxMid - minMid) / minMid : null;
+  const rangePct = maxMid > 0 ? (maxMid - minMid) / maxMid : null;
 
-  // Recompute volume
-  let totalVolume = 0;
-  for (const tr of validTrades) {
-    totalVolume += safeNum((tr as any).size);
-  }
-
-  // Recompute unique price levels
-  const priceLevels = new Set<number>();
+  // Recompute unique price levels from ticks (always available regardless of bucket mode)
+  const tickPriceLevels = new Set<number>();
   for (const tk of validTicks) {
-    priceLevels.add(Math.round(safeNum(tk.mid) * 10000));
+    tickPriceLevels.add(Math.round(safeNum(tk.mid) * 10000));
   }
-
-  const avgTradeSize = validTrades.length > 0 ? totalVolume / validTrades.length : null;
+  // Use tick-based levels if trade-based is zero (bucket approximation)
+  if (uniquePriceLevels === 0) uniquePriceLevels = tickPriceLevels.size;
 
   // Velocity (price change per sqrt of minutes)
   // Use the actual window duration (window_start → window_end), not the
@@ -143,8 +138,8 @@ async function recomputeMetrics(mv: OpenMovement) {
     max_price_24h: maxMid,
     range_pct: rangePct,
     volume_24h: totalVolume,
-    trades_count_24h: validTrades.length,
-    unique_price_levels_24h: priceLevels.size,
+    trades_count_24h: tradesCount,
+    unique_price_levels_24h: uniquePriceLevels,
     avg_trade_size_24h: avgTradeSize,
     velocity,
   };

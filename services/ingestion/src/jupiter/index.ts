@@ -10,6 +10,8 @@ import { resolveMarketsToTrack } from "./jupiter.markets";
 import { insertTradeBatch } from "../../../storage/src/db";
 import { insertMidTick } from "../../../storage/src/insertMidTick";
 import { updateAggregateBuffered } from "../../../aggregates/src/updateAggregate";
+import { accumulateTrade, startBucketFlush } from "../../../aggregates/src/tradeBucket";
+import { USE_TRADE_BUCKETS } from "../../../movements/src/bucketTradeStats";
 import { detectMovement } from "../../../movements/src/detectMovement";
 import type { TradeInsert } from "../../../storage/src/types";
 import * as fs from "fs";
@@ -113,7 +115,7 @@ async function flushTradeBuffer() {
   }
 
   try {
-    await insertTradeBatch(batch);
+    if (!USE_TRADE_BUCKETS) await insertTradeBatch(batch);
     insertFailCount = 0;
   } catch (err: any) {
     insertFailCount++;
@@ -224,6 +226,7 @@ async function main() {
       // Aggregate
       try {
         await updateAggregateBuffered(trade);
+        accumulateTrade(trade);
       } catch (err: any) {
         console.error("[jup] aggregate error:", err?.message);
       }
@@ -264,6 +267,7 @@ async function main() {
 
   // 3. Start trade polling
   poller.startTradePoller();
+  startBucketFlush();
 
   // 4. Start orderbook polling for top N markets by 24h volume
   const orderbookMarkets = [...markets]
